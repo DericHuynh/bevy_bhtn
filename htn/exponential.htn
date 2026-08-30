@@ -1,0 +1,261 @@
+// The look-ahead benchmark's exponential-backtracking domain: a doomed method
+// whose chain of 12 binary-choice gates never touches `gold`, followed by a
+// task requiring `gold > 1000`. With the look-ahead sweep the doomed method is
+// refuted in one pass; without it, plain MTR backtracking must enumerate all
+// 2^12 gate combinations before abandoning the method (the planner's sanity
+// limit is raised by the bench so the blowup is visible rather than capped).
+// The second root method succeeds directly.
+schema {
+    version: 0.1.0
+}
+
+compound_task "Root" {
+    method "doomed" {
+        subtasks: [
+            Gate0, Gate1, Gate2, Gate3, Gate4, Gate5,
+            Gate6, Gate7, Gate8, Gate9, Gate10, Gate11,
+            Final,
+        ]
+    }
+    method "direct" {
+        subtasks: [Strike, Final]
+    }
+}
+
+compound_task "Gate0" {
+    method "a" {
+        subtasks: [JunkA0]
+    }
+    method "b" {
+        subtasks: [JunkB0]
+    }
+}
+
+primitive_task "JunkA0" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB0" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate1" {
+    method "a" {
+        subtasks: [JunkA1]
+    }
+    method "b" {
+        subtasks: [JunkB1]
+    }
+}
+
+primitive_task "JunkA1" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB1" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate2" {
+    method "a" {
+        subtasks: [JunkA2]
+    }
+    method "b" {
+        subtasks: [JunkB2]
+    }
+}
+
+primitive_task "JunkA2" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB2" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate3" {
+    method "a" {
+        subtasks: [JunkA3]
+    }
+    method "b" {
+        subtasks: [JunkB3]
+    }
+}
+
+primitive_task "JunkA3" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB3" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate4" {
+    method "a" {
+        subtasks: [JunkA4]
+    }
+    method "b" {
+        subtasks: [JunkB4]
+    }
+}
+
+primitive_task "JunkA4" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB4" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate5" {
+    method "a" {
+        subtasks: [JunkA5]
+    }
+    method "b" {
+        subtasks: [JunkB5]
+    }
+}
+
+primitive_task "JunkA5" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB5" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate6" {
+    method "a" {
+        subtasks: [JunkA6]
+    }
+    method "b" {
+        subtasks: [JunkB6]
+    }
+}
+
+primitive_task "JunkA6" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB6" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate7" {
+    method "a" {
+        subtasks: [JunkA7]
+    }
+    method "b" {
+        subtasks: [JunkB7]
+    }
+}
+
+primitive_task "JunkA7" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB7" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate8" {
+    method "a" {
+        subtasks: [JunkA8]
+    }
+    method "b" {
+        subtasks: [JunkB8]
+    }
+}
+
+primitive_task "JunkA8" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB8" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate9" {
+    method "a" {
+        subtasks: [JunkA9]
+    }
+    method "b" {
+        subtasks: [JunkB9]
+    }
+}
+
+primitive_task "JunkA9" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB9" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate10" {
+    method "a" {
+        subtasks: [JunkA10]
+    }
+    method "b" {
+        subtasks: [JunkB10]
+    }
+}
+
+primitive_task "JunkA10" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB10" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+compound_task "Gate11" {
+    method "a" {
+        subtasks: [JunkA11]
+    }
+    method "b" {
+        subtasks: [JunkB11]
+    }
+}
+
+primitive_task "JunkA11" {
+    operator: NoopOperator
+    effects: [noise = true]
+}
+
+primitive_task "JunkB11" {
+    operator: NoopOperator
+    effects: [noise = false]
+}
+
+primitive_task "Final" {
+    operator: NoopOperator
+    preconditions: [gold > 1000]
+}
+
+primitive_task "Strike" {
+    operator: NoopOperator
+    effects: [gold = 2000]
+}

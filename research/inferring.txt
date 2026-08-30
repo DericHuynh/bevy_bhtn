@@ -1,0 +1,3258 @@
+Journal of Articial Intelligence Research 82 (2025) 1407-1444
+
+Submitted 09/2024; published 03/2025
+
+An Extensive Empirical Evaluation of Inferring
+Preconditions and Eects of Compound Tasks in Ground
+HTN Planning Problems
+Conny Olz
+Alexander Lodemann
+Benedikt Jutz
+Mario Schmautz
+Maximilian Borowiec
+Susanne Biundo
+
+conny.olz@alumni.uni-ulm.de
+alexander.lodemann@uni-ulm.de
+benedikt.jutz@uni-ulm.de
+mario.schmautz@alumni.uni-ulm.de
+maximilian.borowiec@alumni.uni-ulm.de
+susanne.biundo@uni-ulm.de
+
+Institute of Articial Intelligence, Ulm University
+89081 Ulm, Germany
+
+Pascal Bercher
+
+pascal.bercher@anu.edu.au
+
+School of Computing, The Australian National University
+Canberra, Australia
+
+Abstract
+HTN planning requires the decomposition of compound tasks into primitive and executable actions. In the currently most frequently used formalism, compound tasks lack
+explicit preconditions and eects. Those are, however, useful, e.g., for pruning techniques,
+heuristics, or the comprehension of domains. Previously, we introduced and formalized
+dierent kinds of inferred preconditions and eects of compound tasks based on their decomposition methods together with a complexity analysis. In this paper, we present an
+empirical evaluation of computing these inferred preconditions and eects using the IPC
+benchmark sets. Specically, we analyze their frequency of occurrence and compare the
+performance of an approximation to the exact preconditions and eects. Our goal is to
+provide a comprehensive overview of the proposed techniques, enabling researchers to determine the extent to which they can be utilized in their given application.
+
+1. Introduction
+Hierarchical Task Network (HTN) Planning is a subeld of Automated Planning, with the
+overarching goal of decomposing complex tasks into a sequence of primitive and executable
+actions (Erol, Hendler, & Nau, 1996; Ghallab, Nau, & Traverso, 2004; Bercher, Alford, &
+Höller, 2019). While primitive actions are explicitly dened by preconditions and eects
+that describe their interaction with states, compound tasks lack such explicit denitions in
+the currently most frequently used formalism and HDDL (Höller, Behnke, Bercher, Biundo,
+Fiorino, Pellier, & Alford, 2020a), the domain description language of the International
+Planning Competition (IPC) in 2020 and 2023 (Taitler, Alford, Espasa, Behnke, Fišer,
+Gimelfarb, Pommerening, Sanner, Scala, Schreiber, Segovia-Aguas, & Seipp, 2024). This
+makes their inuence and dependencies on states rather opaque. To shed more light on
+their state implications, Olz, Biundo, and Bercher (2021) proposed inferred preconditions
+and eects for compound tasks in total-order domains based on the actions in their possi©2025 The Authors. Published by AI Access Foundation under Creative Commons Attribution License CC BY 4.0.
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+ble renements, as opposed to hand-crafted preconditions and eects provided by domain
+engineers (Biundo & Schattenberg, 2001; Bercher, Höller, Behnke, & Biundo, 2016).
+The proposed inferred preconditions and eects have already proven useful in diverse
+applications, ranging from assistance in the process of writing or understanding planning
+domains (Olz, Wierzba, Bercher, & Lindner, 2021) to generally improving the scalability and
+eciency of HTN planning systems. For the latter, a total-order HTN planning heuristic
+based on Integer Linear Programming (Olz, Lodemann, & Bercher, 2024) utilizes inferred
+negative eects to restrict the set of possible solutions. Moreover, a look-ahead technique
+(Olz & Bercher, 2023b) exploits preconditions and eects to successfully prune the search
+space, leading to winning all total-order tracks at the latest IPC in 2023 (Olz, Höller, &
+Bercher, 2023; Taitler et al., 2024). Closely related, a version of inferred preconditions
+and eects generalized to partial-order domains (Olz & Bercher, 2022) has been used to
+convert partial-order problems into total-order ones, enabling the use of total-order planning
+systems to solve (some of) these problems, which currently outperform the general partialorder planners (Wu, Olz, Lin, & Bercher, 2023).
+Other systems also already incorporate related or similar information (Nau, Au, Ilghami,
+Kuter, Murdock, Wu, & Yaman, 2003; Waisbrot, Kuter, & Könik, 2008; de Silva, Sardina, &
+Padgham, 2009; Bit-Monnot, Smith, & Do, 2016; Goldman & Kuter, 2019; Magnaguagno,
+Meneguzzi, & de Silva, 2021; Schreiber, 2021), some of which could potentially be further
+improved by integrating the preconditions and eects considered here. Additionally, this
+inferred information might be used to represent HTN planning solutions on an abstract level
+(Marthi, Russell, & Wolfe, 2007; de Silva et al., 2009), or closely related, to decide whether
+a sequence of (abstract) tasks can or can not be rened into a solution without nding a
+concrete plan (Yang, 1990). Those questions are interesting to the eld for a long time
+as can also be seen by investigations on the so-called Upward and Downward properties
+(Tenenberg, 1988). However, little results exist so far.
+Despite the benets and existing approaches to exploit the proposed preconditions and
+eects, the algorithms for computing them are currently hidden in computational complexity
+proofs, and their concrete outcomes on available domains are not reported. For example, it is
+unclear how many preconditions and eects can be found and whether signicant dierences
+exist across dierent domains. These limitations make their application challenging.
+This article complements the previous work by Olz et al. (2021) by making the algorithms for computing inferred preconditions and eects more accessible through the provision of pseudocode. Our main contribution is a comprehensive evaluation of the proposed
+techniques to examine their runtime, report the occurrence frequency of the inferred preconditions and eects, and assess the accuracy of an approximation on concrete domains.
+Our results aim to help researchers decide which of the proposed techniques, and to what
+extent they may be benecial for their specic use cases beyond the already existing ones.
+
+2. Theoretical Background
+We begin with the theoretical basics, i.e., we introduce totally ordered (t.o.) HTN planning
+and the required denitions of preconditions and eects of compound tasks before we state
+algorithms to compute them.
+1408
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+2.1 HTN Planning Formalism
+Our used formalism is based on the one by Geier and Bercher (2011), adapted by Behnke,
+Höller, and Biundo (2018) to totally ordered domains and problems, respectively.
+As a basis, we introduce a STRIPS planning domain D = (F, A), which consists of a
+nite set of facts F and actions A. An action a = (prec, add , del ) ∈ A is a tuple consisting
+of its preconditions prec(a) ⊆ F and its add and delete eects: add (a), del (a) ⊆ F . If it
+holds prec(a) ⊆ s for an action a ∈ A and a state s ∈ 2F , then we say that a is applicable in
+s. In this case a can be applied to s producing the successor state s′ = (s \ del (a))  add (a).
+We also say the application results in s′ . A sequence of actions ā = ⟨a0    an ⟩ with ai ∈ A
+for 0 ≤ i ≤ n is applicable in a state s0 if and only if for all 0 ≤ i ≤ n ai is applicable in
+si , where si+1 results from applying ai in si . A STRIPS planning problem Π = (D, sI , g)
+additionally consists of an initial state sI ∈ 2F and a goal description g ⊆ F , where the
+latter represents a set of goal states s with s ⊇ g. A sequence of actions ⟨a0    an ⟩ is a
+solution to Π if and only if it is applicable in sI and results in a goal state.
+Now, we can dene a t.o. HTN planning domain D = (F, A, C, M ). It contains the sets
+F and A as before but the actions A are also called primitive tasks now. The reason is that
+we additionally consider the set C of compound tasks, and we dene AC =: T . Compound
+tasks represent sequences of primitive and further compound tasks, i.e., t.o. task networks
+tn, which are (possibly empty) nite sequences of tasks t̄ = ⟨t0    tn ⟩ ∈ T ∗ . The set of
+decomposition methods M ⊆ C × T ∗ denes how exactly compound tasks can be rened,
+i.e., a method m = (c, t̄) ∈ M decomposes a compound task c ∈ C within a task network
+tn 1 = ⟨t̄1 c t̄2 ⟩ into a task network tn 2 = ⟨t̄1 t̄ t̄2 ⟩, written tn 1 →c,m tn 2 . We write tn → tn ′
+if there is a (possibly empty) sequence of methods transforming tn into tn ′ . We call tn ′ a
+renement of tn. In contrast to a STRIPS planning problem, a t.o. HTN planning problem
+Π = (D, sI , tnI , g) also contains an initial task network tnI ∈ T ∗ , which needs to be rened.
+So, a sequence of actions tn = ⟨a0    an ⟩ ∈ A∗ is a solution to Π if and only if tnI → tn, tn
+is primitive, applicable in sI , and results in a goal state.
+2.2 Preconditions and Eects of Compound Tasks
+Now, we briey recap the necessary denitions of preconditions and eects of compound
+tasks, taken from the publication we build upon (Olz et al., 2021).
+First, for each compound task c, we need to dene the set of states for which there exists
+an executable renement (i.e., the application in these states is possible) as well as the set
+of states in which the execution of such a renement can result:
+Denition 1 (Executability-Enabling and Resulting States). Let D = (F, A, C, M ) be a
+domain, c ∈ C a compound task, and s ∈ 2F a state.
+• E(c) ⊆ 2F is the set of all states s̃ ∈ 2F for which there exists a sequence of actions
+ā, such that c → ā and ā is applicable in s̃.
+• Rs (c) ⊆ 2F is the set of all states into which the execution of renements of c can
+result, i.e., Rs (c) is the set of all ( resulting) states s′ ∈ 2F for which there exists a
+sequence of actions ā, such that c → ā, ā is applicable in s, and ā executed in s results
+in s′ .
+1409
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+c1
+m1
+
+f1
+f2
+
+a1 f3
+
+m2
+
+f4
+f3 a2
+¬f1
+
+f2
+f5
+
+f3
+a3 ¬f2
+¬f5
+
+f6
+f3 a4
+f7
+
+Figure 1: A compound task c1 and its decomposition methods m1 and m2 . Rectangles are
+primitive tasks with preconditions on the left-hand and eects on the right-hand side.
+When we talk about eects of compound tasks we classify them according to three
+properties. We illustrate them using the compound task c1 in Figure 1, which has two
+renements (using either m1 or m2 ) with two primitive tasks each.
+First, sometimes we are given a concrete state in which a compound task (or more
+precisely, its renements) is executed (e.g., during search), but sometimes we want to know
+the preconditions and eects independent of a concrete state (e.g., as being part of the
+model). Therefore, there are state-dependent and state-independent eects. The latter are
+dened based on the former by considering all executability-enabling states.
+Second, we dierentiate between postconditions and eects. Postconditions can hold
+after the execution of a task just because they hold initially and were not changed, whereas
+eects are facts that were explicitly added (or deleted) by a task in the renement and
+did not (did) hold in advance. For example, executing ⟨a1 , a2 ⟩ from Figure 1 in the state
+s = f1 , f2  results in the state f2 , f3 , f4 . The facts f3 and f4 are explicitly added, so
+they are considered to be eects, whereas f2 held before, so it is a postcondition.1
+Lastly, we distinguish between possible and guaranteed eects. The former were added
+(or deleted) just by some renements whereas the latter hold for all executable renements.
+In Figure 1, the facts f3 , f4 , f6 and f7 are possible positive eects of c1 , f1 , f2 , and f5
+are possible negative eects. Since only f3 is added by both renements, it is the only
+guaranteed eect.
+Based on these properties, we summarize only the most important denitions for this
+article and refer to Olz et al. (2021) for the remaining ones, which can also be easily inferred
+from the denitions provided.
+Denition 2. Let D = (F, A, C, M ) be a domain, c ∈ C a compound task, and s ∈ 2F a
+state. We dene
+
+s′
+( state-dependent postconditions)
+• post +
+s (c) :=
+s′ ∈R
+s (c)
+
+−
+′
+post s (c) := F \ s′ ∈Rs (c) s
+
+• post +
+post +
+( state-independent postconditions)
+∗ (c) :=
+s (c)
+s∈E(c)
+−
+(c)
+post ∗ (c) := s∈E(c) post −
+s
+
+
++ (c)) \ (
+(c)
+:=
+(
+post
+( state-independent eects)
+• e +
+s
+∗
+s∈E(c)
+s∈E(c) s)
+
+−
+−
+e ∗ (c) := s∈E(c) post s (c)
+
+1. There are some pitfalls concerning the dierence between eects and postconditions, which we further
+illustrate with examples in the appendix.
+
+1410
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+
+′
+• poss-post +
+( possible state-dependent postconditions)
+s (c) :=
+s′ ∈Rs (c) s
+
+−
+′
+poss-post s (c) := s′ ∈Rs (c) (F \ s )
+
+• poss-e +
+(poss-post +
+( possible state-independent eects)
+∗ (c) :=
+s (c) \ s)
+s∈E(c)
+−
+(c)
+
+s)
+poss-e ∗ (c) := s∈E(c) (poss-post −
+s
++/−
+
++/−
+
+if E(c) ̸= ∅ and Rs (c) ̸= ∅, otherwise e ∗ (c) = poss-e ∗
++/−
++/−
+post ∗ (c) = poss-post s (c) := undef , respectively.
+
++/−
+
+(c) := undef and post s
+
+(c) =
+
+The state-dependent postconditions are dened by iterating over all resulting states.
+The state-independent ones can be obtained by additionally considering all executabilityenabling states. Depending on whether we want possible or guaranteed ones the intersection
+or union is taken. To obtain positive eects instead of postconditions we need to subtract
+the facts that held before execution. Note that there is an asymmetry between positive and
+negative guaranteed eects. This is due to the absence of negative preconditions. For this
+reason, all supersets of a state s ∈ E(c) are also executability-enabling. Thus, to dene
+the negative eects, we do not need to check that the facts held before since such a state
+always exist if there is at least one executability-enabling state. Therefore, the guaranteed
+negative eects are identical to the guaranteed negative postconditions.
+Besides eects, we can also dene preconditions of a compound task. Intuitively, preconditions are facts that are needed by every executable renement to be executable. For
+c1 in Figure 1 this would be f2 . So a precondition is the set of facts that are contained in
+every executability-enabling state of a compound task.
+Denition 3 (Mandatory Preconditions). Let D = (F, A, C, M ) be a t.o. HTN planning
+domain and
+ c ∈ C a compound task. Then, the set of mandatory preconditions of c is
+prec(c) := s∈E(c) s if E(c) ̸= ∅ and prec(c) := undef otherwise.
+2.2.1 Computational Complexity
+
+When developing algorithms it is always a good start to know the computational complexity
+of the underlying problem since it determines worst-case estimates and (partially) rules out
+the existence of certain algorithms. Thus, we now repeat some complexity results by Olz
+et al. (2021) concerning the inference of preconditions and eects of compound tasks before
+we state the algorithms. It turned out that it is always as hard as solving a planning problem,
+which in turn depends on the structure of the hierarchy.2 Planning problems are referred to
+as acyclic when the number of possible decompositions is nite, meaning that there are no
+recursive methods involved (the respective plan existence problem is PSPACE-complete
+(Alford, Bercher, & Aha, 2015)). A problem is considered regular if, in both the initial task
+network and all the task networks of methods, there is only one compound task, if any,
+and it must always be the last one (PSPACE-complete (Erol et al., 1996)). They can be
+generalized to tail-recursive problems (PSPACE-complete (Alford et al., 2015)). Lastly,
+arbitrary problems do not have any restrictions on the hierarchy (EXPTIME-complete
+(Alford et al., 2015)).
+Theorem 1. Let c ∈ C be a compound task, f ∈ F a fact, and X ∈ s, ∗, where s ∈ 2F .
+Deciding the following problems:
+2. Strictly speaking, this is only true for problems with deterministic complexity classes X (for which it
+holds X = coX ) since the proof is partially based on the complementary problem.
+
+1411
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+• f ∈ prec(c)
+
++/−
+
+• f ∈ e X
+
+(c)
+
++/−
+
+• f ∈ poss-e X
+
+(c)
+
+is PSPACE-complete if c is acyclic, regular, or tail-recursive, and it is EXPTIMEcomplete in general.
+2.2.2 Precondition-Relaxations
+For many practical applications, solving such PSPACE-complete or even EXPTIMEcomplete problems as part of a preprocessing step may not be a viable option due to the
+inherent complexity of the actual problem. Therefore, Olz et al. (2021) introduced a problem
+relaxation which admits the inference of preconditions and eects in polynomial time. It
+is based on ignoring whether primitive tasks are executable in a renement and thus just
+takes the appearance and order of actions into account.
+Denition 4 (Precondition-Relaxation). Let D = (F, A, C, M ) be a planning domain.
+Its precondition-relaxation is the domain D ′ = (F, A′ , C, M ) with A′ = (∅, add , del ) 
+(prec, add , del ) ∈ A.
+Denition 5 (Eects of Precondition-Relaxed Tasks). Let D be a planning domain and
+∅−
+∅+
+∅−
+c ∈ C a compound task. We dene e ∅+
+∗ (c), e ∗ (c), poss-e ∗ (c) and poss-e ∗ (c)
+−
++
+−
+as shorthand for e +
+∗ (c), e ∗ (c), poss-e ∗ (c) and poss-e ∗ (c) that are based on the
+precondition-relaxed variant of D, respectively.
+For preconditions, the relaxation is slightly adapted formally since we can not reason
+about preconditions if they are gone. However, semantically it is the same as for eects.
+Denition 6 (Executability-Relaxed Precondition). Let D = (F, A, C, M ) be a planning
+domain and c ∈ C a compound task. We call a fact f an executability-relaxed precondition
+of c if and only if for all primitive renements (i.e., ignoring executability) ⟨a0    an ⟩ of c
+there exists an action ai with f ∈ prec(ai ) and there does not exist an action aj with j < i
+and f ∈ add (aj ), where i, j ∈ 0    n. Then the set of executability-relaxed preconditions
+of c is prec ∅ (c) := f ∈ F  f is an executability-relaxed precondition of c.
+In order to better distinguish the dierent preconditions and eects verbally we will use
+the term exact preconditions and eects when we refer to Denitions 2 and 3 in contrast
+to the relaxed ones (implying precondition-relaxation or executability-relaxation).
+c2
+m1
+
+f1
+f2
+
+a1 f3
+
+m3
+
+m2
+
+f4
+f3 a2
+¬f1
+
+f2
+f5
+
+f3
+a3 ¬f2
+¬f5
+
+f6
+f3 a4
+f7
+
+c1
+
+f5 a5 f6
+
+m4
+
+a6 f4
+
+Figure 2: A compound task c2 and its decomposition methods. The compound task c1 is
+the same as before.
+Consider the compound task c2 in Figure 2 for an illustration. It has three renements
+⟨a1 , a2 , a5 ⟩, ⟨a3 , a4 , a5 ⟩, and ⟨a6 ⟩. The compound task c1 is the one we considered before. We
+1412
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+can observe that ⟨a3 , a4 , a5 ⟩ will never be executable since a3 deletes f5 , the precondition of
+a5 . So we disregard this renement for exact eects. We can conclude that the guaranteed
++
+positive eects of c2 is e +
+∗ (c2 ) = f4 , the possible ones are poss-e ∗ (c2 ) = f3 , f4 , f6 .
+Now, for the relaxed version we also take the renement ⟨a3 , a4 , a5 ⟩ into consideration so
+∅+
+that we end up with e ∅+
+∗ (c2 ) = ∅ and poss-e ∗ (c2 ) = f3 , f4 , f6 , f7 . The set of (relaxed)
+preconditions of c2 is empty because of m4 .
+Despite the loss of information due to admitting the computation in polynomial time,
+the sets of relaxed preconditions and eects are still useful. The relaxed possible eects
+overestimate the exact ones, while the relaxed guaranteed eects and preconditions underestimate them. The intuition behind this is as follows: The relaxation increases the set of
+resulting states since more renements are considered. Therefore, the set of facts common
+across all renements is potentially reduced. On the other hand, the union of all facts in
+the resulting states is increased. Thus, we can state the following subset relations proven
+formally by Olz et al. (2021, Thm. 4 and 5):
+Proposition 1. Let D = (F, A, C, M ) be a planning domain and c ∈ C a compound task.
+Then it holds that:
++
+∅−
+−
+• poss-e ∅+
+∗ (c) ⊇ poss-e ∗ (c) and poss-e ∗ (c) ⊇ poss-e ∗ (c),
+∅+
+∅−
+−
+• e ∗ (c) ⊆ post +
+∗ (c) and e ∗ (c) ⊆ e ∗ (c),
+∅
+• prec (c) ⊆ prec(c)
+
+if they are not undened.
+It does not hold that e ∅+ (c) ⊆ e + (c) because the set e ∅+ (c) can contain facts
+that are also exact preconditions, which are specically excluded for e +
+∗ (c). An example
+is given in the appendix. To make the sets of eects comparable, we dene adapted (or
+∅+
+corrected ) positive relaxed eects as cor -e ∅+
+∗ (c) = e ∗ (c) \ prec(c), so that the relation
+∅+
++
+cor -e ∗ (c) ⊆ e ∗ (c) holds. Note that this issue does not exist for negative eects since
+there are no negative preconditions.
+In the evaluation section, we will assess the quality of the relaxation by calculating and
+reporting the size of the gap between these sets for many benchmark domains.
+For practical applications, this is exactly the direction of approximation that is often
+needed, as can be seen, for instance, in the look-ahead technique by Olz and Bercher
+(2023b). Since the possible eects are an overapproximation, none of the eects is missing.
+For guaranteed eects, we can be sure that every relaxed eect is indeed correct, though
+some may be potentially missing.
+2.2.3 Conjunctive Possible Effects
+The possible eects of a compound task are often an overapproximation of the facts that
+any specic renement actually produces, as they are derived by combining the eects of
+all possible renements into a single set. To better distinguish the outcomes of dierent
+renements, we previously introduced a more rened concept known as conjunctive possible
+eects (Olz & Bercher, 2023a). This approach considers sets of facts (of size k) that are
+added or deleted by a single renement. Specically, a set Fk is called a positive-size-k
+eect of c if and only if there exist a state s ∈ E(c) and a successor state s′ ∈ Rs (c) such
+1413
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+that Fk ⊆ s′ and s  Fk = ∅. However, evaluating conjunctive possible eects is beyond
+the scope of this article. The time to compute the exact preconditions and eects for the
+conducted evaluation was already extensive (or hardly possible). The exact conjunctive
+possible eects are even more expensive to compute.
+2.3 Related Work on Inference
+There has been prior research focused on inferring preconditions and eects in HTN planning
+and related frameworks.
+Tsuneto, Hendler, and Nau (1998) consider a lifted HTN planning formalism, where
+methods have dierent kinds of constraints predened by domain modelers. From these
+they automatically extract external conditions, which are state constraints and can be
+understood as method preconditions that need to be made true by other parts of the plan.
+According to the authors their algorithm to compute the external conditions is not complete
+and only described in prose.
+Similar to our concept of resulting states (Rs (c)), Marthi et al. (2007) propose the exact
+description of a compound task. Since they are hard to compute, they dene approximations
+through supersets (complete descriptions) and subsets (sound descriptions) and describe
+their potential applications in planning algorithms. However, they do not present procedures
+to create or verify these descriptions, leaving room for future research on utilizing our
+inferred preconditions and eects in this context.
+Clement, Durfee, and Barrett (2007) introduce summary information within a kind of
+non-recursive partial-order HTN formalism with extensions for time and resource management, aiming to coordinate multi-agent plans at abstract levels. These summaries include
+temporal and modal information and are dened via logical formulae. To maintain an
+ecient computation, they focus on immediate subplans rather than the full hierarchy.
+Extending this, de Silva, Sardina, and Padgham (2016) dene summary information
+for a Belief-Desire-Intention (BDI) agent programming language (de Silva, Meneguzzi, &
+Logan, 2020), generalizing lifted totally ordered HTN problems. Their polynomial-time
+inference algorithms are limited to acyclic domains and remain incomplete, as supported
+by our complexity analysis. These algorithms, based on executable renements like our
+exact ones, do not fully characterize the subset of inferred preconditions and eects, with
+examples illustrating their limitations.
+Closer to our formalism are two approaches that compute method and task preconditions
+similarly to our executability-relaxed preconditions but in a lifted manner. Both approaches
+were developed simultaneously and independently of the work by Olz et al. (2021).
+The lifted total-order planner HyperTensioN (Magnaguagno et al., 2021) computes these
+preconditions using a xed-point algorithm during their preprocessing pullup phase, employing mentioned eects (de Silva et al., 2016). Similarly, the SAT-based planner Lilotane
+(Schreiber, Pellier, & Fiorino, 2019; Schreiber, 2021) mines method and task preconditions in polynomial time by recursively considering each method once. If a method is
+encountered twice due to cycles, the preconditions are approximated. These approaches are
+not directly comparable to ours as they operate on a lifted model. Nonetheless, we compare
+them empirically to our inferred preconditions to some extent in the evaluation section.
+The lifted approach has the advantage of being more general and compact and the results
+1414
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+might be usable across multiple domain instances. However, this generality can also lead
+to fewer specic decisions being made.
+More loosely related again, there is also work on learning method preconditions from
+user-provided training data (Ilghami, Nau, Muñoz-Avila, & Aha, 2002; Ilghami, MuñozAvila, Nau, & Aha, 2005), as well as from decomposition trees with partially observed
+intermediate states (Zhuo, Hu, Hogg, Yang, & Munoz-Avila, 2009).
+2.4 Formalisms Incorporating Preconditions and Eects
+The whole article is based on the assumption that the preconditions and eects of compound
+tasks are not explicitly stated in the domain model. This is currently the predominant standard, as reected in HDDL (Höller et al., 2020a), the ocial domain modeling language
+for HTN planning used in the 2020 and 2023 IPC on hierarchical planning (Behnke, Höller,
+Bercher, Biundo, Pellier, Fiorino, & Alford, 2019; Taitler et al., 2024). Conversely, alternative formalisms do specify preconditions and eects for compound tasks, such as the hybrid
+planning formalisms proposed by Kambhampati, Mali, and Srivastava (1998), Biundo and
+Schattenberg (2001), or Bercher, Lin, and Alford (2022). Additionally, planning systems
+like SHOP2 allow method preconditions (Nau et al., 2003). Typically, in these formalisms,
+the domain modeler denes the preconditions and eects of compound tasks, which come
+with varying semantics. Bercher et al. (2016, 2022) provide a comprehensive review of these.
+Nonetheless, it remains the responsibility of the domain modeler to ensure that the specied preconditions and eects meet all desired properties, which can be challenging (Bercher
+et al., 2016). Our proposed inference algorithms actually verify whether a fact is a precondition or eect and are turned to inference algorithms by testing all possible candidates.
+Consequently, even if there exist predened preconditions or eects, our algorithms can be
+valuable for verifying and correcting them, or identifying additional ones.
+
+3. Inference Algorithms
+In this section, we present algorithms to compute the previously dened preconditions and
+eects of compound tasks. Olz et al. (2021) described all procedures in their proofs of
+the computational complexity results purely textual. Thus, the basic procedures are not
+new, but we turned them into pseudocode now to make them directly accessible. As a new
+contribution, we show how to speed up the exact inference procedures by mainly exploiting
+the relaxed preconditions and eects to save unnecessary calculation.
+We begin with possible eects followed by guaranteed ones, then we consider preconditions. Afterwards, the precondition-relaxed versions are considered and illustrated with an
+example. We conclude with ideas on how to improve the exact inference procedures.
+3.1 Eects and Postconditions of Compound Tasks
+We begin with calculating possible state-independent eects of a compound task c ∈ C.
+Intuitively, a fact f ∈ F is such an eect if there exists a state in which f does not hold
+and a renement of c such that f holds after executing the renement in that state. This
+is the case if the planning problem Π = (D, sI = F \ f , tnI = ⟨c⟩, f ) is solvable (Olz
+et al., 2021, Thm. 1).
+1415
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Analogously, f is a postcondition if we alter the initial state to sI = F , meaning that it
+is possible that f holds after decomposing c, even if it was not generated but held already.
+As we do not consider negative preconditions we cover every possible initial state by using
+the state that contains all facts in F , i.e., setting all facts to true.
+If we want to calculate state-dependent postconditions w.r.t. some state s, then we set
+sI = s (Olz et al., 2021, Cor. 1).
+In order to compute negative eects we can make use of auxiliary facts, which represent
+the negation of the original ones (Olz et al., 2021, Cor. 2). Therefore, we add for a fact f
+a new fact not-f , which encodes the negation of f . This idea is well known from compiling
+away negative preconditions (Gazen & Knoblock, 1997). Actions are modied so that all
+actions that add f then also delete not-f , and actions deleting f also add not-f . We will
+refer to this process of adapting the domain by the procedure called AddNegatedFact(D, f ).
+Algorithm 1 summarizes the previous explanations to compute possible state-independent negative eects.
+Algorithm 1 Computes all possible state-independent negative eects
+Input: D = (F, A, C, M ), a planning domain, and c ∈ C, a compound task.
+Output: poss-e −
+∗ (c)
+1: if Π = (D, F, ⟨c⟩, ∅) is unsolvable then
+2:
+return poss-e −
+∗ (c) = undef
+−
+3: poss-e ∗ (c) = ∅
+4: for all f ∈ F do
+5:
+(D ′ , not-f ) = AddNegatedFact(D,f )
+6:
+if Π = (D ′ , F, ⟨c⟩, not-f ) is solvable then
+−
+7:
+poss-e −
+∗ (c) = poss-e ∗ (c)  f 
+8: return poss-e −
+∗ (c)
+
+▷ not-f ̸∈ F
+
+Theorem 2. Algorithm 1 is sound and complete, i.e., it returns exactly the set poss-e −
+∗ (c)
+of possible negative eects of a compound task c.
+Proof. Let c be a compound task and poss-e −
+∗ (c) its possible negative eects. Let out ⊆ F
+be the set of eects calculated and returned by Algorithm 1. We show that poss-e −
+∗ (c) =
+−
+out. The case poss-e ∗ (c) = undef is clearly covered by the algorithm, so we assume that
+poss-e −
+∗ (c) ̸= undef .
+ out. Then, by
+⊆: Suppose there is a fact f ∈ F with f ∈ poss-e −
+∗ (c) but f ∈
+ sr . Let ā
+denition, there is a state s ∈ E(c) and a state sr ∈ Rs (c) such that f ∈ s but f ∈
+be the corresponding renement. After modifying the domain to D ′ by adding the auxiliary
+variable not-f (using AddNegatedFact(D,f )) and applying ā with updated actions in s we
+end up in the state s′r = sr  not-f . Since F ⊇ s and there are no negative preconditions
+the planning problem Π = (D ′ , F, ⟨c⟩, not-f ) must be solvable as otherwise s′r can not
+exist. This contradicts f ∈
+ out, so it must hold f ∈ out.
+⊇: Suppose it holds f ∈ out. Then Π = (D ′ , F, ⟨c⟩, not-f ) is solvable. Let sg be
+ sg . Moreover it holds
+one of the goal states. By construction, it holds not-f ∈ sg and f ∈
+f ∈ F , F ∈ E(c), sg \ not-f  ∈ RF (c) (w.r.t. D, in which not-f  does not exist). Thus,
+we can conclude f ∈ poss-e −
+∗ (c).
+1416
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+In order to compute guaranteed state-independent positive eects we have to ensure that
+for a possible eect f there is no renement after whose execution the fact does not hold.
+To do so we make use of the negated fact and construct two planning problems as shown
+in Algorithm 2 (lines 6 and 7). If f holds in the initial state, then it must not be deleted
+in the end. Otherwise, if not-f holds initially, then f must be added eventually. So there
+may not exist a solution in which not-f holds at the end, i.e., we check whether the two
+problems are unsolvable (line 8). Note that we can also capture this with a single planning
+problem instead of two, by additionally introducing a new compound task c′ , which has
+two methods m1 and m2 , where m1 = (c′ , ⟨(∅, f , ∅)c⟩) and m2 = (c′ , ⟨(∅, not-f , ∅)c⟩).
+The two methods of c′ simulate the two initial states of Π′1 and Π′2 , respectively, i.e., if m1
+gets chosen we end up with Π′1 and Π′2 otherwise. So again one needs to check whether
+Π′ = (D ′ , F \ f , ⟨c′ ⟩, not-f ) is unsolvable (Olz et al., 2021, Thm. 2).
+The adaptions to compute negative eects or postconditions are straightforward, so we
+restrict ourselves to Algorithm 2, the computation of guaranteed state-independent positive
+eects, here.
+Algorithm 2 Computes all guaranteed state-independent positive eects
+Input: D = (F, A, C, M ), a planning domain, and c ∈ C, a compound task.
+Output: e +
+∗ (c)
+1: if poss-e +
+∗ (c) = undef then
+2:
+return undef
+3: e +
+∗ (c) = ∅
+4: for all f ∈ poss-e +
+∗ (c) do
+′
+5:
+(D , not-f ) = AddNegatedFact(D,f )
+6:
+Π′1 = (D ′ , F, ⟨c⟩, not-f )
+7:
+Π′2 = (D ′ , F \ f   not-f , ⟨c⟩, not-f )
+8:
+if Π′1 and Π′2 are not solvable then
++
+9:
+e +
+∗ (c) = e ∗ (c)  f 
+10: return e +
+∗ (c)
+Theorem 3. Algorithm 2 is sound and complete, i.e., it returns exactly the set e +
+∗ (c) of
+guaranteed positive eects of a compound task c.
+Proof. Let c be a compound task and e +
+∗ (c) of guaranteed positive eects. Let out ⊆ F
+be the set of eects calculated and returned by Algorithm 2. We show that e +
+∗ (c) = out.
+(c)
+=
+undef
+is
+covered
+in
+the
+beginning
+of
+the
+algorithm,
+so
+we assume
+Again, the case e +
+∗
++
+that e ∗ (c) ̸= undef .
+is also a possible eect
+⊆: Suppose there is afact f ∈ F with f 
+∈ e +
+∗ (c).
+ Then it
++
+′
+ s∈E(c) s, and f ∈ s∈E(c) s′ ∈Rs (c) s . This means that there
+with f ∈ poss-e ∗ (c), f ∈
+ s′2 . This implies that Π′1 and Π′2 , as
+are no two states s2 ∈ E(c), s′2 = Rs2 (c) with f ∈
+dened in the algorithm, are not solvable because by construction for all goal states of the
+ sg . So f ∈ out.
+two problems with sg ⊇ not-f  it holds f ∈
+⊇: Suppose it holds f ∈ out. Since Π′1 is unsolvable we know that there is no
+executable renement of c that deletes f . Moreover, since Π′2 is unsolvable we also know
+that f is always added if it is not true beforehand. So there is no resulting state in which f
+1417
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+does not hold. Lastly, sincef ∈ poss-e +
+∗ (c) it (f ) is contained in at least one resulting state.
+Additionally, it holds f ∈
+ s∈E(c) s, which means it is not just a positive postcondition but
+explicitly added. Thus, we conclude f ∈ e +
+∗ (c).
+3.2 Preconditions of Compound Tasks
+Algorithm 3 Computes all mandatory preconditions of a compound task
+Input: D = (F, A, C, M ), a planning domain, and c ∈ C, a compound task.
+Output: prec(c)
+1: if Π = (D, F, ⟨c⟩, ∅) is unsolvable then
+2:
+return prec(c) = undef
+3: prec(c) = ∅
+4: for all f ∈ F do
+5:
+Π′ = (D, F \ f , ⟨c⟩, ∅)
+6:
+if Π′ is not solvable then
+7:
+prec(c) = prec(c)  f 
+8: return prec(c)
+The computation of mandatory preconditions of a compound task c is described in
+Algorithm 3. We just need to check for every fact f whether there does not exist an
+executable renement in the state s = F \ f  (Olz et al., 2021, Thm. 3).
+The correctness of Algorithm 3 is straightforward.
+3.3 Precondition-Relaxed Eects
+Computing the exact preconditions and eects of a compound task may take too much time
+in specic applications as can be seen from the algorithms and the underlying computation
+complexity of the problem, which we reported in the previous section. Therefore, we introduced precondition-relaxation to get an under- and over-approximation, respectively, of
+these that can be computed in polynomial time. In this subsection, we present the respective algorithms, which were already described purely textually in the proofs of Theorems 6
+(on the poly-time decidability of possible eects) and Corollary 7 (guaranteed eects) as
+well as of Theorem 7 (on the poly-time decidability of preconditions) by Olz et al. (2021).
+Before we describe the algorithms we would like to clarify that we always assume that
+there are no compound tasks or decomposition methods with only non-terminating renements. By this we mean that every task or method can be rened into a (possibly
+empty) primitive action sequence. Without this assumption the following algorithms can
+lead to wrong results. Note, however, that this assumption is very natural (because such
+tasks would only distract the planner) and easy (in P) to check beforehand, which is also
+done and ruled out by our used planner in the evaluation. More specically, the deployed
+grounder (Behnke, Höller, Schmid, Bercher, & Biundo, 2020) removes compound tasks and
+methods without primitive renements.
+Moreover, w.l.o.g., we assume for the remainder of this article that for all actions a ∈ A
+it holds prec(a)  add (a) = ∅ and add (a)  del (a) = ∅.
+1418
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+Algorithm 5 is the main procedure to compute precondition-relaxed eects. We consider
+one fact f ∈ F after another and curtail the domain according to several subroutines, listed
+in Algorithm 4.
+• We keep only primitive actions that add or delete f as all others are irrelevant.
+Therefore, the function RestrictToEffects(D, f ) takes as input a domain D =
+(F, A, C, M ) and a fact f ∈ F and outputs the domain D ′ = (f , A′ , C, M ′ ), where
+A′ = (∅, add (a)  f , del (a)  f )  a ∈ A \ (∅, ∅, ∅). The set M ′ is obtained
+from M by restricting the task networks to tasks from A′  C instead of A  C. We
+could actually also keep the other facts in the domain but the algorithms are clearer
+and easier to grasp if we remove unnecessary information.
+• A main observation is that it is always the last primitive task in a renement that
+is responsible for determining whether a fact holds after execution or not (recall that
+we removed all facts except for the one under consideration and actions that do not
+aect it). In order to identify such actions we rst need to know whether compound
+tasks can be rened into empty task networks. Therefore, the function EmptyRefinements(D ′ ) is called on the restricted domain and computes the set of compound
+tasks admitting an empty renement, Cε ⊆ C by propagating the information in an
+upwards manner starting with methods with empty task networks. The while-loop
+terminates after at most M  iterations. If a compound task c can be rened into an
+empty task network, we know that f can only be a possible but not a guaranteed
+(positive or negative) precondition-relaxed eect. (Lines 7-9 and 15 are not necessary
+since the stopping condition is that the set Cε has not changed. However, they might
+have a positive impact on the runtime.)
+• As mentioned before, it is always the last primitive task responsible for adding or
+deleting f . Therefore, we can remove tasks preceding this task in all method’s task
+networks as they are irrelevant. However, it is important to consider the case where
+a compound task in a task network can be rened into an empty renement; in
+such cases, the preceding task also becomes relevant. Thus, the function ShortenMethodsFromRight(D ′ , Cε ) identies this task for all decomposition methods and
+removes the tasks that are ordered before it, i.e., we examine every method’s task
+network from right to left and cut o the remaining tasks after we either found a
+primitive task or a compound task that does not admit an empty renement.
+• DecompositionReachability(D) computes for all tasks c ∈ C the set of methods
+that are still reachable via decomposition from c in the restricted domain, i.e., MR =
+m ∈ M  m = (c, tn)  m = (c′ , tn) ∈ M  ∃ tn ′ : ⟨c⟩ → tn ′ ∧ c′ ∈ tn ′ .
+Finally, the eects are determined task by task by analyzing all methods that are still
+reachable via decomposition from that task as described from line 7 to 16: If there is a
+reachable method containing an action a adding f then f is a possible positive preconditionrelaxed eect because then there is a renement of c containing a such that no other action
+adds or deletes f afterwards according to Olz et al. (2021) and the proof below. Furthermore,
+we can conclude that f is even a guaranteed positive precondition-relaxed eect if (1) it is
+a possible positive eect, (2) not a possible negative one, and c can not be rened into an
+1419
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+empty renement. This is because, in the case of (2) or (3), there are renements after the
+execution of which f is not added. The procedure for negative eects follows analogously.
+Algorithm 4 Auxiliary Functions
+1: ▷ Returns Cε ⊆ C, the set of compound tasks admitting an empty renement.
+2: function EmptyRefinements(D = (F, A, C, M ))
+3:
+Cε = ∅; M ′ = M ; setChanged = true
+4:
+for all m = (c, tn = ⟨t1    tn ⟩) ∈ M do
+5:
+if tn = ε and c ∈
+ Cε then
+6:
+Cε = Cε  c
+7:
+M ′ = M ′ \ m
+8:
+if ∃ i : ti ∈ A then
+9:
+M ′ = M ′ \ m
+10:
+while setChanged do
+11:
+setChanged = false
+12:
+for all m = (c, tn = ⟨t1    tn ⟩) ∈ M ′ do
+13:
+if c ∈
+ Cε and ∀i : ti ∈ Cε then
+14:
+Cε = Cε  c
+15:
+M ′ = M ′ \ m
+16:
+setChanged = true
+17:
+return Cε
+
+◁
+
+18: ▷ Returns a domain, where all methods have task networks with at most one task not
+
+in Cε (which then is the rst one).
+
+◁
+
+19: function ShortenMethodsFromRight(D, Cε )
+20:
+21:
+22:
+23:
+24:
+25:
+26:
+27:
+28:
+
+M′ = ∅
+for all m = (c, tn = ⟨t1    tn ⟩) ∈ M do
+tn 2 = tn
+for i = n    1 do
+if ti ̸∈ Cε then
+tn 2 = ⟨ti    tn ⟩
+break
+M ′ = M ′  (c, tn 2 )
+return D ′ = (F, A, C, M ′ )
+
+Theorem 4. Algorithm 5 is sound and complete, i.e., it returns exactly the sets of precondition-relaxed eects of all compound tasks.
+Proof. We only prove the case of positive eects. Therefore, let c ∈ C be a compound task
+∅+
+and poss-e ∅+
+∗ (c), e ∗ (c) its positive precondition-relaxed eects. Let poss-out(c) ⊆ F
+and gua-out(c) ⊆ F be the respective sets returned by Algorithm 5. We show that these
+respective sets are identical in both cases. We assume that D ′ , Cε , D ′′ , and MR are calculated
+and given according to lines 3-6.
+We start with possible eects. Let f ∈ poss-e ∅+
+∗ (c). Then there is a (not necessarily
+executable) primitive renement ā = ⟨a1    an ⟩ of c such that there exists an action ai ∈ ā
+1420
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+Algorithm 5 Calculates the precondition-relaxed eects for all compound tasks
+Input: D = (F, A, C, M ), a t.o. HTN planning domain.
+Output: The sets of precondition-relaxed eects of all compound tasks
+∅−
+∅+
+∅−
+1: poss-e ∅+
+∗ (c) = poss-e ∗ (c) = e ∗ (c) = e ∗ (c) = ∅ for all c ∈ C
+2: for all f ∈ F do
+3:
+D ′ = RestrictToEffects(D, f )
+4:
+Cε = ComputeEmptyRefinements(D ′ )
+5:
+D ′′ = ShortenMethodsFromRight(D ′ , Cε )
+6:
+MR = DecompositionReachability(D ′′ )
+7:
+for all c ∈ C do
+8:
+if ∃ (c′ , ⟨t1    tn ⟩) ∈ MR (c) ∧ i ∈ 1    n : f ∈ add (ti ) then
+∅+
+9:
+poss-e ∅+
+∗ (c) = poss-e ∗ (c)  f 
+′
+10:
+if ∃ (c , ⟨t1    tn ⟩) ∈ MR (c) ∧ i ∈ 1    n : f ∈ del (ti ) then
+∅−
+11:
+poss-e ∅−
+∗ (c) = poss-e ∗ (c)  f 
+12:
+if c ∈
+ Cε then
+13:
+if f ∈ poss-e ∅+
+ poss-e ∅−
+∗ (c) ∧ f ∈
+∗ (c) then
+∅+
+∅+
+14:
+e ∗ (c) = e ∗ (c)  f 
+∅−
+15:
+if f ∈
+ poss-e ∅+
+∗ (c) ∧ f ∈ poss-e ∗ (c) then
+∅−
+16:
+e ∅−
+∗ (c) = e ∗ (c)  f 
+∅+
+∅+
+∅−
+17: return poss-e ∗ (c), poss-e ∅−
+∗ (c), e ∗ (c), e ∗ (c) for all c ∈ C
+with f ∈ add (a) and none of the subsequent actions add or delete f . Let m ∈ M be the
+method that inserted ai into ā. Then the corresponding method m′′ of D ′′ must contain ai
+and m′′ ∈ MR (c). Suppose this is not the case. Since f ∈ add (ai ), it holds ai ∈ A′ (of D ′ ).
+So, ai must have either been cut out from m by ShortenMethodsFromRight(D ′ , Cε )
+or m′′ it is not reachable anymore because some compound task leading to it has been
+deleted from a method. If the former happened, then there must be an action aj with f ∈
+add (aj )  del (aj ) succeeding ai in m and thus also in ā, which contradicts our assumption.
+So, ai is not reachable anymore, since a compound task c1 leading to m has been cut out.
+Suppose this happened in method m1 . Then, there must be a succeeding primitive action
+aj adding or deleting f or a compound task c2 without empty renement in m1 . However,
+then aj or a similar primitive action of the renement of c2 is also contained in ā succeeding
+ai , which again contradicts the assumption. Thus, m′′ ∈ MR (c), ai ∈ m′′ , and therefore
+f ∈ poss-out(c). The opposite direction follows with similar arguments.
+The correct calculation of the guaranteed eects is easy to see. Generally, there are three
+types of renements of c: Either a fact f gets added, deleted, or does not appear in any of
+the involved actions’ eects. In the latter case, c admits an empty renement with respect
+∅+
+ poss-e ∅−
+to f . Therefore, it holds f ∈ e ∅+
+∗ (c) if and only if f ∈ poss-e ∗ (c), f ∈
+∗ (c),
+and c does not admit an empty renement. This is veried starting from line 12.
+3.3.1 Example
+We illustrate Algorithm 5 with an example shown in Figure 3. A compound task c with its
+decomposition methods m1 and m2 is shown at the top. The methods of compound tasks
+1421
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Figure 3: An example demonstrating the mechanisms of Algorithm 5, which computes
+precondition-relaxed eects. The decomposition hierarchy of a compound task c is depicted
+at the top. At the bottom one can see the restricted domain after fact f1 (left), f2 (middle),
+and f3 (right) were considered. Rectangles with sharp corners depict primitive tasks. Tasks
+within a task network are ordered from left to right. As a result we get: poss-e ∅+
+∗ (c) = f1 ,
+∅+
+∅−
+(c)
+=
+f
+,
+e
+(c)
+=
+f
+,
+and
+e
+(c)
+=
+∅.
+f2 , f3 , poss-e ∅−
+2
+3
+∗
+∗
+∗
+within the task networks are also given directly. The hierarchy contains a cycle because
+task network tn 7 can be reached from compound task c1 and does also contain c1 again.
+The methods of c1 and c2 are given after tn 5 , so we do not repeat them for tn 6 and tn 7 .
+The rectangles with sharp corners are primitive tasks.
+At the bottom left we can see the curtailed domain after considering f1 in the outermost
+forall-step. Only the primitive task in tn 1 adds (or deletes) f1 , so all other primitive tasks
+were removed. EmptyRefinements(D) does not change anything. We can conclude that
+f1 is a possible positive precondition-relaxed eect of c because tn1 is still reachable via
+decomposition from c, and it contains a primitive task adding f1 . It is not a guaranteed
+(precondition-relaxed) eect since c can be rened into an empty task network using m2 .
+Next, we examine f2 (depicted in the middle). We consider the original domain – rather
+than the one on the left – and once again remove all irrelevant primitive tasks. Since the
+rightmost task in tn 2 is primitive, we truncate the task network at this point, resulting in
+the removal of c5 and making tn 3 no longer reachable. Consequently, we conclude that f2
+is a possible precondition-relaxed positive and negative eect as it can be decomposed into
+1422
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+tn 2 or tn 4 . Therefore, and for the same reasons as previously discussed, it cannot be a
+guaranteed (positive or negative) eect.
+Finally, we consider f3 (on the right side). Again, we keep only actions adding or
+deleting f3 and cut task networks: We remove c5 in tn 2 and in tn 5 we remove the leftmost
+(primitive) task since c1 does not admit an empty renement. Now, f3 is a (guaranteed)
+positive precondition-relaxed eect of c because 1) there is a task network reachable from c
+with an action adding f3 (e.g., tn 2 ), 2) there is no such task network with an action deleting
+it, and 3) c does not admit an empty renement.
+3.4 Executability-Relaxed Preconditions
+Executability-relaxed preconditions can be computed similarly to eects, as shown in Algorithm 6. To ensure that every renement of c contains a primitive action requiring f and no
+preceding action adds it, the function RestrictToEffects(D, f ) is adapted into two new
+functions: RestrictToPrecsOnly(D, f ) and RestrictToPrecsAndAdds(D, f ). In
+the rst case we keep only actions with f ∈ prec(a) and in the latter if f ∈ prec(a)  add (a).
+Additionally, methods are now curtailed from left to right since we want to check the rst
+task in each renement instead of the last. So, the function ShortenMethodsFromLeft(D ′′ , Cε′ ) mirrors ShortenMethodsFromRight(D ′ , Cε ), with the loop in line 23
+running from 1 to tn instead. Then, f is an executability-relaxed precondition of c if no
+reachable method contains an action adding f , and c does not allow an empty renement
+in the restricted domain where only actions requiring f as a precondition are considered.
+Algorithm 6 Calculates the executability-relaxed preconditions.
+Input: D = (F, A, C, M ), a HTN planning domain.
+Output: The executability-relaxed preconditions of all compound tasks.
+1: prec ∅ (c) = ∅ for all c ∈ C
+2: for all f ∈ F do
+3:
+D ′ = RestrictToPrecsOnly(D, f )
+4:
+Cε = ComputeEmptyRefinements(D ′ )
+5:
+D ′′ = RestrictToPrecsAndAdds(D, f )
+6:
+Cε′ = ComputeEmptyRefinements(D ′′ )
+7:
+D ′′′ = ShortenMethodsFromLeft(D ′′ , Cε′ )
+8:
+MR = DecompositionReachability(D ′′′ )
+9:
+for all c ∈ C do
+10:
+if c ∈
+ Cε ∧ ∄ m = (c′ , tn = ⟨t1    tn ⟩) ∈ MR (c) : ∃ i : f ∈ add (ti ) then
+11:
+prec ∅ (c) = prec ∅ (c)  f 
+12: return prec ∅ (c) for all c ∈ C
+
+Theorem 5. Algorithm 6 is sound and complete, i.e., it returns exactly the sets of executability-relaxed preconditions of all compound tasks.
+Proof Sketch. Let c be a compound task, prec ∅ (c) its executability-relaxed preconditions,
+and the sets D ′ , Cε , D ′′ , Cε′ , D ′′′ , and MR as calculated by Algorithm 6. According to our
+1423
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+denition, it holds f ∈ prec ∅ (c) if and only if for all primitive renements (i.e., ignoring
+executability) ⟨a0    an ⟩ of c there exists an action ai with f ∈ prec(ai ) and there does
+not exist an action aj with j < i and f ∈ add (aj ), where i, j ∈ 0    n. The rst part
+is ensured by the conjunct c ∈
+ Cε in line 10. With similar arguments as for the proof
+of Theorem 4 it holds that there is a renement of c with an action aj adding f and no
+preceding action ai with f ∈ prec(ai ) if and only if there is a method in MR (c) containing
+an action that adds f . So we can conclude that if and only if such a method does not
+exist in MR (c) (second conjunct in line 10) then no such renement exists and f is an
+executability-relaxed precondition.
+
+4. Optimizations Concerning Exact Inference
+Calculating possible positive or negative state-independent eects or postconditions can take
+quite a while as we have to solve at least one planning problem per pair of compound task
+and fact (in the way we do it). However, we can exploit the property of exact possible eects
+being precondition-relaxed possible eects (see Proposition 1) to speed up the calculation.
++
+Because it holds poss-e ∅+
+
+∗ (c) ⊇ poss-e ∗ (c) we can conclude that if a fact f ∈
++
+(c)
+then
+also
+f
+∈
+
+poss-e
+(c).
+So
+instead
+of
+considering
+all
+facts
+in
+F
+as
+being
+poss-e ∅+
+∗
+∗
+candidates for possible state-independent eects we just take the relaxed ones and therefore
+need to solve fewer planning problems, i.e. we improve Algorithm 1 in line 4. Since we can
+calculate the set poss-e ∅+
+∗ (c) in polynomial time this saves a lot of time as we will see
+in the evaluation section. Moreover, since the possible eects are taken as basis for the
+guaranteed ones, this does also aect the eciency of their calculation.
+We had not stated an analogous result for preconditions since we have not dened
+possible executability-relaxed preconditions so far as we had not seen any benet at the
+time. However, now we found an application: We can use them analogously to speed up
+the inference of mandatory preconditions. So we dene them just for this purpose here:
+Denition 7 (Possible Executability-Relaxed Precondition). Let D = (F, A, C, M ) be a
+planning domain and c ∈ C a compound task. We call a fact f a possible executabilityrelaxed precondition of c if and only if there exists a primitive renement (i.e., ignoring
+executability) ⟨a0    an ⟩ of c such that there exists an action ai with f ∈ prec(ai ) and there
+does not exist an action aj with j < i and f ∈ add (aj ), where i, j ∈ 0    n.
+Denition 8 (Possible Executability-Relaxed Preconditions). Let D be a planning domain
+and c ∈ C a compound task. Then the set of possible executability-relaxed preconditions
+of c is poss-prec ∅ (c) := f ∈ F  f is a possible executability-relaxed precondition of c.
+
+∅
+ It is easy to see that prec(c) ⊆ poss-prec (c) holds. Let f ∈ prec(c). Since prec(c) :=
+s∈E(c) s (if E(c) ̸= ∅), we know that there is a state s ∈ E(c) and a renement of c
+executable in s in which there is an action a ∈ A with f ∈ prec(a) and no other action adds
+f beforehand; otherwise, the renement would also be executable in the state s′ = s \ f , so
+s′ ∈ E(c), which contradicts f ∈ prec(c).
+We can calculate the possible preconditions using an adaptation of the algorithm to
+compute executability-relaxed preconditions, i.e., via Algorithm 6. We only need to ensure
+that there is a renement in which a fact f is required due to a primitive task’s preconditions
+before it is potentially added by another one. Therefore, we can skip lines 3 and 4 and
+
+1424
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+alter line 10 as follows: If ∃ m = (c′ , tn = ⟨t1    tn ⟩) ∈ MR (c) : ∃ i : f ∈ prec(ti ) then
+f ∈ poss-prec ∅ (c). Note that the logic behind this is very similar to calculating possible
+eects, which is why we refrain from a formal proof of soundness and completeness. The
+only dierence is that we restrict to actions containing f in preconditions and add eects
+instead of add and delete eects. Moreover, we traverse the task networks from left to right
+to check for the rst occurrence of actions instead of the last ones.
+To summarize, for calculating the exact preconditions and eects we make use of the
+following subset properties:
+∅+
+−
+∅−
+1. poss-e +
+∗ (c) ⊆ poss-e ∗ (c) and poss-e ∗ (c) ⊆ poss-e ∗ (c)
++
+−
+−
+2. e +
+∗ (c) ⊆ poss-e ∗ (c) and e ∗ (c) ⊆ poss-e ∗ (c)
+
+3. prec(c) ⊆ poss-prec ∅ (c)
+
+∅+
+−
+∅−
+4. e +
+∗ (c) ⊇ cor -e ∗ (c) and e ∗ (c) ⊇ e ∗ (c)
+
+5. prec(c) ⊇ prec ∅ (c)
+
++
++
+−
+6. poss-e −
+∗ (c)  e ∗ (c) = ∅ and poss-e ∗ (c)  e ∗ (c) = ∅
+
+7. e +
+∗ (c)  prec(c) = ∅.
+
+We use 1.-3. to restrict the set of possible candidates in Algorithm 1 (line 4) and Algorithm 3 (line 4). Because of 4.-5., we know that we can just add the guaranteed relaxed
+preconditions and eects to the exact ones and do not need to solve the respective planning
+problems. Moreover, (6.-7.), we know that every possible negative eect can not be a guaranteed positive eect, every possible positive eect can not be a guaranteed negative eect,
+and every precondition is not a positive eect. The correctness follows from Proposition 1
+and the explanations above.
+We evaluate the impact on the runtime of exploiting the relaxed preconditions and
+eects for computing the exact ones later on. To make the comparison fairer we will not
+check all facts in the naive approach but only those that actually occur in at least one
+primitive action in a renement of the analyzed compound task. They are called mentioned
+preconditions and eects (the latter are later denoted mnt + (c) and mnt − (c)) (de Silva et al.,
+∅−
++
+−
+2016). It is easy to see that poss-e ∅+
+∗ (c) ⊆ mnt (c) and poss-e ∗ (c) ⊆ mnt (c).
+4.1 A Discussion on Possible Alternative Algorithms
+Before we present the evaluation results, we briey sketch and discuss an alternative approach for calculating inferred preconditions and eects, as suggested by one of our anonymous reviewers. While we do not provide precise algorithms, evaluations, or theoretical
+analyses here – these are beyond the scope of this article – we aim to outline the idea and
+assess its potential advantages and challenges.
+The suggestion is based on the concept of cumulative preconditions and eects of
+STRIPS actions, as introduced by Haslum and Jonsson (2000) as well as Bäckström, Jonsson, and Jonsson (2012). Let ā ∈ A∗ be a sequence of actions and a ∈ A. The cumulative
+1425
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+preconditions and eects of a sequence of actions are dened recursively as follows:
+prec(⟨⟩) = add (⟨⟩) = del (⟨⟩) = ∅
+
+prec(⟨āa⟩) = prec(ā)  (prec(a) \ add (ā))
+add (⟨āa⟩) = (add (ā) \ del (a))  add (a)
+del (⟨āa⟩) = (del (ā) \ add (a))  del (a)
+
+Moreover, ⟨āa⟩ is executable if and only if del (ā)  prec(a) = ∅ and ā is executable.
+For each decomposition method, one could recursively compute the set of composed
+tasks corresponding to all executable sequences of primitive tasks generated by the method.
+However, upon closer examination, several challenges arise:
+Consider exact preconditions and eects. Even in acyclic hierarchies, the number of
+executable action sequences can grow exponentially, and in general hierarchies, this number could be innite. Eciently combining intermediate concatenated action sequences
+would require substantial memory, potentially leading to an exponential storage requirement. Furthermore, calculating everything correctly in such cases would involve non-trivial
+procedures to manage the interactions between preconditions, add eects, and delete eects
+across multiple sequences. If successful, this approach could compute preconditions and
+eects for all facts simultaneously, avoiding the need to solve a planning problem for each
+fact individually. Additionally, it inherently answers the question whether an executable
+action sequence exists, potentially yielding a new planning algorithm. However, as shown
+in Theorem 1, deciding whether a fact is an inferred precondition or eect is as computationally hard as the plan existence problem itself. Thus, one could regard it unlikely that
+this method would signicantly speed up the inference process – yet, one could try and
+compare empirical results.
+For calculating relaxed preconditions and eects, this approach seems more promising.
+Ignoring executability simplies the set manipulations and again allows all facts to be calculated simultaneously. However, this would still likely require storing an exponential number
+of intermediate results, trading o faster computation for increased memory usage. While
+the proposed approach is theoretically interesting, its practical impact may be limited. Our
+current algorithm is already very fast and not the bottleneck in most practical applications.
+Nevertheless, this alternative presents an interesting avenue for future research, particularly
+in comparing its performance to our polynomial-time procedure.
+
+5. Evaluation
+In this section, we report the results of an evaluation of the algorithms presented above.
+The experiments were conducted using the Pandaπ planning system3 (Höller & Behnke,
+2021; Höller, Bercher, Behnke, & Biundo, 2020b). Specically, we used the public release
+and locally integrated Algorithms 5 and 6 to compute the relaxed preconditions and eects
+independently of the planning procedure as a preprocessing step. Algorithms 1, 2, to nd
+state-independent eects, and 3 for the mandatory preconditions are mainly implemented
+as a script that calls the planner accordingly.
+3. https://panda-planner-dev.github.io/
+
+1426
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+Code and scripts are available in the respective repository (Olz, Lodemann, Jutz,
+Schmautz, Borowiec, Biundo, & Bercher, 2025).
+5.1 The Evaluation Setting
+We run our experiments on a server with a Xeon(R) Gold 6144 CPU and 174 GiBs of RAM
+running Ubuntu 20.04 LTS.
+The inference problem of preconditions and eects of compound tasks can be reduced
+to several planning problems as outlined in section 3. We will call these planning problems
+decision problems in the remainder to distinguish them from the general planning problems
+of which we want to analyze the compound task’s preconditions and eects. We attempted
+to solve every decision problem by using several planning systems in the following order.
+Every planner was granted 1800 seconds (= 30 minutes) and 8 GiBs of RAM for one decision
+problem. First, we handed each problem to the progression-based planner Pandaπ with
+GBFS and loop detection in combination with the Relaxed Composition (RC) heuristic
+(Höller et al., 2020b) with the classical Add heuristic (Bonet & Gener, 2001) as inner
+heuristic, since this is its currently best-performing conguration for the t.o. setting (Höller
+& Behnke, 2021). If a timeout occurred, the problem was given to Pandaπ -SAT (Behnke
+et al., 2018; Behnke, 2021). If we still got no result, we tried Pandaπ -BDD (Behnke &
+Speck, 2021). Overall, we set a timeout of 15 days to calculate all preconditions and eects of
+all compound tasks of one planning problem instance. One of the main issues leading to the
+high computation times was considering the problems that do not have a solution, as most
+planners are primarily designed for solvable planning problems. Specically, although the
+decision problem of whether a total-order HTN planning problem is unsolvable is decidable,
+most current planners are not decision procedures. This means they might run indenitely
+without being able to prove the problem’s unsolvability.
+We considered the total-order IPC 2020 benchmark set4 and added the two new domains,
+Lamps and SharpSAT, from 20235 to evaluate the presented techniques and algorithms. In
+total, we considered 26 domains. Since we were not able to calculate the exact preconditions
+and eects for most of the contained problem instances within the determined time limit we
+restricted the analysis to the rst problem instance of every domain with one exception: We
+considered the whole AssemblyHierarchical domain since here we got results for all problem
+instances quickly. Additionally, we excluded the initial compound task of every instance,
+which has only one method containing the initial task network, in order to get results in
+reasonable time. As they represent the whole planning problem we see little information
+gain in calculating their preconditions and eects.
+In order to measure the impact of using the relaxed preconditions and eects to calculate
+the exact ones, presented in Section 4, we calculated them once naively with only using
+mentioned preconditions and eects and once with the help of the precondition-relaxed
+version. The other mentioned optimizations we exploited in both runs.
+When we compare exact positive guaranteed eects with the relaxed version we consider
+∅+
+the adapted positive eects (cor -e ∅+
+∗ (c) = e ∗ (c) \ prec(c)) instead of the latter so that
++
+the relation cor -e ∅+
+∗ (c) ⊆ e ∗ (c) holds as already discussed in Subsection 2.2.2.
+4. https://ipc2020.hierarchical-task.net/
+5. https://ipc2023-htn.github.io/
+
+1427
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+To increase the informative value we also calculate the preconditions and eects of every
+method in addition to every task. This was done by adding an extra task to the problem
+which can only be decomposed by the method we want to analyze.
+In the following subsections, we present our ndings, which are visualized in graphs. For
+readers who are interested in delving into specic aspects in more detail, we also provide
+two tables with some of the underlying data in the appendix.
+5.2 Computation Eort
+Overall, we observed that calculating the exact preconditions and eects of compound tasks
+and methods is often not possible in reasonable time. This is not surprising given the complexity of the underlying problems (see Theorem 1). In particular, for our evaluation, this
+means that we do not have information about both Monroe domains and the methods of
+Minecraft Player since the analyses terminated after the runtime exceeded 15 days. Moreover, we could not completely analyze the domains Blocksworld-GTOHP, Hiking, Satellite,
+Logistic, Minecraft Player (tasks), SharpSAT, and Freecell because for each of them some
+of the decision problems were not solvable by any of the used solvers within the given time
+or memory limit. This was also the case for computing the preconditions and eects of
+compound tasks in the domain Snake, however, the evaluation was successful for the ones
+of methods.
+In this subsection, we want to report how much time it took to infer the exact preconditions and eects and the time that we could save by using the optimizations. For this, we
+only compare and report the computation eort for domains and problems, respectively, for
+which the analyses terminated within the time limit in both cases, i.e., when we used the
+additional information of precondition-relaxed eects and when we did not. Additionally,
+we excluded the problems for which Pandaπ -SAT or Pandaπ -BDD were needed since they
+skew the results disproportionally (so only problem instances that could be fully analyzed
+with only Pandaπ with GBFS are included). This leaves us with the rst problem instances
+of 15 domains. (The problem instances 3 to 30 of the AssemblyHierarchical domain are only
+solvable when we used the additional information of precondition-relaxed eects. Transport and problem instance 2 of AssemblyHierarchical needed Pandaπ -BDD, Snake needed
+Pandaπ -SAT.)
+We report statistics concerning the inference time in Figure 4. The overall time needed to
+infer preconditions and eects of one problem instance is given in Figure 4a. On average 286
+seconds were needed to calculate the information for compound tasks with optimizations and
+604 seconds without. For the methods, it took 427 seconds and 1295 seconds, respectively.
+Figure 4b illustrates the reduction of calculation eort in percentage terms. Lastly, we report
+the number of decision problems that we saved by using the precondition-relaxed eects in
+Figure 4c. For the compound tasks, on average 961 decision problems were needed with
+the optimization and 1320 without. For preconditions and eects of methods, we have 1712
+versus 2940 decision problems.
+5.3 Quantitative Analysis
+In this section, we present the main results of this note, namely the quantitative evaluation of
+precondition-relaxed eects and executability-relaxed preconditions compared to the exact
+1428
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+80
+
+1,000
+100
+10
+
+Mean
+T asks
+Met hods
+
+60
+
+40
+
+20
+
+50
+
+Reduct ion in %
+
+Mean
+T asks
+Met hods
+
+Reduct ion in %
+
+Search t ime in sec
+
+10,000
+
+Mean
+T asks
+Met hods
+
+40
+30
+20
+10
+
+1
+T ime wit h
+relaxed informat ion
+
+T ime wit hout
+relaxed informat ion
+
+(a) Time to infer exact precs/es with
+(left) and without (right) optimizations.
+
+0
+
+(b) Reduction of
+calculation time.
+
+0
+
+(c) Reduction of
+decision problems.
+
+Figure 4: Boxplots displaying the time and number of decision problems saved per problem
+instance when utilizing relaxed preconditions and eects for inferring exact preconditions
+and eects, compared to the naive approach.
+ones. For this, we excluded all of the Assembly instances except for the rst one to not
+overrepresent this domain. However, in the last subsection, we will have a closer look at
+how the results scale with increasing problem size.
+Preconditions Concerning preconditions of compound tasks our results show that the
+set of executability-relaxed preconditions and the exact ones are identical. This is not only
+surprising but also a quite positive result since for the considered set of domains we can
+solve an EXPTIME-complete problem (in the worst case) by using a polynomial algorithm.
+When looking at the preconditions of methods, the results are slightly weaker. Three
+of 47 preconditions are missing in the set of executability-relaxed eects in the Elevator
+domain, which leads to an approximation quality of 9362% for this domain. All others
+match perfectly. So, in total we observed an approximation quality of 9996% overall and
+9962% on average per domain.
+Guaranteed Eects Now, we report the comparison of exact and relaxed guaranteed
+eects, which are displayed in Figure 5.
+−
+In case of negative eects the sets e ∅−
+∗ (c) and e ∗ (c) are again identical for tasks!
+When we consider negative eects of methods, the sets are nearly identical with the exception of six missing eects each in the Towers (out of 150) and Rover (out of 51) domain
+as well as eight out of 28 in the Elevator domain. This results in an overall approximation
+quality of 9970%, an average approximation quality per domain of 9739% for the methods,
+and 100% for the tasks.
+Moving on to guaranteed positive eects we can see a diverse spectrum. The approximation of relaxed eects of tasks is very good in domains like Assembly, Childsnack, Lamps,
+Robot, Towers, and Woodworking. On the other side, we nd hardly any relaxed positive guaranteed eects in Elevator-Learned, Entertainment, and Minecraft-Regular. In the
+other domains, the approximation quality is distributed between around 20% and 80%.
+Overall we have an approximation quality of 6367% and 5837% on average per domain
+for the tasks. When we compare these results with those of the methods we can see that
+the relaxed eects of methods are closer to the exact eects in most domains with 9066%
+overall approximation quality and 7584% average approximation quality per domain.
+1429
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+cor -e ∅+
+∗
+
+e +
+∗
+
+e −
+∗
+
+e ∅−
+∗
+
+AssemblyHierarchical 01
+AssemblyHierarchical 15
+AssemblyHierarchical 30
+Barman BDI
+Blocksworld HPDDL
+Childsnack
+Depots
+Elevator Learned ECAI 16
+Entertainment
+Factories simple
+Lamps
+Minecraft Regular
+Multiarm Blocksworld
+Robot
+Rover GTOHP
+Snake
+Towers
+Transport
+Woodworking
+
+0
+
+25
+
+50
+
+75
+
+Tasks
+
+100
+
+0
+
+25
+
+50
+
+75
+
+100
+
+Methods
+
+Figure 5: The percentage of precondition-relaxed eects compared to exact ones per domain.
+The darker colors indicate the percentage of the prec-relaxed eects, i.e. a full bar means
+that exact and prec-relaxed eects are the same. If X% of a bar is dark then X% of the
+exact eects are also precondition-relaxed eects. The rst line of each domain represents
+positive eects, the second lines are negative ones.
+
+For the above evaluation, we used the sets cor -e ∅+
+∗ (c) (i.e., adapted positive precondition-relaxed eects) instead of the original precondition-relaxed eects as also mentioned earlier. We report on the number of occurrences here. For tasks, 51 out of 447
+precondition-relaxed eects are also preconditions. All of them are found in the Woodworking domain. So overall, we adapted 1141% of the relaxed positive eects. On average per
+domain, we needed to adjust 249%. Considering methods, 798 of 5,117 eects are preconditions as well. This equals 1560%. These 798 facts are spread over 10 domains resulting
+in 1319% eects that need to be adapted on average per domain.
+Possible Eects Now, we discuss the possible eects. We rst compare exact and
+precondition-relaxed possible eects, afterwards, we compare possible precondition-relaxed
+eects with the guaranteed ones. For the tasks, there are 4,083 possible negative precondition-relaxed eects while there are 4,040 exact ones (recall that the possible precondition-relaxed eects are an overapproximation of the exact ones). This equals an
+accuracy of 9895%. For the methods, we have 16,748 precondition-relaxed and 16,651
+1430
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+Accuracy in %
+
+100
+
+80
+
+60
+
+40
+
+Mean
+T asks
+Met hods
+
+P ossible negat ive effect s
+
+P ossible posit ive effect s
+
+Figure 6: Boxplot displaying percentage dierence of possible precondition-relaxed and
+exact eects. One data point represents one problem instance.
+exact eects, which results in 9942% accuracy. The average accuracy is 9705% for the
+tasks and 9603% for the methods.
+Considering positive eects, we found 2,784 possible precondition-relaxed eects of tasks
+and 12,787 of methods. The exact ones are 2,182 and 11,278 many, respectively. This results
+in an accuracy of 7838% (tasks) and 8820% (methods). On average per problem, we have
+8691% (tasks) and 8592% (methods) accuracy.
+All in all, we can see that the possible precondition-relaxed eects approximate the
+exact ones quite well in the analyzed domains. We report their percentage dierence for
+positive and negative eects in Figure 6.
+In Figure 7, we report how many of the (precondition-relaxed) possible eects are guaranteed ones and compare them additionally with the mentioned eects. For tasks, we can
+see that the shares of guaranteed eects are quite low for almost all domains except for
+Assembly and Woodworking. For methods, the shares become higher, which matches our
+intuition since the guaranteed eects of tasks are the conjunction of the ones of their respective methods. If we compare possible and mentioned eects, we see a quite diverse
+spectrum. There are domains (e.g., Assembly and Robot) in which the sets are identical.
+On the other hand, in domains like Childsnack, Entertainment, and Minecraft Regular less
+than half (for either positive or negative ones) of the mentioned are possible eects. Thus,
+it seems to depend on the domain whether it pays out to compute possible rather than just
+mentioned eects (the latter is easier to compute).
+Inuence of Instance Size Lastly, we look at how the numbers of preconditions and
+eects scale with increasing instance size. We do this only exemplary for the AssemblyHierarchical domain since we did not get results for the other ones. Figure 8 on the left
+shows that the maximum number and mean of preconditions and guaranteed eects, as
+well as the mean of possible eects per compound task converge quite fast to some number between zero and four. The maximum number of possible eects increases linearly as
+1431
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+e +
+∗
+e −
+∗
+
+poss-e +
+∗
+poss-e −
+∗
+
+mnt +
+mnt −
+
+AssemblyHierarchical 01
+AssemblyHierarchical 15
+AssemblyHierarchical 30
+Barman BDI
+Blocksworld HPDDL
+Childsnack
+Depots
+Elevator Learned ECAI
+Entertainment
+Factories simple
+Lamps
+Minecraft Regular
+Multiarm Blocksworld
+Robot
+Rover GTOHP
+Snake
+Towers
+Transport
+Woodworking
+0
+
+25
+
+50
+
+75
+
+Tasks
+
+100
+
+0
+
+25
+
+50
+
+75
+
+100
+
+Methods
+
+Figure 7: Percentage of how many guaranteed and possible eects are mentioned eects,
+respectively. The lightest colors represent the percentage of mentioned eects that are not
+possible (including guaranteed) ones, while the middle colors represent the percentage of
+eects that are possible but not guaranteed.
+
+shown in Figure 8 on the right. Those ndings are reasonable and can be explained as
+follows: The number of facts increases with increasing instance size, so it is likely that more
+facts are reachable, which leads to more maximum possible eects. On the other hand, the
+problem instances were created using one lifted domain description, which means that with
+increasing instance size one lifted action creates more grounded instances, but they do not
+change their structure, which makes it reasonable that the number of guaranteed and mean
+of possible eects does not change with increasing size. However, this is an evaluation of
+just one domain, it might be dierent for another one, especially if the problem instances
+are not just created by only increasing the number of grounded instances of the same lifted
+actions.
+1432
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+max(e +
+∗)
+
+max(e −
+∗)
+max(prec)
+
+6
+
+mean(e +
+∗)
+
+mean(e −
+∗)
+mean(prec)
+
+mean(poss-e +
+∗)
+
+mean(poss-e − )
+
+max(poss-e +
+∗)
+
+mean(e +
+∗)
+
+4
+
+200
+
+2
+
+0
+
+max(poss-e −
+∗)
+
+300
+
+100
+
+0
+
+10
+
+20
+
+Assembly instance number
+
+0
+
+30
+
+0
+
+10
+
+20
+
+Assembly instance number
+
+30
+
+Figure 8: Number of preconditions and eects per compound task (circles) or method
+(triangles) with increasing problem instance size in the Assembly domain.
+5.4 Comparison to HyperTensioN and Lilotane
+We mentioned that the planners HyperTensioN (Magnaguagno et al., 2021) and Lilotane
+(Schreiber, 2021) also infer preconditions in a preprocessing step. In this subsection, we
+compare these approaches empirically, though this comparison comes with inherent limitations due to dierences in the nature of the models they operate on. HyperTensioN and
+Lilotane are designed to work with lifted models, while our inference algorithms operate on
+a grounded model. These dierences lead to two possible strategies for comparison:
+1. We pass the lifted problem description to HyperTensioN and Lilotane and ground their
+output afterwards. However, this approach complicates the quantitative comparison
+of results due to transformations introduced by the grounding process. Grounders,
+such as the one of the Pandaπ planning system (Behnke et al., 2020), perform feature
+compilations (e.g., handling of negative preconditions) resulting in additional articial
+facts and actions and prune unreachable parts of the domain. Similarly, HyperTensioN
+and Lilotane prune parts of the domain during preprocessing to improve planning
+eciency. While these transformations are advantageous for planning, they can lead
+to dierences in the sets of inferred preconditions making direct comparisons dicult.
+2. We pass the grounded problem, generated by the grounder of the Pandaπ planning
+system and compiled to HDDL, to both HyperTensioN and Lilotane. This new HDDL
+problem contains only nullary predicates, eectively converting the lifted HTN planning problem into a propositional form. This allows for a more direct comparison of
+the inferred preconditions and eects. However, even here, challenges arise because
+HyperTensioN and Lilotane still prune parts of the domain during their preprocessing.
+Additionally, comparing runtime in this scenario may be unfair, as their algorithms
+are optimized for lifted domains and may not perform as well on grounded models
+and could circumvent techniques that only work in the original, lifted domain.
+Given these considerations, we adopt the following approach for our evaluation: To compare
+the sets of inferred preconditions, we use the grounded problem as input for all three systems (our approach, HyperTensioN, and Lilotane). To compare runtime, we also evaluate
+HyperTensioN and Lilotane on their intended lifted problem.
+1433
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Since our algorithm to infer relaxed preconditions runs in polynomial time and can be
+computed in a reasonable timeframe, we consider all problem instances from all domains
+for this analysis. We report the minimum, maximum, and average inference times of our
+poly-time algorithms in Table 2 in the Appendix.
+
+domain
+
+prec ∅ (m)
+
+Lilotane
+
+HyperTensioN
+
+Assembly
+
+48
+3066
+125
+40213
+5802
+258444
+
+48
+2834
+115
+35030
+5790
+258360
+
+48
+2834
+115
+34880
+5790
+258360
+
+100
+
+99.25
+
+99.19
+
+Depots
+Hiking
+Mean coverage compared to prec ∅ (m)
+
+Table 1: Sum of all inferred preconditions of all methods per problem instance. Grey rows
+correspond to the rst problems, white rows correspond to the largest problems for which
+all approaches terminated within the given time restrictions. For the other domains, the
+sums are identical for all three approaches.
+
+In Table 1, we report the number of inferred method preconditions, though these results should be interpreted with caution. As previously mentioned, our relaxed inference
+procedure is capable of identifying nearly all exact preconditions in the evaluated problems.
+HyperTensioN and Lilotane yield similar results, so we only highlight the domains where
+dierences exist between the relaxed preconditions and those identied by the other two
+planners. Except for the larger Assembly instances, Depot, and Hiking, all approaches
+identify the same number of preconditions per problem, provided they terminate within
+1800 seconds. Overall, out of 953 problems, our algorithm – incorporating both relaxed
+eects and preconditions – was able to terminate within 1800 seconds for 887 problems. In
+comparison, HyperTensioN terminated for 739 problems and Lilotane for 819. On average,
+HyperTensioN identied 9919% and Lilotane 9925% of our relaxed preconditions.
+As HyperTensioN and Lilotane are designed for lifted models and thus more general,
+a search time comparison based only on the grounded problems seems unfair as described
+above. So, we also evaluate their inference times on the original lifted problems. In Figure 9,
+we report the time for all three approaches to infer the preconditions of methods, with
+HyperTensioN and Lilotane having two variants: one for the original lifted problem and one
+for the problem that was rst grounded. In the lifted domains, HyperTensioN terminated
+within the given time limits for all 953 problems, while Lilotane solved 948. Although our
+approach performed worse than these lifted versions in terms of both speed and the number
+of successfully processed problems, it outperformed the grounded variants of HyperTensioN
+and Lilotane and solved more problems (905 versus 739 and 819, respectively). Note that the
+dierences are also inuenced by the grounding process, which successfully grounded only
+906 of the 953 problems. As a result, these ndings should again be interpreted cautiously.
+1434
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+953
+900
+
+Number of solved inst ances
+
+800
+700
+600
+500
+400
+300
+HyperT ensioN (Grounded)
+200
+
+HyperT ensioN (Lift ed)
+Lilot ane (Grounded)
+
+100
+
+Lilot ane (Lift ed)
+P anda
+
+0
+
+0.1
+
+1
+
+10
+
+100
+
+1000
+
+Runt ime in sec
+
+Figure 9: Inference time for relaxed preconditions of methods calculated by HyperTensioN,
+Lilotane, and our approach. Beware of the log-scale.
+
+6. Conclusion
+We introduced pseudocode for computing inferred preconditions and eects of compound
+tasks and methods. We provided this code both for the exact sets (i.e., the complete set
+of existing preconditions and eects) and for relaxed sets (i.e., a subset of the exact ones).
+Since relaxed preconditions and eects can be computed in polynomial time, whereas the
+exact sets are between PSPACE- and EXPTIME-complete, two natural questions arose:
+(1) Can the exact sets still be computed in practice? (2) How useful are the relaxed ones,
+i.e., what percentage of the exact preconditions and eects can still be discovered using the
+relaxed computation?
+In our extensive evaluation, our ndings show that, as expected, calculating the exact preconditions and eects is indeed hardly feasible. Fortunately, our experiments also
+demonstrate that, in the evaluated domains, the relaxed preconditions reveal large parts of
+the exact preconditions and eects, despite the relaxation that reduces complexity to only
+P. By making the inference methods more accessible, we believe that these preconditions
+and eects are not only useful for the existing applications such as heuristics or pruning
+in search-based or SAT-based planning, but also provide opportunities for new ideas and
+further research in total-order HTN planning. In future work, we hope to draw inspiration
+from HyperTensioN and Lilotane to generalize our inference techniques to lifted models.
+1435
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Acknowledgments
+In Subsection 3.3, we added an assumption necessary for the correctness of Algorithm 5,
+thanks to Patrik Haslum, which had not been stated explicitly in the foundation paper (Olz
+et al., 2021). Additionally, we sincerely thank our anonymous reviewers for their thoughtful
+and constructive feedback, which signicantly enhanced this article.
+Pascal Bercher is the recipient of an Australian Research Council (ARC) Discovery
+Early Career Researcher Award (DECRA), project number DE240101245, funded by the
+Australian Government.
+
+Appendix A
+A.1 On Eects versus Postconditions
+Unfortunately, the denitions of our inferred postconditions and eects do not always align
+perfectly with our intuitive understanding of their dierences. To recap, intuitively, eects
+are considered to be facts explicitly added by a renement, whereas postconditions may
+also hold after execution because they were true before and were not subsequently deleted.
+The following examples in Figure 10 illustrate some known pitfalls:
+
+c1
+m1
+
+m2
+m3
+
+f1 a1 f2
+
+a2 f1
+
+f1 a1 f2
+
+(a) A compound task c1 with its two decompositions methods m1 and m2 .
+
+f
+f2 a3 1
+f3
+
+(b) A decomposition method m3 (without
+compound task).
+
+Figure 10: Examples illustrating deciencies concerning the denitions of inferred eects
+and postconditions.
+In Figure 10a, there is the compound task c1 with its two decomposition methods. The
+fact f1 is included in e +
+∗ (c1 ) because f1 holds after the execution of both a1 and a2 , and
+it is not a mandatory precondition. However, f1 is not actually added by a1 , and thus,
+intuitively, we might consider it a postcondition, yet by denition is declared an eect.
+This is accurately reected in the relaxed version, where f1 ̸∈ e ∅+
+∗ (c1 ).
+In Figure 10b, we have a method containing two primitive tasks within its task network.
+The fact f1 is required as a precondition for a1 and is additionally added by a3 . It is
+not entirely clear whether f1 should be classied as an eect or merely a postcondition.
+Intuitively, we tend to consider it a postcondition, but since it is explicitly added, one
+might also view it as an eect. Our denitions classify f1 as a postcondition, as f1 ∈
++
+post +
+∗ (m3 ) and f1 ̸∈ e ∗ (m3 ). In the relaxed version, however, f1 is considered an eect,
+∅+
++
+i.e., f1 ∈ e ∅+
+∗ (m3 ). This example demonstrates that e ∗ (m3 ) ⊆ e ∗ (m3 ) does not
+∅+
++
+always hold, but rather e ∗ (m3 ) ⊆ post ∗ (m3 ).
+1436
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+When developing the denitions of inferred eects and postconditions, we aimed to avoid
+these unintuitive situations. However, each version we considered had its own weaknesses,
+leading us to adopt the version presented here. For practical applications, these issues have
+minimal impact but should be carefully considered.
+A.2 Additional Evaluation Results
+In Table 2, we provide an overview of the minimum, maximum, and average computation
+times for inferring the relaxed preconditions and eects per problem, as well as the number
+of problems per domain for which the inference algorithm successfully terminated. Since
+the runtime for inferring relaxed preconditions and eects is signicantly lower compared to
+the exact ones, we include all problems from all domains in this table. However, note that in
+some larger instances, it was not our inference algorithm but rather the parser or grounder
+exceeding the given time or resource constraints. The maximum and average times are
+sometimes quite high because they include unsolvable problems. Olz and Bercher (2023b)
+provide statistics on the percentage of overall search time required for calculating inferred
+preconditions and eects in their supplemental material.
+An overview over the maximum and average number of exact preconditions as well as
+possible and guaranteed eects per compound task and method are displayed in Table 3 and
+Table 4, respectively. Grey lines refer to the exact preconditions and eects, while white
+lines correspond to relaxed ones.
+
+1437
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+domain
+Assembly
+Barman-BDI
+Blocksw.-GTOHP
+Blocksw.-HPDDL
+Childsnack
+Depots
+Elevator-Learned
+Entertainment
+Factories
+Freecell-Learned
+Hiking
+Lamps
+Logistics-Learned
+Minecraft Pl.
+Minecraft Reg.
+Monroe FO
+Monroe PO
+Multiarm-Blocksw.
+Robot
+Rover
+Satellite
+SharpSAT
+Snake
+Towers
+Transport
+Woodworking
+
+problems
+
+coverage
+
+min
+
+max
+
+mean
+
+30
+20
+30
+30
+30
+30
+147
+12
+20
+60
+30
+30
+80
+20
+59
+20
+20
+74
+30
+30
+20
+21
+20
+20
+40
+30
+
+30
+20
+30
+30
+26
+29
+147
+12
+20
+45
+26
+30
+80
+4
+42
+20
+20
+74
+30
+27
+20
+14
+20
+20
+40
+30
+
+0.01
+0.04
+0.02
+0.02
+0.09
+0.02
+0.02
+0.01
+0.03
+12.24
+0.15
+0.02
+0.02
+5.09
+0.03
+35.01
+35.56
+0.02
+0.01
+0.02
+0.01
+0.02
+0.05
+0.02
+0.01
+0.02
+
+0.24
+276.46
+95.39
+24.55
+542.35
+1073.22
+0.95
+0.23
+7.00
+682.26
+892.97
+20.15
+16.98
+285.48
+62.43
+51.02
+72.90
+6.29
+0.63
+1651.06
+865.71
+37.43
+25.12
+2.74
+18.12
+237.14
+
+0.09
+22.21
+6.10
+2.65
+37.87
+49.02
+0.29
+0.09
+1.53
+242.92
+47.68
+1.73
+3.15
+159.38
+2.37
+39.57
+42.19
+0.74
+0.14
+207.67
+98.71
+5.34
+2.22
+0.64
+1.72
+34.22
+
+Table 2: For each domain, we report the minimum, maximum, and average inference times
+for the relaxed preconditions and eects per problem in seconds. The problem and
+coverage columns indicate the number of problems for which the inference algorithm
+successfully terminated within the given time and memory limits (noting that in some
+cases, these limits were exceeded during the parsing or grounding phase).
+
+1438
+
+Entertainment
+Factories
+Lamps
+Minecraft Reg.
+Multiarm-Blocksw.
+Robot
+Rover
+Towers
+Transport
+Woodworking
+
+mean(prec(c))
+
+Elevator-Learned
+
+max(prec(c))
+
+Depots
+
+mean(e +
+∗ (c))
+
+Childsnack
+
+max(e +
+∗ (c))
+
+Blocksw.-HPDDL
+
+mean(e −
+∗ (c))
+
+Barman-BDI
+
+max(e −
+∗ (c))
+
+Assembly30
+
+mean(poss-e +
+∗ (c))
+
+Assembly15
+
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+
+max(poss-e +
+∗ (c))
+
+Assembly01
+
+mean(poss-e −
+∗ (c))
+
+domain
+
+max(poss-e −
+∗ (c))
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+13
+13
+181
+181
+361
+361
+36
+36
+33
+33
+80
+80
+17
+17
+13
+19
+37
+37
+13
+14
+2
+2
+3
+3
+24
+24
+3
+3
+9
+9
+15
+15
+6
+6
+11
+11
+
+625
+625
+340
+34
+337
+337
+1326
+1326
+1007
+1007
+1193
+1193
+744
+744
+518
+755
+1179
+1179
+621
+686
+2
+2
+172
+172
+727
+727
+2
+2
+426
+456
+58
+58
+36
+36
+326
+326
+
+14
+14
+182
+182
+362
+362
+34
+34
+27
+29
+14
+17
+14
+16
+10
+19
+10
+11
+8
+8
+2
+2
+6
+6
+23
+23
+3
+3
+8
+9
+14
+15
+4
+4
+13
+13
+
+675
+675
+309
+309
+304
+304
+1498
+1498
+8
+893
+139
+392
+592
+648
+445
+755
+295
+395
+479
+486
+2
+2
+335
+335
+627
+64
+2
+2
+333
+448
+56
+58
+22
+22
+332
+455
+
+1
+1
+2
+2
+2
+2
+4
+4
+2
+2
+1
+1
+2
+2
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+2
+2
+1
+1
+1
+1
+1
+1
+1
+1
+3
+3
+
+025
+025
+131
+131
+132
+132
+098
+098
+086
+086
+094
+094
+076
+076
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+067
+067
+033
+033
+004
+004
+04
+04
+04
+04
+083
+083
+
+2
+2
+2
+2
+2
+2
+6
+6
+6
+1
+2
+2
+2
+2
+1
+0
+2
+0
+1
+1
+0
+0
+3
+0
+6
+1
+1
+1
+1
+1
+1
+1
+2
+2
+5
+5
+
+075
+075
+099
+099
+100
+1
+198
+154
+136
+064
+108
+108
+116
+076
+1
+0
+105
+0
+079
+014
+0
+0
+169
+0
+113
+047
+033
+033
+085
+022
+04
+04
+14
+08
+149
+242
+
+1
+1
+3
+3
+3
+3
+4
+4
+2
+2
+2
+2
+1
+1
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+2
+2
+1
+1
+1
+1
+1
+1
+1
+1
+4
+4
+
+075
+075
+230
+23
+232
+232
+119
+119
+086
+086
+125
+125
+036
+036
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+087
+087
+067
+067
+037
+037
+04
+04
+04
+04
+189
+189
+
+Table 3: Number of preconditions and eects per compound tasks.
+
+1439
+
+Entertainment
+Factories
+Lamps
+Minecraft Reg.
+Multiarm-Blocksw.
+Robot
+Rover
+Snake
+Towers
+Transport
+Woodworking
+
+mean(prec(m))
+
+Elevator-Learned
+
+max(prec(m))
+
+Depots
+
+mean(e +
+∗ (m))
+
+Childsnack
+
+max(e +
+∗ (m))
+
+Blocksw.-HPDDL
+
+mean(e −
+∗ (m))
+
+Barman-BDI
+
+max(e −
+∗ (m))
+
+Assembly30
+
+mean(poss-e +
+∗ (m))
+
+Assembly15
+
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+Exact
+Relaxed
+
+max(poss-e +
+∗ (m))
+
+Assembly01
+
+mean(poss-e −
+∗ (m))
+
+domain
+
+max(poss-e −
+∗ (m))
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+13
+13
+181
+181
+361
+361
+36
+36
+33
+33
+20
+20
+16
+16
+13
+19
+37
+37
+13
+14
+2
+2
+3
+3
+24
+24
+3
+3
+8
+9
+51
+51
+15
+15
+4
+4
+10
+10
+
+243
+243
+202
+202
+201
+201
+806
+806
+826
+826
+467
+467
+473
+482
+232
+339
+945
+945
+332
+39
+1
+1
+135
+135
+564
+564
+143
+143
+268
+299
+1441
+1441
+263
+289
+187
+187
+209
+209
+
+14
+14
+182
+182
+362
+362
+34
+34
+27
+29
+2
+5
+13
+15
+10
+19
+10
+11
+8
+8
+2
+2
+6
+6
+23
+23
+3
+3
+8
+9
+44
+44
+13
+15
+3
+3
+12
+13
+
+267
+267
+183
+183
+182
+182
+976
+976
+654
+721
+122
+187
+393
+466
+196
+339
+236
+307
+284
+287
+1
+1
+226
+266
+5
+518
+129
+143
+21
+293
+1232
+126
+263
+311
+133
+133
+212
+344
+
+2
+2
+2
+2
+2
+2
+4
+4
+4
+4
+3
+3
+7
+7
+2
+2
+5
+5
+3
+3
+1
+1
+2
+2
+3
+3
+1
+1
+2
+2
+4
+4
+3
+3
+2
+2
+4
+4
+
+129
+129
+14
+14
+14
+14
+15
+15
+192
+192
+289
+289
+234
+234
+1
+071
+125
+125
+074
+074
+05
+05
+043
+043
+139
+139
+071
+071
+071
+062
+365
+365
+185
+178
+107
+107
+155
+155
+
+2
+2
+2
+2
+2
+2
+7
+6
+6
+4
+2
+2
+5
+6
+5
+2
+6
+3
+2
+1
+1
+1
+3
+2
+7
+4
+1
+1
+2
+1
+4
+4
+3
+3
+3
+2
+5
+7
+
+152
+152
+121
+121
+121
+121
+28
+212
+256
+172
+122
+154
+193
+224
+125
+071
+155
+057
+097
+055
+05
+05
+134
+082
+211
+139
+071
+071
+096
+071
+328
+33
+189
+2
+133
+107
+155
+281
+
+3
+3
+3
+3
+3
+3
+5
+5
+6
+6
+3
+3
+5
+5
+4
+3
+3
+3
+2
+2
+1
+1
+2
+2
+6
+6
+2
+2
+2
+2
+4
+4
+3
+3
+2
+2
+4
+4
+
+229
+229
+259
+259
+26
+26
+169
+169
+264
+264
+259
+259
+187
+187
+168
+157
+12
+12
+084
+084
+05
+05
+085
+085
+248
+248
+143
+143
+121
+121
+361
+361
+244
+244
+1
+1
+282
+282
+
+Table 4: Number of preconditions and eects per decomposition method.
+1440
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+References
+Alford, R., Bercher, P., & Aha, D. W. (2015). Tight bounds for HTN planning. In Proceedings of the 25th International Conference on Automated Planning and Scheduling
+(ICAPS 2015), pp. 7–15. AAAI Press.
+Bäckström, C., Jonsson, A., & Jonsson, P. (2012). Macros, reactive plans and compact representations. In Proceedings of the 20th European Conference on Articial Intelligence
+(ECAI 2012), pp. 85–90. IOS Press.
+Behnke, G. (2021). Block compression and invariant pruning for SAT-based totally-ordered
+HTN planning. In Proceedings of the 31st International Conference on Automated
+Planning and Scheduling (ICAPS 2021), pp. 25–35. AAAI Press.
+Behnke, G., Höller, D., Bercher, P., Biundo, S., Pellier, D., Fiorino, H., & Alford, R. (2019).
+Hierarchical planning in the IPC. In Proceedings of the Workshop on the International
+Planning Competition.
+Behnke, G., Höller, D., & Biundo, S. (2018). totSAT – Totally-ordered hierarchical planning
+through SAT. In Proceedings of the 32nd AAAI Conference on Articial Intelligence
+(AAAI 2018), pp. 6110–6118. AAAI Press.
+Behnke, G., Höller, D., Schmid, A., Bercher, P., & Biundo, S. (2020). On succinct groundings
+of HTN planning problems. In Proceedings of the 34th AAAI Conference on Articial
+Intelligence (AAAI 2020), pp. 9775–9784. AAAI Press.
+Behnke, G., & Speck, D. (2021). Symbolic search for optimal total-order HTN planning.
+In Proceedings of the 35th AAAI Conference on Articial Intelligence (AAAI 2021),
+pp. 11744–11754. AAAI Press.
+Bercher, P., Alford, R., & Höller, D. (2019). A survey on hierarchical planning – One
+abstract idea, many concrete realizations. In Proceedings of the 28th International
+Joint Conference on Articial Intelligence (IJCAI 2019), pp. 6267–6275. IJCAI.
+Bercher, P., Höller, D., Behnke, G., & Biundo, S. (2016). More than a name? On implications
+of preconditions and eects of compound HTN planning tasks. In Proceedings of the
+22nd European Conference on Articial Intelligence (ECAI 2016), pp. 225–233. IOS
+Press.
+Bercher, P., Lin, S., & Alford, R. (2022). Tight bounds for hybrid planning. In Proceedings of the 31st International Joint Conference on Articial Intelligence and the 25th
+European Conference on Articial Intelligence (IJCAI-ECAI 2022), pp. 4597–4605.
+IJCAI.
+Bit-Monnot, A., Smith, D. E., & Do, M. (2016). Delete-free reachability analysis for temporal and hierarchical planning. In Proceedings of the 22nd European Conference on
+Articial Intelligence (ECAI 2016), pp. 1698–1699. IOS Press.
+Biundo, S., & Schattenberg, B. (2001). From abstract crisis to concrete relief (A preliminary
+report on combining state abstraction and HTN planning). In Proceedings of the 6th
+European Conference on Planning (ECP 2001), pp. 157–168. AAAI Press.
+Bonet, B., & Gener, H. (2001). Planning as heuristic search. Articial Intelligence, 129 (12), 5–33.
+1441
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Clement, B. J., Durfee, E. H., & Barrett, A. C. (2007). Abstract reasoning for planning
+and coordination. Journal of Articial Intelligence Research (JAIR), 28, 453–515.
+de Silva, L., Meneguzzi, F. R., & Logan, B. (2020). BDI agent architectures: A survey.
+In Proceedings of the 29th International Joint Conference on Articial Intelligence
+(IJCAI 2020), pp. 4914–4921. IJCAI.
+de Silva, L., Sardina, S., & Padgham, L. (2009). First principles planning in BDI systems. In Proceedings of the 8th International Conference on Autonomous Agents and
+Multiagent Systems (AAMAS 2009), pp. 1105–1112. IFAAMAS.
+de Silva, L., Sardina, S., & Padgham, L. (2016). Summary information for reasoning about
+hierarchical plans. In Proceedings of the 22nd European Conference on Articial Intelligence (ECAI 2016), pp. 1300–1308. IOS Press.
+Erol, K., Hendler, J. A., & Nau, D. S. (1996). Complexity results for HTN planning. Annals
+of Mathematics and Articial Intelligence (AMAI), 18 (1), 69–93.
+Gazen, B. C., & Knoblock, C. A. (1997). Combining the expressivity of UCPOP with the
+eciency of graphplan. In Proceedings of the 4th European Conference on Planning:
+Recent Advances in AI Planning (ECP 1997), pp. 221–233. Springer.
+Geier, T., & Bercher, P. (2011). On the decidability of HTN planning with task insertion.
+In Proceedings of the 22nd International Joint Conference on Articial Intelligence
+(IJCAI 2011), pp. 1955–1961. AAAI Press.
+Ghallab, M., Nau, D. S., & Traverso, P. (2004). Automated Planning: Theory and Practice.
+Morgan Kaufmann.
+Goldman, R. P., & Kuter, U. (2019). Hierarchical task network planning in common Lisp:
+the case of SHOP3. In Proceedings of the 12th European Lisp Symposium (ELS 2019),
+pp. 73–80. ACM.
+Haslum, P., & Jonsson, P. (2000). Planning with reduced operator sets. In Proceedings of
+the 5th International Conference on Articial Intelligence Planning Systems (AIPS
+2000), pp. 150–158. AAAI Press.
+Höller, D., Behnke, G., Bercher, P., Biundo, S., Fiorino, H., Pellier, D., & Alford, R. (2020a).
+HDDL: An extension to PDDL for expressing hierarchical planning problems. In
+Proceedings of the 34th AAAI Conference on Articial Intelligence (AAAI 2020), pp.
+9883–9891. AAAI Press.
+Höller, D., Bercher, P., Behnke, G., & Biundo, S. (2020b). HTN planning as heuristic
+progression search. Journal of Articial Intelligence Research (JAIR), 67, 835–880.
+Höller, D., & Behnke, G. (2021). Loop detection in the PANDA planning system. In Proceedings of the 31st International Conference on Automated Planning and Scheduling
+(ICAPS 2021), pp. 168–173. AAAI Press.
+Ilghami, O., Muñoz-Avila, H., Nau, D. S., & Aha, D. W. (2005). Learning approximate preconditions for methods in hierarchical plans. In Proceedings of the 22nd International
+Conference on Machine Learning (ICML 2005), pp. 337–344. ACM.
+1442
+
+Preconditions and Effects of Compound HTN Planning Tasks
+
+Ilghami, O., Nau, D. S., Muñoz-Avila, H., & Aha, D. W. (2002). CaMeL: Learning method
+preconditions for HTN planning. In Proceedings of the 6th International Conference
+on AI Planning & Scheduling (AIPS 2002), pp. 131–142. AAAI Press.
+Kambhampati, S., Mali, A., & Srivastava, B. (1998). Hybrid planning for partially hierarchical domains. In Proceedings of the 15th National Conference on Articial Intelligence
+(AAAI 1998), pp. 882–888. AAAI Press.
+Magnaguagno, M. C., Meneguzzi, F. R., & de Silva, L. (2021). Hypertension: A three-stage
+compiler for planning. In Proceedings of the 10th International Planning Competition:
+Planner and Domain Abstracts – Hierarchical Task Network (HTN) Planning Track
+(IPC 2020), pp. 5–8.
+Marthi, B., Russell, S. J., & Wolfe, J. A. (2007). Angelic semantics for high-level actions. In Proceedings of the 17th International Conference on Automated Planning
+and Scheduling (ICAPS 2007), pp. 232–239. AAAI Press.
+Nau, D., Au, T.-C., Ilghami, O., Kuter, U., Murdock, J. W., Wu, D., & Yaman, F. (2003).
+SHOP2: An HTN planning system. Journal of Articial Intelligence Research (JAIR),
+20, 379–404.
+Olz, C., & Bercher, P. (2022). On the ecient inference of preconditions and eects of
+compound tasks in partially ordered HTN planning domains. In Proceedings of the
+5th ICAPS Workshop on Hierarchical Planning (HPlan 2022), pp. 47–51.
+Olz, C., & Bercher, P. (2023a). Can they come together? A computational complexity analysis of conjunctive possible eects of compound HTN planning tasks. In Proceedings
+of the 33rd International Conference on Automated Planning and Scheduling (ICAPS
+2023), pp. 314–323. AAAI Press.
+Olz, C., & Bercher, P. (2023b). A look-ahead technique for search-based HTN planning:
+Reducing the branching factor by identifying inevitable task renements. In Proceedings of the 16th International Symposium on Combinatorial Search (SoCS 2023), pp.
+65–73. AAAI Press.
+Olz, C., Biundo, S., & Bercher, P. (2021). Revealing hidden preconditions and eects of
+compound HTN planning tasks – A complexity analysis. In Proceedings of the 35th
+AAAI Conference on Articial Intelligence (AAAI 2021), pp. 11903–11912. AAAI
+Press.
+Olz, C., Höller, D., & Bercher, P. (2023). The PandaDealer system for totally ordered
+HTN planning in the 2023 IPC. In Proceedings of the 11th International Planning
+Competition: Planner Abstracts – Hierarchical Task Network (HTN) Planning Track
+(IPC 2023).
+Olz, C., Lodemann, A., & Bercher, P. (2024). A heuristic for optimal total-order HTN
+planning based on integer linear programming. In Proceedings of the 27th European
+Conference on Articial Intelligence (ECAI 2024), pp. 4303–4310. IOS Press.
+Olz, C., Lodemann, A., Jutz, B., Schmautz, M., Borowiec, M., Biundo, S., & Bercher, P.
+(2025). Experimental results for the JAIR article An extensive empirical evaluation
+of inferring preconditions and eects of compound tasks in ground HTN planning
+problems. Zenodo. doi: 10.5281/zenodo.14678643.
+1443
+
+Olz, Lodemann, Jutz, Schmautz, Borowiec, Biundo & Bercher
+
+Olz, C., Wierzba, E., Bercher, P., & Lindner, F. (2021). Towards improving the comprehension of HTN planning domains by means of preconditions and eects of compound
+tasks. In Proceedings of the 10th Workshop on Knowledge Engineering for Planning
+and Scheduling (KEPS 2021).
+Schreiber, D. (2021). Lilotane: A lifted SAT-based approach to hierarchical planning. Journal of Articial Intelligence Research (JAIR), 70, 1117–1181.
+Schreiber, D., Pellier, D., & Fiorino, H. (2019). Tree-REX: SAT-based tree exploration
+for ecient and high-quality HTN planning. In Proceedings of the 29th International
+Conference on Automated Planning and Scheduling (ICAPS 2019), pp. 382–390. AAAI
+Press.
+Taitler, A., Alford, R., Espasa, J., Behnke, G., Fišer, D., Gimelfarb, M., Pommerening, F.,
+Sanner, S., Scala, E., Schreiber, D., Segovia-Aguas, J., & Seipp, J. (2024). The 2023
+international planning competition. AI Magazine, 45 (2), 280–296.
+Tenenberg, J. D. (1988). Abstraction in Planning. Ph.D. thesis, Computer Science Department, University of Rochester.
+Tsuneto, R., Hendler, J., & Nau, D. (1998). Analyzing external conditions to improve
+the eciency of HTN planning. In Proceedings of the 15th National Conference on
+Articial Intelligence (AAAI 1998), pp. 913–920. AAAI Press.
+Waisbrot, N., Kuter, U., & Könik, T. (2008). Combining heuristic search with hierarchical
+task-network planning: A preliminary report. In Proceedings of the 21st International
+Florida Articial Intelligence Research Society Conference (FLAIRS 2008), pp. 577–
+578. AAAI Press.
+Wu, Y. X., Olz, C., Lin, S., & Bercher, P. (2023). Grounded (lifted) linearizer: Solving
+partial order HTN problems by linearizing them. In Proceedings of the 11th International Planning Competition: Planner Abstracts – Hierarchical Task Network (HTN)
+Planning Track (IPC 2023).
+Yang, Q. (1990). Formalizing planning knowledge for hierarchical planning. Computational
+Intelligence, 6 (1), 12–24.
+Zhuo, H. H., Hu, D. H., Hogg, C., Yang, Q., & Munoz-Avila, H. (2009). Learning HTN
+method preconditions and action models from partial observations. In Proceedings of
+the 21st International Joint Conference on Articial Intelligence (IJCAI 2009), pp.
+1804–1809. Morgan Kaufmann.
+
+1444
+
+

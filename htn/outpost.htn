@@ -1,0 +1,223 @@
+schema {
+    version: 0.1.0
+}
+
+compound_task "SecureOutpost" {
+    method "patrol perimeter" {
+        preconditions: [perimeter == false]
+        subtasks: [PerimeterPatrol, SecureOutpost]
+    }
+    method "reinforce squad" {
+        preconditions: [reinforced == false]
+        subtasks: [ReinforceSquad, SecureOutpost]
+    }
+    method "harden vehicles" {
+        preconditions: [armored == false]
+        subtasks: [ArmorVehicles, SecureOutpost]
+    }
+    method "secure cache" {
+        preconditions: [caches == false]
+        subtasks: [SecureCache, SecureOutpost]
+    }
+    method "standing down" {
+        preconditions: [morale < 5]
+        subtasks: [Rest, SecureOutpost]
+    }
+    method "complete" {
+        preconditions: [
+            perimeter == true,
+            reinforced == true,
+            armored == true,
+            caches == true,
+            morale >= 5,
+        ]
+        subtasks: []
+    }
+}
+
+compound_task "PerimeterPatrol" {
+    method "get to posting" {
+        preconditions: [position != Zone::Posting]
+        subtasks: [ReachPosting, PerimeterPatrol]
+    }
+    method "walk the watch" {
+        preconditions: [position == Zone::Posting]
+        subtasks: [WatchPost]
+    }
+}
+
+compound_task "ReachPosting" {
+    method "vehicle run" {
+        preconditions: [fuel >= 8]
+        subtasks: [Drive]
+    }
+    method "marginal fuel, queue anyway" {
+        preconditions: [fuel >= 2]
+        subtasks: [Drive]
+    }
+    method "packed rations march" {
+        preconditions: [food >= 20]
+        subtasks: [Hike]
+    }
+    method "forced foot march" {
+        preconditions: [health > 5]
+        subtasks: [March]
+    }
+    method "collapse, then march" {
+        subtasks: [Rest, March]
+    }
+}
+
+primitive_task "Drive" {
+    preconditions: [fuel >= 8]
+    effects: [position = Zone::Posting, fuel -= 1]
+    operator: NoopOperator
+}
+
+primitive_task "Hike" {
+    preconditions: [food >= 20]
+    effects: [position = Zone::Posting, food -= 2]
+    operator: NoopOperator
+}
+
+primitive_task "March" {
+    preconditions: [health > 5]
+    effects: [position = Zone::Posting, food -= 2]
+    operator: NoopOperator
+}
+
+primitive_task "WatchPost" {
+    preconditions: [position == Zone::Posting]
+    effects: [perimeter = true]
+    operator: NoopOperator
+}
+
+compound_task "ReinforceSquad" {
+    method "march to rally" {
+        preconditions: [position != Zone::Rally]
+        subtasks: [ToRally, ReinforceSquad]
+    }
+    method "consolidate at rally" {
+        preconditions: [position == Zone::Rally]
+        subtasks: [Rally]
+    }
+}
+
+compound_task "ToRally" {
+    method "fast convoy" {
+        preconditions: [fuel >= 5]
+        subtasks: [Convoy]
+    }
+    method "fuel flag convoy" {
+        preconditions: [fuel >= 2]
+        subtasks: [Siphon, Convoy]
+    }
+    method "hike point" {
+        preconditions: [health > 8]
+        subtasks: [Hike]
+    }
+    method "rally march" {
+        preconditions: [ammo >= 10]
+        subtasks: [March]
+    }
+    method "walk it off" {
+        subtasks: [Walk]
+    }
+}
+
+primitive_task "Siphon" {
+    effects: [fuel += 2]
+    operator: NoopOperator
+}
+
+primitive_task "Convoy" {
+    preconditions: [fuel >= 4]
+    effects: [position = Zone::Rally, fuel -= 1]
+    operator: NoopOperator
+}
+
+primitive_task "Walk" {
+    effects: [position = Zone::Rally]
+    operator: NoopOperator
+}
+
+primitive_task "Rally" {
+    preconditions: [position == Zone::Rally]
+    effects: [reinforced = true]
+    operator: NoopOperator
+}
+
+compound_task "ArmorVehicles" {
+    method "bolt up" {
+        preconditions: [position == Zone::Armory]
+        subtasks: [BoltArmor]
+    }
+    method "go to armory" {
+        preconditions: [position != Zone::Armory]
+        subtasks: [ToArmory, ArmorVehicles]
+    }
+}
+
+compound_task "ToArmory" {
+    method "refuel at depot" {
+        preconditions: [fuel >= 3]
+        subtasks: [Supply]
+    }
+    method "patrol on" {
+        preconditions: [ammo >= 5]
+        subtasks: [Approach]
+    }
+    method "advance" {
+        subtasks: [Advance]
+    }
+}
+
+primitive_task "Supply" {
+    effects: [position = Zone::Armory, fuel -= 3]
+    operator: NoopOperator
+}
+
+primitive_task "Approach" {
+    effects: [position = Zone::Armory]
+    operator: NoopOperator
+}
+
+primitive_task "Advance" {
+    effects: [position = Zone::Armory]
+    operator: NoopOperator
+}
+
+primitive_task "BoltArmor" {
+    preconditions: [position == Zone::Armory]
+    effects: [armored = true]
+    operator: NoopOperator
+}
+
+compound_task "SecureCache" {
+    method "clear cache" {
+        subtasks: [ClearCache]
+    }
+    method "escort team" {
+        preconditions: [morale >= 30]
+        subtasks: [Escort]
+    }
+    method "rest first" {
+        preconditions: [health < 30]
+        subtasks: [Rest, SecureCache]
+    }
+}
+
+primitive_task "ClearCache" {
+    effects: [caches = true]
+    operator: NoopOperator
+}
+
+primitive_task "Escort" {
+    effects: [caches = true, morale += 5]
+    operator: NoopOperator
+}
+
+primitive_task "Rest" {
+    effects: [morale = 100, health = 100]
+    operator: NoopOperator
+}
