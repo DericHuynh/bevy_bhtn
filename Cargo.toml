@@ -1,8 +1,8 @@
 [package]
-name = "cdda_htn"
+name = "bevy_bhtn"
 version = "0.1.0"
 edition = "2021"
-description = "Hierarchical Task Network planner for CDDA AI — imports .htn files, strongly-typed reflection-driven operators, forward (+MTR) and backward (goal-state) planning."
+description = "Hierarchical Task Network planner for Bevy AI — imports .htn files, strongly-typed reflection-driven operators, forward (+MTR) and backward (goal-state) planning."
 
 [dependencies]
 bevy_reflect = "0.18"

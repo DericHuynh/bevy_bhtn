@@ -8,10 +8,10 @@
 //!     `Drive` leaf fails, so the planner must **backtrack** off it;
 //!   - the plan, when executed, drives all four goal flags to `true`.
 
+use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::{HtnDomain, Task};
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
-use cdda_htn::planner::HtnPlanner;
-use cdda_htn::{HtnDomain, Task};
 
 /// A heavily-armed outpost squad member's plan state. Mirrors the fields used by
 /// `outpost.htn` exactly (names must match the `.htn` identifiers).
@@ -52,7 +52,7 @@ fn load_outpost() -> String {
 fn domain_and_registry() -> (HtnDomain, bevy_reflect::TypeRegistry) {
     let mut registry = bevy_reflect::TypeRegistry::default();
     register(&mut registry);
-    let domain = cdda_htn::parse_htn(&load_outpost()).expect("outpost.htn must parse");
+    let domain = bevy_bhtn::parse_htn(&load_outpost()).expect("outpost.htn must parse");
     (domain, registry)
 }
 

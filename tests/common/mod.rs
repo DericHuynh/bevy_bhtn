@@ -7,9 +7,9 @@
 //! abstract planner tests; the workspace `TestBed` pattern is mirrored here but
 //! simplified to the HTN slice.
 
-use cdda_htn::back_planner::BackPlanner;
-use cdda_htn::planner::HtnPlanner;
-use cdda_htn::{HtnDomain, HtnResult, HtnState};
+use bevy_bhtn::back_planner::BackPlanner;
+use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::{HtnDomain, HtnResult, HtnState};
 use ustr::Ustr;
 
 /// A ready-to-use HTN test arena.
@@ -29,7 +29,7 @@ impl HtnTestBed {
     ) -> Self {
         let mut registry = bevy_reflect::TypeRegistry::default();
         register_types(&mut registry);
-        let domain = cdda_htn::parse_htn(htn_src).expect("htn should parse");
+        let domain = bevy_bhtn::parse_htn(htn_src).expect("htn should parse");
         Self {
             domain,
             registry,

@@ -12,10 +12,10 @@
 mod common;
 use common::HtnTestBed;
 
+use bevy_bhtn::{Effect, HtnCondition, Task};
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::{Effect, HtnCondition, Task};
 
 // ---------------------------------------------------------------------------
 // Travel domain — mirrors the classic bevy_htn `test_travel_htn`.

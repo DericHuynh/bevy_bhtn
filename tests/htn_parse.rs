@@ -2,7 +2,7 @@
 //! the reference `bevy_htn` examples must parse with our grammar. This pins the
 //! `.htn` file API so the planner stays a drop-in for those domains.
 
-use cdda_htn::parse_htn;
+use bevy_bhtn::parse_htn;
 
 fn load(name: &str) -> String {
     std::fs::read_to_string(format!("{}/htn/{name}", env!("CARGO_MANIFEST_DIR")))

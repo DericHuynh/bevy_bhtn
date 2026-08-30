@@ -10,10 +10,10 @@
 mod common;
 use common::HtnTestBed;
 
+use bevy_bhtn::Task;
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::Task;
 
 // ---------------------------------------------------------------------------
 // A three-level nested domain: root -> middle -> leaves.

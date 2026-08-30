@@ -11,14 +11,14 @@
 #[path = "../benches/common/mod.rs"]
 mod bench_common;
 
+use bevy_bhtn::parse_htn;
+use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::HtnState;
 use bevy_reflect::{Reflect, TypeRegistry};
-use cdda_htn::parse_htn;
-use cdda_htn::planner::HtnPlanner;
-use cdda_htn::HtnState;
 
 use bench_common::*;
 
-fn miner_bed() -> (cdda_htn::HtnDomain, TypeRegistry) {
+fn miner_bed() -> (bevy_bhtn::HtnDomain, TypeRegistry) {
     let mut registry = TypeRegistry::default();
     register_miner(&mut registry);
     (
@@ -27,7 +27,7 @@ fn miner_bed() -> (cdda_htn::HtnDomain, TypeRegistry) {
     )
 }
 
-fn outpost_bed() -> (cdda_htn::HtnDomain, TypeRegistry) {
+fn outpost_bed() -> (bevy_bhtn::HtnDomain, TypeRegistry) {
     let mut registry = TypeRegistry::default();
     register_outpost(&mut registry);
     (
@@ -38,7 +38,7 @@ fn outpost_bed() -> (cdda_htn::HtnDomain, TypeRegistry) {
 
 /// Helper: plan and render the exact task-name sequence.
 fn plan_of<S: HtnState>(
-    domain: &cdda_htn::HtnDomain,
+    domain: &bevy_bhtn::HtnDomain,
     registry: &TypeRegistry,
     root: &str,
     state: &S,
@@ -49,7 +49,7 @@ fn plan_of<S: HtnState>(
 
 fn plan_of_with<S: HtnState>(
     planner: &mut HtnPlanner,
-    domain: &cdda_htn::HtnDomain,
+    domain: &bevy_bhtn::HtnDomain,
     root: &str,
     state: &S,
 ) -> Vec<String> {
@@ -356,7 +356,7 @@ fn lookahead_bench_domains_plan_exactly() {
 /// plan → execute-one-step → replan, against the working state. Returns every
 /// cycle's plan and the final state.
 fn run_replan_cycle<S: HtnState>(
-    domain: &cdda_htn::HtnDomain,
+    domain: &bevy_bhtn::HtnDomain,
     registry: &TypeRegistry,
     root: &str,
     initial: &S,

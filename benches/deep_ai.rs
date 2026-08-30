@@ -18,11 +18,11 @@
 
 mod common;
 
+use bevy_bhtn::planner::HtnPlanner;
 use bevy_ecs::component::Component;
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::planner::HtnPlanner;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -66,7 +66,7 @@ struct AiProcessed(std::sync::atomic::AtomicUsize);
 /// Immutable domain + registry + pre-built relationship lookup.
 #[derive(Resource)]
 struct HtnResources {
-    domain: cdda_htn::HtnDomain,
+    domain: bevy_bhtn::HtnDomain,
     registry: TypeRegistry,
 }
 
@@ -74,7 +74,7 @@ impl HtnResources {
     fn new() -> Self {
         let mut registry = TypeRegistry::default();
         register_outpost(&mut registry);
-        let domain = cdda_htn::parse_htn(OUTPOST_HTN).expect("parse outpost HTN");
+        let domain = bevy_bhtn::parse_htn(OUTPOST_HTN).expect("parse outpost HTN");
         Self { domain, registry }
     }
 }

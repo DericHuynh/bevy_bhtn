@@ -18,9 +18,9 @@
 mod common;
 use common::HtnTestBed;
 
+use bevy_bhtn::{FieldSet, HtnDomain};
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::{FieldSet, HtnDomain};
 
 // ---------------------------------------------------------------------------
 // Helpers + state
@@ -503,14 +503,14 @@ primitive_task "Rescue" {
 
 #[test]
 fn backtracking_restores_queue_after_mid_sequence_failure() {
-    let domain = cdda_htn::parse_htn(MID_FAILURE_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(MID_FAILURE_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_miner(&mut registry);
     let state = MinerState::default();
 
     // Look-ahead on: `broken` is refuted at the frame (Doomed needs gold > 100
     // and nothing in its sequence writes gold) — plan goes straight to Rescue.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(true);
     assert_eq!(
         planner.plan("Root", &state).task_names(),
@@ -521,7 +521,7 @@ fn backtracking_restores_queue_after_mid_sequence_failure() {
     // Look-ahead off: plain backtracking must unwind `broken` cleanly — the
     // abandoned branch's Collateral must NOT leak into the plan, and the
     // fallback method must be reached.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert_eq!(
         planner.plan("Root", &state).task_names(),
@@ -584,14 +584,14 @@ primitive_task "Ok" {
 
 #[test]
 fn backtracking_restores_ancestor_suffix_after_tail_failure() {
-    let domain = cdda_htn::parse_htn(LOST_SUFFIX_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(LOST_SUFFIX_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_miner(&mut registry);
     let state = MinerState::default();
 
     // Look-ahead on: `doomed` is refuted at the frame (Final needs gold > 100
     // and nothing in the sequence writes gold).
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(
         planner.plan("Root", &state).task_names(),
         ["Ok"],
@@ -600,7 +600,7 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
 
     // Look-ahead off: the search must enumerate Gate.a, Gate.b, then unwind
     // past the consumed `Final` and still reach `direct`.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert_eq!(
         planner.plan("Root", &state).task_names(),
@@ -654,7 +654,7 @@ primitive_task "Ok" {
 
 #[test]
 fn terminating_flag_refutes_pure_infinite_recursion() {
-    let domain = cdda_htn::parse_htn(PURE_RECURSION_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(PURE_RECURSION_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState::default();
@@ -664,12 +664,12 @@ fn terminating_flag_refutes_pure_infinite_recursion() {
     assert_eq!(domain.task_summary("Spiral").unwrap().min_yield, usize::MAX);
 
     // Look-ahead on: `doomed` is refuted at the frame without recursing.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["Ok"]);
 
     // Look-ahead off: plain backtracking burns the sanity budget and returns
     // the partial plan (the documented fallback semantics).
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert_eq!(planner.plan("Root", &state).task_names(), ["Prime"]);
 }
@@ -721,19 +721,19 @@ primitive_task "Ok" {
 
 #[test]
 fn terminating_flag_refutes_through_nested_compounds() {
-    let domain = cdda_htn::parse_htn(NESTED_RECURSION_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(NESTED_RECURSION_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState::default();
 
     assert!(!domain.task_summary("Probe").unwrap().terminating);
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["Ok"]);
 
     // Off: the doomed branch is entered; no primitive ever executes before
     // the budget burns, so the partial plan is empty.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert!(planner.plan("Root", &state).task_names().is_empty());
 }
@@ -775,15 +775,15 @@ primitive_task "Ok" {
 
 #[test]
 fn non_terminating_method_skipped_among_viable_ones() {
-    let domain = cdda_htn::parse_htn(MIXED_TERMINATION_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(MIXED_TERMINATION_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState::default();
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Pick", &state).task_names(), ["Ok"]);
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert!(planner.plan("Pick", &state).task_names().is_empty());
 }
@@ -823,7 +823,7 @@ primitive_task "Check" {
 
 #[test]
 fn terminating_recursion_not_flagged() {
-    let domain = cdda_htn::parse_htn(TERMINATING_RECURSION_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(TERMINATING_RECURSION_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState::default();
@@ -832,7 +832,7 @@ fn terminating_recursion_not_flagged() {
     assert!(summary.terminating);
     assert_eq!(summary.min_yield, 1);
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["Tick", "Check"]);
 }
 
@@ -889,19 +889,19 @@ fn gates_with_unknown_x_domain(gates: usize) -> String {
 
 #[test]
 fn per_condition_reads_prune_despite_unknown_sibling_field() {
-    let domain = cdda_htn::parse_htn(&gates_with_unknown_x_domain(12)).expect("parses");
+    let domain = bevy_bhtn::parse_htn(&gates_with_unknown_x_domain(12)).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState::default();
 
     // On: `y == 5` is definitely false (y known 0) even though `x == 1` is
     // maybe — the doomed method is refuted at the frame.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["Ok"]);
 
     // Off: the doomed method is entered (first task SetX) and burns the
     // budget on the gate enumeration.
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert_eq!(planner.plan("Root", &state).task_names()[0], "SetX");
 }
@@ -947,7 +947,7 @@ primitive_task "Safe" {
 
 #[test]
 fn identifier_condition_with_unknown_field_is_maybe() {
-    let domain = cdda_htn::parse_htn(IDENTIFIER_MAYBE_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(IDENTIFIER_MAYBE_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     // a=0 (stale clone would compare 0 == 5 → false), b=5; SetA makes them
@@ -957,7 +957,7 @@ fn identifier_condition_with_unknown_field_is_maybe() {
         ..Default::default()
     };
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["SetA", "Cmp"]);
 }
 
@@ -1002,7 +1002,7 @@ primitive_task "Safe" {
 
 #[test]
 fn notted_condition_on_unknown_field_is_maybe() {
-    let domain = cdda_htn::parse_htn(NOTTED_MAYBE_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(NOTTED_MAYBE_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_sweep(&mut registry);
     let state = SweepState {
@@ -1010,7 +1010,7 @@ fn notted_condition_on_unknown_field_is_maybe() {
         ..Default::default()
     };
 
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     assert_eq!(planner.plan("Root", &state).task_names(), ["SetA", "Cmp"]);
 }
 
@@ -1093,10 +1093,10 @@ fn pins_apply_per_occurrence_not_per_task_index() {
 
     // Without the look-ahead there are no pins at all; plain backtracking
     // must find the same plan.
-    let domain = cdda_htn::parse_htn(OCCURRENCE_PIN_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(OCCURRENCE_PIN_HTN).expect("parses");
     let mut registry = bevy_reflect::TypeRegistry::default();
     register_pin(&mut registry);
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     planner.set_lookahead(false);
     assert_eq!(
         planner.plan("Root", &start).task_names(),

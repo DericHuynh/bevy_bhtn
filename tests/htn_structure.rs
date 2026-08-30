@@ -14,9 +14,9 @@
 
 mod common;
 
+use bevy_bhtn::planner::HtnPlanner;
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::planner::HtnPlanner;
 
 #[derive(Reflect, Clone, Debug, Default)]
 struct ChainState {
@@ -116,7 +116,7 @@ compound_task "Emb" {
 
 #[test]
 fn structure_analysis_pins_flags_and_min_yield() {
-    let domain = cdda_htn::parse_htn(STRUCTURE_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(STRUCTURE_HTN).expect("parses");
     let summary = |name: &str| domain.task_summary(name).expect("summary");
 
     // Flat task: cheapest method is `sell` (one primitive); no recursion, so
@@ -201,7 +201,7 @@ fn deep_chain_domain(depth: usize) -> String {
 
 #[test]
 fn min_yield_refutes_method_that_cannot_finish_within_budget() {
-    let domain = cdda_htn::parse_htn(&deep_chain_domain(30)).expect("parses");
+    let domain = bevy_bhtn::parse_htn(&deep_chain_domain(30)).expect("parses");
     let mut registry = TypeRegistry::default();
     register_chain(&mut registry);
     let state = ChainState::default();
@@ -230,7 +230,7 @@ fn min_yield_does_not_refute_within_budget() {
     // Same shape, 5 deep, default budget: the chain must plan to completion —
     // a wrong min-yield computation (e.g. counting compounds twice, or
     // flagging recursive tasks as infinite) would over-refute here.
-    let domain = cdda_htn::parse_htn(&deep_chain_domain(5)).expect("parses");
+    let domain = bevy_bhtn::parse_htn(&deep_chain_domain(5)).expect("parses");
     let mut registry = TypeRegistry::default();
     register_chain(&mut registry);
     let state = ChainState::default();
@@ -245,7 +245,7 @@ fn min_yield_does_not_refute_within_budget() {
 
     // And the recursive domains from STRUCTURE_HTN keep planning under the
     // default budget (their min yields are small despite recursion).
-    let domain = cdda_htn::parse_htn(STRUCTURE_HTN).expect("parses");
+    let domain = bevy_bhtn::parse_htn(STRUCTURE_HTN).expect("parses");
     let mut registry = TypeRegistry::default();
     register_chain(&mut registry);
     let mut planner = HtnPlanner::new(&domain, &registry);

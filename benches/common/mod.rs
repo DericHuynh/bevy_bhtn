@@ -12,11 +12,11 @@
 // rest is intentionally shared.
 #![allow(dead_code)]
 
+use bevy_bhtn::planner::Plan;
+use bevy_bhtn::{HtnDomain, Task};
 use bevy_ecs::component::Component;
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::{Reflect, TypeRegistry};
-use cdda_htn::planner::Plan;
-use cdda_htn::{HtnDomain, Task};
 use ustr::Ustr;
 
 // ---------------------------------------------------------------------------

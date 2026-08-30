@@ -276,6 +276,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_bhtn"
+version = "0.1.0"
+dependencies = [
+ "bevy_asset",
+ "bevy_ecs",
+ "bevy_reflect",
+ "criterion",
+ "pest",
+ "pest_derive",
+ "serde",
+ "thiserror 2.0.20",
+ "ustr",
+]
+
+[[package]]
 name = "bevy_derive"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,21 +568,6 @@ dependencies = [
  "jobserver",
  "libc",
  "shlex",
-]
-
-[[package]]
-name = "cdda_htn"
-version = "0.1.0"
-dependencies = [
- "bevy_asset",
- "bevy_ecs",
- "bevy_reflect",
- "criterion",
- "pest",
- "pest_derive",
- "serde",
- "thiserror 2.0.20",
- "ustr",
 ]
 
 [[package]]

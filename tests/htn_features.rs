@@ -3,12 +3,12 @@
 //! ordering, domain helpers, and error-variant shapes. These pin the *semantics*
 //! of each surface so future optimization work can't silently change behaviour.
 
+use bevy_bhtn::operators::{construct_operator, verify_operator, Operator};
+use bevy_bhtn::planner::Plan;
+use bevy_bhtn::{Effect, HtnCondition, HtnError};
 use bevy_reflect::std_traits::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_reflect::TypeRegistry;
-use cdda_htn::operators::{construct_operator, verify_operator, Operator};
-use cdda_htn::planner::Plan;
-use cdda_htn::{Effect, HtnCondition, HtnError};
 
 // ---------------------------------------------------------------------------
 // A state covering every field type the conditions/effects can touch.
@@ -323,11 +323,11 @@ fn construct_operator_returns_registered_default() {
 fn plan_mtr_ordering() {
     let low = Plan {
         tasks: vec!["A".into()],
-        mtr: cdda_htn::planner::Mtr(vec![0]),
+        mtr: bevy_bhtn::planner::Mtr(vec![0]),
     };
     let high = Plan {
         tasks: vec!["B".into()],
-        mtr: cdda_htn::planner::Mtr(vec![1]),
+        mtr: bevy_bhtn::planner::Mtr(vec![1]),
     };
     assert!(low.is_preferred_over(&high));
     assert!(!high.is_preferred_over(&low));
@@ -360,7 +360,7 @@ compound_task "Root" {
     }
 }
 "#;
-    let domain = cdda_htn::parse_htn(src).expect("parse");
+    let domain = bevy_bhtn::parse_htn(src).expect("parse");
     assert_eq!(domain.root_task().map(|t| t.name()), Some("Root"));
     assert!(domain.goal("G").is_some());
     assert_eq!(domain.primitive_names(), vec!["P"]);
@@ -374,7 +374,7 @@ primitive_task "X" {
     operator: NoopOp
 }
 "#;
-    let only = cdda_htn::parse_htn(only_src).expect("parse only-primitive domain");
+    let only = bevy_bhtn::parse_htn(only_src).expect("parse only-primitive domain");
     assert_eq!(only.root_task().map(|t| t.name()), Some("X"));
 }
 
@@ -407,8 +407,8 @@ primitive_task "Arrive" {
 }
 "#;
     let registry = treg();
-    let domain = cdda_htn::parse_htn(src).expect("parse");
-    let mut planner = cdda_htn::planner::HtnPlanner::new(&domain, &registry);
+    let domain = bevy_bhtn::parse_htn(src).expect("parse");
+    let mut planner = bevy_bhtn::planner::HtnPlanner::new(&domain, &registry);
     let plan = planner.plan("Travel", &State::default());
     // Without expected_effects being simulated, Arrive's `zone == Outside`
     // would block the plan; with it, both tasks plan in sequence.
@@ -421,7 +421,7 @@ primitive_task "Arrive" {
 
 #[test]
 fn malformed_htn_yields_parser_error() {
-    let err = cdda_htn::parse_htn("this is not an htn").unwrap_err();
+    let err = bevy_bhtn::parse_htn("this is not an htn").unwrap_err();
     assert!(matches!(err, HtnError::Parser { .. }));
 }
 
@@ -436,9 +436,9 @@ primitive_task "P" {
     operator: NoopOp
 }
 "#;
-    let domain = cdda_htn::parse_htn(src).expect("parse");
+    let domain = bevy_bhtn::parse_htn(src).expect("parse");
     let registry = treg();
-    let mut planner = cdda_htn::back_planner::BackPlanner::new(&domain, &registry);
+    let mut planner = bevy_bhtn::back_planner::BackPlanner::new(&domain, &registry);
     let err = planner.plan("MissingGoal", &State::default()).unwrap_err();
     assert!(matches!(err, HtnError::UnknownTask { .. }));
 }
@@ -469,8 +469,8 @@ goal_task "Both" {
 }
 "#;
     let registry = treg();
-    let domain = cdda_htn::parse_htn(src).expect("parse");
-    let mut planner = cdda_htn::back_planner::BackPlanner::new(&domain, &registry);
+    let domain = bevy_bhtn::parse_htn(src).expect("parse");
+    let mut planner = bevy_bhtn::back_planner::BackPlanner::new(&domain, &registry);
     // Greedy heuristic: DoubleShot covers 2 of 2 needed fields, SingleShot only
     // 1 -> DoubleShot is selected first (and satisfies the whole goal).
     let plan = planner.plan("Both", &State::default()).expect("back plan");
@@ -503,8 +503,8 @@ goal_task "Both" {
 }
 "#;
     let registry = treg();
-    let domain = cdda_htn::parse_htn(src).expect("parse");
-    let mut planner = cdda_htn::back_planner::BackPlanner::new(&domain, &registry);
+    let domain = bevy_bhtn::parse_htn(src).expect("parse");
+    let mut planner = bevy_bhtn::back_planner::BackPlanner::new(&domain, &registry);
     // No single leaf covers both fields -> both are chained.
     let plan = planner.plan("Both", &State::default()).expect("back plan");
     let names = plan.task_names();

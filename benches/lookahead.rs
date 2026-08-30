@@ -31,15 +31,15 @@
 
 mod common;
 
+use bevy_bhtn::parse_htn;
+use bevy_bhtn::planner::HtnPlanner;
 use bevy_reflect::Reflect;
-use cdda_htn::parse_htn;
-use cdda_htn::planner::HtnPlanner;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use common::{
-    execute_plan_step, fresh_outpost, register_gate, register_outpost, GateState, DOOMED_RECURSION_HTN,
-    EXPONENTIAL_HTN, OUTPOST_HTN,
+    execute_plan_step, fresh_outpost, register_gate, register_outpost, GateState,
+    DOOMED_RECURSION_HTN, EXPONENTIAL_HTN, OUTPOST_HTN,
 };
 
 /// How many plan → execute → replan cycles each case runs per measured

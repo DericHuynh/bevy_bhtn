@@ -16,11 +16,11 @@
 
 mod common;
 
+use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::Res;
 use bevy_reflect::Reflect;
-use cdda_htn::planner::HtnPlanner;
-use cdda_htn::HtnDomain;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
@@ -96,7 +96,7 @@ impl HtnResources {
     fn new() -> Self {
         let mut registry = bevy_reflect::TypeRegistry::default();
         register_miner(&mut registry);
-        let domain = cdda_htn::parse_htn(MINER_HTN).expect("parse miner HTN");
+        let domain = bevy_bhtn::parse_htn(MINER_HTN).expect("parse miner HTN");
         Self { domain, registry }
     }
 }
