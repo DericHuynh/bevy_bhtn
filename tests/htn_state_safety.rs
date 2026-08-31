@@ -517,6 +517,131 @@ fn lookahead_scratch_reuse_balances_heap_clones() {
 // Misc edges
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Rollback snapshot ownership (regressions for the bitwise-snapshot bug)
+// ---------------------------------------------------------------------------
+
+/// A heap-owning component whose allocation verifies it is freed **exactly
+/// once**: the inner cell records its own free, so reanimating freed bytes
+/// (the exact failure mode of a dangling rollback snapshot) panics
+/// deterministically. Drop-invocation counters alone cannot catch this —
+/// dropping the same allocation twice keeps constructed/cloned/dropped
+/// counts balanced.
+#[derive(Component, Debug)]
+struct HeapGuard(*mut Cell);
+
+struct Cell {
+    freed: bool,
+}
+
+impl HeapGuard {
+    fn new() -> Self {
+        let cell = unsafe { std::alloc::alloc(std::alloc::Layout::new::<Cell>()) as *mut Cell };
+        unsafe { std::ptr::write(cell, Cell { freed: false }) };
+        Self(cell)
+    }
+}
+
+impl Default for HeapGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for HeapGuard {
+    // A fresh, independent cell: clones are equal-but-distinct values, so
+    // every live value owns its own allocation.
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for HeapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            assert!(
+                !(*self.0).freed,
+                "heap cell freed twice — a dangling snapshot was reanimated"
+            );
+            (*self.0).freed = true;
+            std::alloc::dealloc(self.0 as *mut u8, std::alloc::Layout::new::<Cell>());
+        }
+    }
+}
+
+unsafe impl Send for HeapGuard {}
+unsafe impl Sync for HeapGuard {}
+
+/// Regression: a rollback snapshot must OWN its copy of a heap-owning value.
+/// The old journal snapshotted slot bytes bitwise; an effect that *replaced*
+/// the value freed the old allocation, the snapshot dangled, and the restore
+/// reanimated freed memory — the second drop is a double free.
+#[test]
+fn rollback_of_a_replaced_heap_value_frees_everything_exactly_once() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(replace_guard).then(impossible);
+        task.branch().then(safe);
+    }
+    fn replace_guard(task: &mut TaskBuilder) {
+        task.effect(|g: &mut HeapGuard| *g = HeapGuard::new());
+    }
+    fn impossible(task: &mut TaskBuilder) {
+        task.precondition(|gold: &Gold| gold.0 > 100);
+    }
+    fn safe(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 1);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components)
+        .set(HeapGuard::new())
+        .set(Gold(0))
+        .finish();
+
+    let mut planner = HtnPlanner::new(&domain);
+    // Look-ahead off: the sweep would refute the doomed method before any
+    // primitive runs, and the rollback journal would never be exercised.
+    planner.set_lookahead(false);
+    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    drop(state);
+}
+
+/// Regression: the same slot snapshotted twice *without* an intervening
+/// mutation (the recursive-acquire shape) must not restore the same freed
+/// allocation twice.
+#[test]
+fn rollback_of_repeated_unmutated_snapshots_frees_everything_exactly_once() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch()
+            .then(touch_guard)
+            .then(touch_guard)
+            .then(impossible);
+        task.branch().then(safe);
+    }
+    fn touch_guard(task: &mut TaskBuilder) {
+        // Takes the &mut (so the slot is journaled) but never mutates: both
+        // snapshots alias the same allocation under a bitwise journal.
+        task.effect(|_g: &mut HeapGuard| {});
+    }
+    fn impossible(task: &mut TaskBuilder) {
+        task.precondition(|gold: &Gold| gold.0 > 100);
+    }
+    fn safe(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 1);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components)
+        .set(HeapGuard::new())
+        .set(Gold(0))
+        .finish();
+
+    let mut planner = HtnPlanner::new(&domain);
+    planner.set_lookahead(false);
+    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    drop(state);
+}
+
 /// `FieldSet` operations work past the first 64-bit word (universes larger
 /// than one word).
 #[test]

@@ -20,7 +20,8 @@
 //!
 //! - `clone` — one pool allocation + per-slot monomorphized clones (no
 //!   per-component heap boxes, so the look-ahead sweep's lazy clone is cheap),
-//! - rollback snapshots/restores — `memcpy` of single slot regions,
+//! - rollback snapshots/restores — deep clones of single slot values (the
+//!   journal owns its copies; plain-data slots clone as a `memcpy`),
 //! - `get`/`get_mut` — aligned pointer casts (no `dyn Any` downcasts).
 //!
 //! Component access is fully monomorphized: a precondition closure
@@ -131,6 +132,7 @@ pub struct RegistryLayout {
     types: Vec<(TypeId, &'static str)>,
     offsets: Vec<usize>,
     sizes: Vec<usize>,
+    aligns: Vec<usize>,
     fetchers: Vec<FetchFn>,
     writers: Vec<WriteFn>,
     cloners: Vec<CloneFn>,
@@ -149,6 +151,7 @@ impl RegistryLayout {
         self.types.push((TypeId::of::<T>(), name));
         self.offsets.push(offset);
         self.sizes.push(size);
+        self.aligns.push(align);
         self.fetchers.push(fetch_fn::<T>());
         self.writers.push(write_fn::<T>());
         self.cloners.push(clone_fn::<T>());
@@ -226,6 +229,11 @@ impl ComponentRegistry {
     pub fn name_of(&self, idx: usize) -> &'static str {
         let full = self.layout.types[idx].1;
         full.rsplit("::").next().unwrap_or(full)
+    }
+
+    /// The maximum slot alignment (the rollback journal's arena alignment).
+    pub(crate) fn max_align(&self) -> usize {
+        self.layout.align
     }
 }
 
@@ -400,32 +408,53 @@ impl PlanState {
         self.pool.as_ptr().add(self.layout.offsets[idx]) as *mut T
     }
 
-    /// Snapshot one slot's bytes for rollback.
-    pub(crate) fn snapshot_slot(&self, idx: usize, out: &mut Vec<u8>) {
-        let (off, size) = (self.layout.offsets[idx], self.layout.sizes[idx]);
-        out.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(self.pool.as_ptr().add(off), size)
-        });
-    }
-
-    /// Restore one slot from a rollback snapshot: drops the current value and
-    /// copies the snapshotted bytes back (a bit-identical move of the old
-    /// value — never a clone).
+    /// Snapshot one slot's value for rollback by **deep-cloning it into the
+    /// journal** — the journal owns its own copy, so the value's heap
+    /// allocations stay valid no matter what in-place mutation does to the
+    /// slot afterwards (a bitwise copy would dangle the moment a mutation
+    /// freed an internal buffer, and reanimating it on restore is a double
+    /// free). For plain-data slots the cloner is a memcpy.
     ///
     /// # Safety contract (enforced by the planner's rollback journal)
-    /// `bytes` must hold exactly `size_of::<T>()` bytes of the value that was
-    /// snapshotted from this slot.
+    /// `dst` must be aligned for the slot's type and hold `size_of::<T>()`
+    /// bytes of uninitialized memory.
+    pub(crate) fn snapshot_slot(&self, idx: usize, dst: *mut u8) {
+        let off = self.layout.offsets[idx];
+        unsafe {
+            (self.layout.cloners[idx])(self.pool.as_ptr().add(off), dst);
+        }
+    }
+
+    /// Restore one slot from a journal snapshot: drops the current value and
+    /// **clones** the journal's copy back in. The journal keeps ownership of
+    /// its copy until [`Self::drop_journaled_slot`] releases it — the two
+    /// values never alias.
+    ///
+    /// # Safety contract (enforced by the planner's rollback journal)
+    /// `bytes` must hold exactly `size_of::<T>()` bytes of a live, initialized
+    /// value cloned from this slot.
     pub(crate) unsafe fn restore_slot(&mut self, idx: usize, bytes: *const u8) {
         (self.layout.droppers[idx])(self.pool.as_mut_ptr().add(self.layout.offsets[idx]));
-        std::ptr::copy_nonoverlapping(
-            bytes,
-            self.pool.as_mut_ptr().add(self.layout.offsets[idx]),
-            self.layout.sizes[idx],
-        );
+        (self.layout.cloners[idx])(bytes, self.pool.as_mut_ptr().add(self.layout.offsets[idx]));
+    }
+
+    /// Drop a journal-held value after it has been cloned back into its slot.
+    /// Every allocation then has exactly one owner: the slot.
+    ///
+    /// # Safety contract (enforced by the planner's rollback journal)
+    /// `bytes` must point at a live value cloned from slot `idx` that has
+    /// already been restored (or will never be restored).
+    pub(crate) unsafe fn drop_journaled_slot(&self, idx: usize, bytes: *mut u8) {
+        (self.layout.droppers[idx])(bytes);
     }
 
     pub(crate) fn slot_size(&self, idx: usize) -> usize {
         self.layout.sizes[idx]
+    }
+
+    /// The alignment of slot `idx` (the journal aligns each cloned value).
+    pub(crate) fn slot_align(&self, idx: usize) -> usize {
+        self.layout.aligns[idx]
     }
 
     /// Deep-copy `src`'s slots into this scratchpad (same layout): drops each

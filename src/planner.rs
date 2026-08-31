@@ -26,6 +26,7 @@
 //! materialized as [`Ustr`]s when the final [`Plan`] is constructed.
 
 use std::collections::VecDeque;
+use std::ptr::NonNull;
 
 use smallvec::SmallVec;
 use ustr::Ustr;
@@ -133,19 +134,102 @@ enum Step {
     },
 }
 
-/// Rollback journal for the search: snapshotted slot bytes plus the
-/// `(slot, size)` ops that produced them, both append-only. Restoring pops
-/// both stacks in lockstep — a bit-identical move of each old value back into
-/// its slot (drop current, `memcpy` old bytes), allocation-free after warmup.
+/// Growable, max-aligned byte arena: the rollback journal's value storage.
+/// A `Vec<u8>` cannot guarantee its buffer's alignment, and journaled values
+/// are cloned in place through their component's typed cloner — so the arena
+/// allocates with the domain's maximum slot alignment and every entry is
+/// offset-aligned to its slot's alignment. Growing moves the values bitwise
+/// (a plain Rust move — the journal owns them; the old buffer is deallocated
+/// without dropping values).
+struct Journal {
+    ptr: NonNull<u8>,
+    len: usize,
+    cap: usize,
+    align: usize,
+}
+
+impl Journal {
+    fn new(align: usize) -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: 0,
+            align: align.max(1),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        if self.len + additional <= self.cap {
+            return;
+        }
+        let new_cap = (self.cap.max(256) * 2).max(self.len + additional);
+        let layout =
+            std::alloc::Layout::from_size_align(new_cap, self.align).expect("valid journal layout");
+        let new_ptr = if self.cap == 0 {
+            unsafe { std::alloc::alloc(layout) }
+        } else {
+            let old = std::alloc::Layout::from_size_align(self.cap, self.align)
+                .expect("valid journal layout");
+            unsafe { std::alloc::realloc(self.ptr.as_ptr(), old, new_cap) }
+        };
+        self.ptr = NonNull::new(new_ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        self.cap = new_cap;
+    }
+
+    /// Reserve `size` bytes aligned to `align`, returning the entry's offset.
+    fn push_aligned(&mut self, size: usize, align: usize) -> usize {
+        let start = self.len.next_multiple_of(align);
+        self.reserve(start + size - self.len);
+        self.len = start + size;
+        start
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    fn ptr_at(&self, offset: usize) -> *mut u8 {
+        unsafe { self.ptr.as_ptr().add(offset) }
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        if self.cap != 0 {
+            let layout = std::alloc::Layout::from_size_align(self.cap, self.align)
+                .expect("valid journal layout");
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+// The arena uniquely owns its allocation and is only accessed through
+// `&Journal`/`&mut Journal` — same reasoning as `Vec<u8>`.
+unsafe impl Send for Journal {}
+unsafe impl Sync for Journal {}
+
+/// Rollback journal for the search: **deep-cloned** slot values plus the
+/// `(slot, journal offset)` ops that produced them, both append-only. The
+/// journal
+/// owns its copies — a bitwise snapshot would dangle the moment an in-place
+/// mutation freed a heap allocation (HashMap grow, Vec shrink, whole-value
+/// replacement), and reanimating it on restore is a double free. Restoring
+/// pops both stacks in lockstep: drop the slot's current value, clone the
+/// journal's copy back in, drop the journal's copy — every allocation has
+/// exactly one owner at every point. For plain-data slots the cloner is a
+/// memcpy, so the common case keeps the old cost.
 struct Rollback {
-    bytes: Vec<u8>,
+    values: Journal,
+    /// `(slot, journal offset)` per snapshot — the offset is stored because
+    /// alignment padding between entries makes offsets not derivable from
+    /// the current length.
     ops: Vec<(usize, usize)>,
 }
 
 impl Rollback {
-    fn new() -> Self {
+    fn new(max_align: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(256),
+            values: Journal::new(max_align),
             ops: Vec::with_capacity(16),
         }
     }
@@ -156,18 +240,23 @@ impl Rollback {
     }
 
     fn snapshot(&mut self, state: &PlanState, idx: usize) {
-        state.snapshot_slot(idx, &mut self.bytes);
-        self.ops.push((idx, state.slot_size(idx)));
+        let align = state.slot_align(idx);
+        let padded = state.slot_size(idx).next_multiple_of(align);
+        let start = self.values.push_aligned(padded, align);
+        state.snapshot_slot(idx, self.values.ptr_at(start));
+        self.ops.push((idx, start));
     }
 
     fn restore_to(&mut self, len: usize, state: &mut PlanState) {
         while self.ops.len() > len {
-            let (idx, size) = self.ops.pop().expect("len invariant");
-            let start = self.bytes.len() - size;
+            let (idx, start) = self.ops.pop().expect("len invariant");
             unsafe {
-                state.restore_slot(idx, self.bytes[start..].as_ptr());
+                // Drop the slot's current value, clone the journal's copy
+                // back in, then drop the journal's copy.
+                state.restore_slot(idx, self.values.ptr_at(start));
+                state.drop_journaled_slot(idx, self.values.ptr_at(start));
             }
-            self.bytes.truncate(start);
+            self.values.truncate(start);
         }
     }
 }
@@ -358,9 +447,9 @@ impl<'a> HtnPlanner<'a> {
         // sweep's sequence view of it.
         let mut resolved_buf: Vec<(usize, usize)> = Vec::with_capacity(8);
         let mut seq_buf: Vec<usize> = Vec::with_capacity(8);
-        // Rollback journal: snapshotted slot bytes + ops, restored on
-        // backtrack down to the frame's length (allocation-free after warmup).
-        let mut rollback = Rollback::new();
+        // Rollback journal: snapshotted (deep-cloned) slot values + ops,
+        // restored on backtrack down to the frame's length.
+        let mut rollback = Rollback::new(self.domain.components.max_align());
         // Reusable look-ahead state clone: the sweep's lazily-created private
         // copy, reused across sweeps (`copy_from`, no re-allocation).
         let mut sweep_owned: Option<PlanState> = None;
