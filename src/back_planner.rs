@@ -23,8 +23,6 @@
 
 use std::collections::HashSet;
 
-use ustr::Ustr;
-
 use crate::domain::HtnDomain;
 use crate::error::{HtnError, HtnResult};
 use crate::planner::Plan;
@@ -60,7 +58,7 @@ impl<'a> BackPlanner<'a> {
         let mut state = initial_state.clone();
         let mut needed: HashSet<usize> = goal.write_slots().collect();
 
-        let mut plan: Vec<Ustr> = Vec::new();
+        let mut steps: Vec<u32> = Vec::new();
         let mut search_limit = 200;
 
         while !needed.is_empty() && search_limit > 0 {
@@ -86,7 +84,7 @@ impl<'a> BackPlanner<'a> {
                             }
                         }
                     }
-                    plan.push(self.domain.tasks[task_idx].name().into());
+                    steps.push(task_idx as u32);
                 }
                 None => {
                     // Nothing can advance a needed slot.
@@ -97,7 +95,11 @@ impl<'a> BackPlanner<'a> {
 
         if needed.is_empty() {
             Ok(Plan {
-                tasks: plan,
+                names: steps
+                    .iter()
+                    .map(|&s| self.domain.tasks[s as usize].name().into())
+                    .collect(),
+                steps,
                 mtr: crate::planner::Mtr::default(),
             })
         } else {

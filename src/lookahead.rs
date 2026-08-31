@@ -63,10 +63,12 @@ pub(crate) enum Lookahead {
 pub(crate) fn sweep(
     domain: &HtnDomain,
     state: &PlanState,
+    owned_scratch: &mut Option<PlanState>,
     sequence: &[usize],
     budget: usize,
     unknown: &mut FieldSet,
     pins: &mut Vec<(usize, usize)>,
+    surviving_buf: &mut Vec<usize>,
 ) -> Lookahead {
     // The sweep is only sound when the inferred summaries are present (they
     // define what "possibly written" and "terminating" mean).
@@ -78,7 +80,9 @@ pub(crate) fn sweep(
     pins.clear();
     // The private state clone is only needed once a primitive's effects must
     // be applied; compound-only prefixes evaluate against the caller's state.
-    let mut owned: Option<PlanState> = None;
+    // The scratch is owned by the planner and reused across sweeps
+    // (`copy_from` — no re-allocation, just per-slot deep clones).
+    let mut owned = false;
     // Lower bound on the decomposition steps the sequence still needs (sum of
     // per-task minimum yields). Exceeding the budget proves the method cannot
     // finish within it — the same contract as dead-end refutation.
@@ -93,8 +97,13 @@ pub(crate) fn sweep(
 
         match &domain.tasks[idx] {
             Task::Primitive(p) => {
+                let cur: &PlanState = if owned {
+                    owned_scratch.as_ref().expect("owned scratch materialized")
+                } else {
+                    state
+                };
                 for c in &p.preconditions {
-                    if definitely_false(c, current(state, &owned), unknown) {
+                    if definitely_false(c, cur, unknown) {
                         return Lookahead::DeadEnd;
                     }
                 }
@@ -105,9 +114,16 @@ pub(crate) fn sweep(
                     // a trailing primitive's writes are invisible to the sweep
                     // (and this avoids cloning the state for tail-effect
                     // methods, the common shape).
-                    let s = ensure_owned(state, &mut owned);
+                    if !owned {
+                        match owned_scratch {
+                            Some(scratch) => scratch.copy_from(state),
+                            None => *owned_scratch = Some(state.clone()),
+                        }
+                        owned = true;
+                    }
+                    let scratch = owned_scratch.as_mut().expect("just materialized");
                     for e in p.effects.iter().chain(p.expected_effects.iter()) {
-                        e.apply(s);
+                        e.apply(scratch);
                         // Opaque closures: every written component becomes
                         // unknown (its new value may depend on the old one).
                         for &w in e.writes() {
@@ -122,32 +138,30 @@ pub(crate) fn sweep(
                 // budget — a task that can only refine forever can never
                 // complete, so any method whose sequence contains it is
                 // refuted outright.)
-                let mut surviving = 0usize;
-                let mut unique: Option<usize> = None;
+                // Single pass: evaluate each method's preconditions once,
+                // collecting survivors; then pin (unique survivor) and
+                // propagate optimistic writes.
+                let cur: &PlanState = if owned {
+                    owned_scratch.as_ref().expect("owned scratch materialized")
+                } else {
+                    state
+                };
+                surviving_buf.clear();
                 for (mi, m) in c.methods.iter().enumerate() {
-                    if definitely_false_all(&m.preconditions, current(state, &owned), unknown) {
-                        continue;
-                    }
-                    surviving += 1;
-                    unique = Some(mi);
-                    if surviving > 1 {
-                        unique = None;
-                        break;
+                    if !definitely_false_all(&m.preconditions, cur, unknown) {
+                        surviving_buf.push(mi);
                     }
                 }
-                if surviving == 0 {
+                if surviving_buf.is_empty() {
                     return Lookahead::DeadEnd;
                 }
-                if surviving == 1 {
-                    pins.push((seq_position, unique.expect("surviving == 1 implies unique")));
+                if surviving_buf.len() == 1 {
+                    pins.push((seq_position, surviving_buf[0]));
                 }
                 // Optimistic propagation: every component any surviving
                 // method's refinement might write becomes "unknown".
-                for m in c.methods.iter() {
-                    if definitely_false_all(&m.preconditions, current(state, &owned), unknown) {
-                        continue;
-                    }
-                    unknown.union_with(&m.possible_writes);
+                for &mi in surviving_buf.iter() {
+                    unknown.union_with(&c.methods[mi].possible_writes);
                 }
             }
             // The forward planner stops at a goal task; mirror that.
@@ -156,17 +170,6 @@ pub(crate) fn sweep(
     }
 
     Lookahead::Refine(std::mem::take(pins))
-}
-
-/// The state to evaluate against: the private clone once it exists, else the
-/// caller's working state.
-fn current<'a>(state: &'a PlanState, owned: &'a Option<PlanState>) -> &'a PlanState {
-    owned.as_ref().unwrap_or(state)
-}
-
-/// Materialize the private clone (first write) and return it.
-fn ensure_owned<'a>(state: &'a PlanState, owned: &'a mut Option<PlanState>) -> &'a mut PlanState {
-    owned.get_or_insert_with(|| state.clone())
 }
 
 /// Whether `c` definitely fails: it reads only known components and evaluates

@@ -27,11 +27,12 @@
 
 use std::collections::VecDeque;
 
+use smallvec::SmallVec;
 use ustr::Ustr;
 
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
-use crate::state::{ErasedValue, PlanState};
+use crate::state::PlanState;
 use crate::tasks::Task;
 
 /// The method traversal record of a completed plan: the index of the chosen
@@ -54,13 +55,20 @@ impl std::fmt::Display for Mtr {
     }
 }
 
-/// A completed forward plan: an ordered list of primitive task names (interned
-/// [`Ustr`]s, so it's cheap to copy, compare, and hand around) plus the MTR
-/// describing how each compound was decomposed.
+/// A completed forward plan: a **compiled step program** plus the MTR.
+///
+/// `steps` holds task indices into [`HtnDomain::tasks`](crate::domain::HtnDomain)
+/// in execution order, so executing a plan is a flat array walk — the driver
+/// indexes the baked task array directly, with no name lookups and no string
+/// comparisons on the hot path. The interned names are kept in parallel for
+/// display and introspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    /// Primitive task names, in execution order.
-    pub tasks: Vec<Ustr>,
+    /// Baked step program: task indices, in execution order.
+    pub steps: Vec<u32>,
+    /// Interned task names, parallel to [`Self::steps`] (display/introspection;
+    /// execution reads [`Self::steps`] only).
+    pub names: Vec<Ustr>,
     /// Method indices chosen at each decomposition level.
     pub mtr: Mtr,
 }
@@ -68,7 +76,23 @@ pub struct Plan {
 impl Plan {
     /// The ordered primitive task names (interned handles; deref to `&str`).
     pub fn task_names(&self) -> &[Ustr] {
-        &self.tasks
+        &self.names
+    }
+
+    /// The domain task index of the step at `cursor` (the compiled program
+    /// entry the executor jumps to).
+    pub fn step_task(&self, cursor: usize) -> Option<usize> {
+        self.steps.get(cursor).map(|&s| s as usize)
+    }
+
+    /// The number of steps in the compiled program.
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Whether the program has no steps.
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
     }
 
     /// The MTR for this plan.
@@ -86,6 +110,45 @@ impl Plan {
         }
         // Prefer the shorter MTR when they share a prefix.
         self.mtr.0.len() < other.mtr.0.len()
+    }
+}
+
+/// Rollback journal for the search: snapshotted slot bytes plus the
+/// `(slot, size)` ops that produced them, both append-only. Restoring pops
+/// both stacks in lockstep — a bit-identical move of each old value back into
+/// its slot (drop current, `memcpy` old bytes), allocation-free after warmup.
+struct Rollback {
+    bytes: Vec<u8>,
+    ops: Vec<(usize, usize)>,
+}
+
+impl Rollback {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(256),
+            ops: Vec::with_capacity(16),
+        }
+    }
+
+    /// The number of snapshotted ops (the value frames store).
+    fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    fn snapshot(&mut self, state: &PlanState, idx: usize) {
+        state.snapshot_slot(idx, &mut self.bytes);
+        self.ops.push((idx, state.slot_size(idx)));
+    }
+
+    fn restore_to(&mut self, len: usize, state: &mut PlanState) {
+        while self.ops.len() > len {
+            let (idx, size) = self.ops.pop().expect("len invariant");
+            let start = self.bytes.len() - size;
+            unsafe {
+                state.restore_slot(idx, self.bytes[start..].as_ptr());
+            }
+            self.bytes.truncate(start);
+        }
     }
 }
 
@@ -120,11 +183,11 @@ struct DecompositionFrame {
     /// is consumed front-to-back during search, so a backtrack that re-queues
     /// this task must also restore what followed it — truncating lengths alone
     /// would lose siblings already popped after a failed later subtask (or
-    /// leave stale ones from the abandoned choice). Empty (and allocation-free)
-    /// for the common last-subtask case.
-    stack: Vec<(usize, Option<usize>)>,
-    /// `rollback.len()` before this decomposition's subtasks ran. Restoring
-    /// the scratchpad is a pop-and-restore loop down to this length.
+    /// leave stale ones from the abandoned choice). Inline for the common
+    /// 2–5-subtask case (allocation-free commitments).
+    stack: SmallVec<[(usize, Option<usize>); 4]>,
+    /// `rollback.ops.len()` before this decomposition's subtasks ran.
+    /// Restoring the scratchpad rewinds the journal down to this length.
     rollback_len: usize,
 }
 
@@ -198,13 +261,18 @@ impl<'a> HtnPlanner<'a> {
         // and its inevitable-refinement output, cleared per sweep.
         let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.components.len());
         let mut sweep_pins: Vec<(usize, usize)> = Vec::with_capacity(4);
+        // Reusable survivor buffer for the sweep's single-pass compound check.
+        let mut sweep_surviving: Vec<usize> = Vec::with_capacity(8);
         // Reusable scratch for the commitment's resolved subtask list and the
         // sweep's sequence view of it.
         let mut resolved_buf: Vec<(usize, usize)> = Vec::with_capacity(8);
         let mut seq_buf: Vec<usize> = Vec::with_capacity(8);
-        // Rollback stack: `(slot, old value)` pairs pushed before each effect
-        // application; backtracking restores down to the frame's length.
-        let mut rollback: Vec<(usize, Option<Box<dyn ErasedValue>>)> = Vec::with_capacity(16);
+        // Rollback journal: snapshotted slot bytes + ops, restored on
+        // backtrack down to the frame's length (allocation-free after warmup).
+        let mut rollback = Rollback::new();
+        // Reusable look-ahead state clone: the sweep's lazily-created private
+        // copy, reused across sweeps (`copy_from`, no re-allocation).
+        let mut sweep_owned: Option<PlanState> = None;
         let mut skip = 0;
         let mut state = state.clone();
 
@@ -213,7 +281,8 @@ impl<'a> HtnPlanner<'a> {
         let root = Ustr::from(root);
         let Some(&root_idx) = self.domain.index_of.get(&root) else {
             return Plan {
-                tasks: Vec::new(),
+                steps: Vec::new(),
+                names: Vec::new(),
                 mtr: Mtr(Vec::new()),
             };
         };
@@ -222,10 +291,7 @@ impl<'a> HtnPlanner<'a> {
         'search: while let Some((current, occurrence_pin)) = stack.pop_front() {
             count += 1;
             if count > sanity_limit {
-                return Plan {
-                    tasks: materialize_names(tasks, &plan),
-                    mtr: Mtr(mtr),
-                };
+                return materialize(tasks, &plan, mtr);
             }
 
             let task = &tasks[current];
@@ -284,10 +350,12 @@ impl<'a> HtnPlanner<'a> {
                             lookahead::sweep(
                                 self.domain,
                                 &state,
+                                &mut sweep_owned,
                                 &seq_buf,
                                 sanity_limit.saturating_sub(count),
                                 &mut sweep_unknown,
                                 &mut sweep_pins,
+                                &mut sweep_surviving,
                             )
                         } else {
                             Lookahead::Refine(Vec::new())
@@ -340,8 +408,7 @@ impl<'a> HtnPlanner<'a> {
                             .chain(primitive.expected_effects.iter())
                         {
                             for &w in e.writes() {
-                                let old = state.snapshot(w);
-                                rollback.push((w, old));
+                                rollback.snapshot(&state, w);
                             }
                             e.apply(&mut state);
                         }
@@ -367,10 +434,7 @@ impl<'a> HtnPlanner<'a> {
             }
         }
 
-        Plan {
-            tasks: materialize_names(tasks, &plan),
-            mtr: Mtr(mtr),
-        }
+        materialize(tasks, &plan, mtr)
     }
 }
 
@@ -384,7 +448,7 @@ fn backtrack(
     plan: &mut Vec<usize>,
     mtr: &mut Vec<usize>,
     stack: &mut VecDeque<(usize, Option<usize>)>,
-    rollback: &mut Vec<(usize, Option<Box<dyn ErasedValue>>)>,
+    rollback: &mut Rollback,
     skip: &mut usize,
     state: &mut PlanState,
 ) -> bool {
@@ -395,11 +459,7 @@ fn backtrack(
                 mtr.truncate(frame.mtr_len);
                 // Restore the scratchpad: undo every effect applied since the
                 // frame committed (newest first).
-                while rollback.len() > frame.rollback_len {
-                    if let Some((slot, old)) = rollback.pop() {
-                        state.restore(slot, old);
-                    }
-                }
+                rollback.restore_to(frame.rollback_len, state);
                 // Restore the queue to its state at commitment time: the
                 // failed subtree's remnants go, the suffix (with its
                 // occurrence pins) comes back.
@@ -420,8 +480,12 @@ fn backtrack(
     }
 }
 
-/// Convert a plan of task indices into interned task-name [`Ustr`]s in the same
-/// order.
-fn materialize_names(tasks: &[Task], plan: &[usize]) -> Vec<Ustr> {
-    plan.iter().map(|&i| tasks[i].name().into()).collect()
+/// Convert a plan of task indices into the compiled step program: contiguous
+/// `u32` task indices plus the parallel interned-name list.
+fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>) -> Plan {
+    Plan {
+        steps: plan.iter().map(|&i| i as u32).collect(),
+        names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
+        mtr: Mtr(mtr),
+    }
 }

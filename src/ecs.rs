@@ -131,35 +131,30 @@ pub fn htn_ai_system(world: &mut World) {
                 let plan = planner.plan(&root, &state);
                 // An empty plan means "nothing to do" — store it as planless
                 // so a later world change can trigger a real replan instead
-                // of wedging the agent on a zero-length plan.
-                let plan = if plan.tasks.is_empty() {
-                    None
-                } else {
-                    Some(plan)
-                };
+                // of wedging the agent on a zero-length program.
+                let plan = if plan.is_empty() { None } else { Some(plan) };
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.plan = plan;
                     agent.cursor = 0;
                 }
             }
 
-            // 2. Resolve the next step.
-            let Some(task_name) = world.get::<HtnAgent>(entity).and_then(|a| {
+            // 2. Resolve the next step from the compiled program: a flat
+            // array index into the baked task array — no name lookups.
+            let Some(step_idx) = world.get::<HtnAgent>(entity).and_then(|a| {
                 let plan = a.plan.as_ref()?;
-                let name = *plan.tasks.get(a.cursor)?;
-                Some(name)
+                plan.step_task(a.cursor)
             }) else {
                 return;
             };
-            let Some(Task::Primitive(primitive)) = config.domain.get_task(task_name.as_str())
-            else {
+            let Some(Task::Primitive(primitive)) = config.domain.tasks.get(step_idx) else {
                 return;
             };
 
             // 3. Validate the step against the real world: if the
             // preconditions no longer hold (the world drifted since
             // planning), drop the plan and replan next tick.
-            let state = PlanState::extract(world, entity, &config.domain.components);
+            let mut state = PlanState::extract(world, entity, &config.domain.components);
             if !primitive.preconditions_met(&state) {
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.plan = None;
@@ -168,9 +163,9 @@ pub fn htn_ai_system(world: &mut World) {
                 return;
             }
 
-            // 4. Execute: dispatch the action's commands, commit the effects
-            // to the real components, then flush so later agents see the
-            // results.
+            // 4. Execute: dispatch the action's commands (then flush so the
+            // effects observe post-action state), and commit the effects to
+            // the real components.
             if let Some(action) = &primitive.action {
                 let mut commands = world.commands();
                 let mut entity_commands = commands.entity(entity);
@@ -178,10 +173,12 @@ pub fn htn_ai_system(world: &mut World) {
                 drop(entity_commands);
                 drop(commands);
                 world.flush();
+                // The action may have mutated planning components: re-extract
+                // so effects apply on top of the post-action state.
+                state = PlanState::extract(world, entity, &config.domain.components);
             }
             let writes: Vec<usize> = primitive.write_slots().collect();
             if !writes.is_empty() {
-                let mut state = state;
                 primitive.apply_effects(&mut state);
                 state.write_back_with(world, entity, &config.domain.components, &writes);
             }
@@ -189,10 +186,7 @@ pub fn htn_ai_system(world: &mut World) {
             // 5. Advance the cursor (a finished plan is dropped for replan).
             if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                 agent.cursor += 1;
-                let done = agent
-                    .plan
-                    .as_ref()
-                    .is_some_and(|p| agent.cursor >= p.tasks.len());
+                let done = agent.plan.as_ref().is_some_and(|p| agent.cursor >= p.len());
                 if done {
                     agent.plan = None;
                     agent.cursor = 0;

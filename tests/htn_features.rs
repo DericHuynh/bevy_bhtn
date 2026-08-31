@@ -710,11 +710,13 @@ fn action_is_stored_on_primitive() {
 #[test]
 fn plan_mtr_ordering() {
     let low = Plan {
-        tasks: vec!["A".into()],
+        steps: vec![0],
+        names: vec!["A".into()],
         mtr: Mtr(vec![0]),
     };
     let high = Plan {
-        tasks: vec!["B".into()],
+        steps: vec![1],
+        names: vec!["B".into()],
         mtr: Mtr(vec![1]),
     };
     assert!(low.is_preferred_over(&high));

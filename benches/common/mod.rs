@@ -730,29 +730,26 @@ pub fn doomed_recursion_domain() -> HtnDomain {
 /// scratchpad, in order. This is the *execution* semantics the integration
 /// tests pin (`effects` only — `expected_effects` are planning-only hopes).
 pub fn execute_plan(domain: &HtnDomain, state: &mut PlanState, plan: &Plan) {
-    for name in plan.task_names() {
-        apply_task_effects(domain, state, name);
+    for &step in &plan.steps {
+        apply_step_effects(domain, state, step);
     }
 }
 
-/// Execute **one step** of a plan (the first planned task's effects) — the
+/// Execute **one step** of a plan (the first compiled step's effects) — the
 /// agent-tick semantics the benches' plan → execute → replan cycle uses: each
 /// cycle advances the world by one action, so every replan sees real, changed
 /// state instead of a goal that was already completed by a full-plan execution.
 pub fn execute_plan_step(domain: &HtnDomain, state: &mut PlanState, plan: &Plan) {
-    if let Some(first) = plan.task_names().first() {
-        apply_task_effects(domain, state, first);
+    if let Some(&first) = plan.steps.first() {
+        apply_step_effects(domain, state, first);
     }
 }
 
-fn apply_task_effects(domain: &HtnDomain, state: &mut PlanState, name: &str) {
-    match domain.get_task(name) {
-        Some(Task::Primitive(p)) => {
-            for e in &p.effects {
-                e.apply(state);
-            }
+fn apply_step_effects(domain: &HtnDomain, state: &mut PlanState, step: u32) {
+    if let Some(Task::Primitive(p)) = domain.tasks.get(step as usize) {
+        for e in &p.effects {
+            e.apply(state);
         }
-        _ => {} // defensive: plans are primitive sequences
     }
 }
 

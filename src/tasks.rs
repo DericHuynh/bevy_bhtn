@@ -176,6 +176,22 @@ pub trait IntoEffect<Args> {
     fn build(self, registry: &mut ComponentRegistry) -> Effect;
 }
 
+/// Reject an effect closure that takes `&mut` to the same component type
+/// twice: both parameters would resolve to the same registered slot, and the
+/// compiled closure would create two aliasing `&mut` — a soundness violation.
+/// Shared-reference preconditions may repeat freely.
+fn assert_distinct_slots(indices: &[usize]) {
+    for i in 0..indices.len() {
+        for j in (i + 1)..indices.len() {
+            assert!(
+                indices[i] != indices[j],
+                "effect closure takes `&mut` to the same component type twice — \
+                 the slots would alias; merge the parameters into one `&mut`"
+            );
+        }
+    }
+}
+
 macro_rules! impl_effect {
     ($($name:ident),*) => {
         #[allow(non_snake_case)]
@@ -188,23 +204,16 @@ macro_rules! impl_effect {
                 $(let $name = registry.index::<$name>();)*
                 #[allow(unused_mut)]
                 let writes: SmallVec<[usize; 4]> = smallvec![$($name,)*];
+                assert_distinct_slots(&writes);
                 Effect {
                     writes,
                     apply: Box::new(move |state| {
                         // The closure's arguments are distinct registered
-                        // slots, so a disjoint mutable borrow is exactly
-                        // right (and panics on a caller bug, never aliases).
-                        let [$($name),*] = state
-                            .slots_mut()
-                            .get_disjoint_mut([$($name,)*])
-                            .expect("effect writes distinct registered slots");
+                        // slots, so their byte regions are disjoint by
+                        // construction — the raw pointers never alias.
+                        let [$($name),*] = state.disjoint_slots([$($name,)*]);
                         self($(
-                            $name
-                                .as_mut()
-                                .expect("scratchpad slot is materialized")
-                                .as_any_mut()
-                                .downcast_mut::<$name>()
-                                .expect("slot holds the registered component type"),
+                            unsafe { &mut *($name as *mut $name) },
                         )*)
                     }),
                 }

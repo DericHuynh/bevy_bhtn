@@ -66,7 +66,7 @@ fn agent_plans_executes_and_completes() {
     // Tick 1: plans (3x gather) and executes the first step.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert_eq!(agent.plan.as_ref().map(|p| p.tasks.len()), Some(3));
+    assert_eq!(agent.plan.as_ref().map(|p| p.len()), Some(3));
     assert_eq!(agent.cursor, 1);
     assert_eq!(
         world.get::<Battery>(entity).unwrap().0,
@@ -180,7 +180,7 @@ fn missing_components_materialize_as_defaults() {
 
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert_eq!(agent.plan.as_ref().map(|p| p.tasks.len()), Some(3));
+    assert_eq!(agent.plan.as_ref().map(|p| p.len()), Some(3));
     // The effect wrote Battery back onto the entity (write-back inserts it).
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
 }
