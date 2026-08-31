@@ -50,12 +50,14 @@
 
 use std::any::{type_name, TypeId};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bevy_ecs::system::EntityCommands;
 use smallvec::{smallvec, SmallVec};
 use ustr::Ustr;
 
+use crate::selection::{BranchCandidate, SelectionPolicy};
 use crate::state::{ComponentRegistry, PlanComponent, PlanState};
 use crate::summaries::FieldSet;
 
@@ -106,6 +108,9 @@ impl Effect {
 /// [`EntityCommands`] when the planner executes the primitive. `Arc`-wrapped
 /// so the driver can hold a handle while running it against the world.
 pub type Action = Arc<dyn Fn(&mut EntityCommands) + Send + Sync>;
+
+/// A compiled dynamic utility/cost scorer over the scratchpad.
+pub type ScoreFn = Box<dyn Fn(&PlanState) -> f32 + Send + Sync>;
 
 /// Conversion into a compiled [`Precondition`], implemented (up to 8
 /// parameters) for closures over shared component references. The `Args`
@@ -222,6 +227,31 @@ macro_rules! impl_effect {
     };
 }
 
+/// Conversion into a compiled `f32` scorer over shared component references
+/// (used by `utility_fn`). Same axum-style `Args` inference as
+/// [`IntoPrecondition`]; closure parameters must be annotated.
+pub trait IntoUtility<Args> {
+    /// Compile into a [`ScoreFn`], registering read components in `registry`.
+    fn build(self, registry: &mut ComponentRegistry) -> ScoreFn;
+}
+
+macro_rules! impl_utility {
+    ($($name:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<F, $($name,)*> IntoUtility<fn($(& $name,)*) -> f32> for F
+        where
+            F: Fn($(& $name,)*) -> f32 + Send + Sync + 'static,
+            $($name: PlanComponent,)*
+        {
+            #[allow(unused_variables)]
+            fn build(self, registry: &mut ComponentRegistry) -> ScoreFn {
+                $(let $name = registry.index::<$name>();)*
+                Box::new(move |state| self($(state.get::<$name>($name),)*))
+            }
+        }
+    };
+}
+
 impl_precondition!();
 impl_precondition!(A);
 impl_precondition!(A, B);
@@ -231,6 +261,15 @@ impl_precondition!(A, B, C, D, E);
 impl_precondition!(A, B, C, D, E, F2);
 impl_precondition!(A, B, C, D, E, F2, G);
 impl_precondition!(A, B, C, D, E, F2, G, H);
+impl_utility!();
+impl_utility!(A);
+impl_utility!(A, B);
+impl_utility!(A, B, C);
+impl_utility!(A, B, C, D);
+impl_utility!(A, B, C, D, E);
+impl_utility!(A, B, C, D, E, F2);
+impl_utility!(A, B, C, D, E, F2, G);
+impl_utility!(A, B, C, D, E, F2, G, H);
 
 impl_effect!(A);
 impl_effect!(A, B);
@@ -316,6 +355,8 @@ impl<F: Fn(&mut GoalBuilder) + 'static> GoalFn for F {
 /// One recorded branch of a compound task (a method), prior to baking.
 #[derive(Default)]
 pub(crate) struct MethodProto {
+    pub(crate) name: Option<&'static str>,
+    pub(crate) utility: Option<ScoreFn>,
     pub(crate) preconditions: Vec<Precondition>,
     pub(crate) subtasks: Vec<(TypeId, &'static str)>,
 }
@@ -323,13 +364,17 @@ pub(crate) struct MethodProto {
 /// What a task function recorded, prior to baking.
 pub(crate) enum TaskProto {
     /// Declared only `branch`es — a compound task.
-    Compound { methods: Vec<MethodProto> },
+    Compound {
+        methods: Vec<MethodProto>,
+        policy: SelectionPolicy,
+    },
     /// Declared only preconditions/effects/actions — a primitive task.
     Primitive {
         preconditions: Vec<Precondition>,
         effects: Vec<Effect>,
         expected_effects: Vec<Effect>,
         action: Option<Action>,
+        cost: Option<ScoreFn>,
     },
 }
 
@@ -353,7 +398,9 @@ pub struct TaskBuilder<'a> {
     effects: Vec<Effect>,
     expected_effects: Vec<Effect>,
     action: Option<Action>,
+    cost: Option<ScoreFn>,
     methods: Vec<MethodProto>,
+    selection: Option<SelectionPolicy>,
 }
 
 impl<'a> TaskBuilder<'a> {
@@ -364,8 +411,34 @@ impl<'a> TaskBuilder<'a> {
             effects: Vec::new(),
             expected_effects: Vec::new(),
             action: None,
+            cost: None,
             methods: Vec::new(),
+            selection: None,
         }
+    }
+
+    /// Set this compound task's branch-selection policy (Axis 1). Only
+    /// meaningful on compound tasks; setting it on a primitive is a
+    /// build-time error.
+    pub fn select(&mut self, policy: SelectionPolicy) -> &mut Self {
+        self.selection = Some(policy);
+        self
+    }
+
+    /// Constant action cost, fed to cost-aware search strategies. Inert
+    /// under [`DepthFirst`](crate::selection::HtnSearchStrategy::DepthFirst).
+    pub fn cost(&mut self, c: f32) -> &mut Self {
+        self.cost = Some(Box::new(move |_| c));
+        self
+    }
+
+    /// Dynamic cost sampled from the scratchpad at plan time.
+    pub fn cost_fn<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn(&PlanState) -> f32 + Send + Sync + 'static,
+    {
+        self.cost = Some(Box::new(f));
+        self
     }
 
     /// Add a precondition (all must hold for a primitive to be pickable, or
@@ -432,10 +505,12 @@ impl<'a> TaskBuilder<'a> {
                 );
                 TaskProto::Compound {
                     methods: self.methods,
+                    policy: self.selection.unwrap_or_default(),
                 }
             } else {
                 TaskProto::Compound {
                     methods: self.methods,
+                    policy: self.selection.unwrap_or_default(),
                 }
             }
         } else {
@@ -444,6 +519,7 @@ impl<'a> TaskBuilder<'a> {
                 effects: self.effects,
                 expected_effects: self.expected_effects,
                 action: self.action,
+                cost: self.cost,
             }
         };
         // The task's own TypeId was registered by the expansion loop before
@@ -460,6 +536,32 @@ pub struct MethodBuilder<'a> {
 }
 
 impl<'a> MethodBuilder<'a> {
+    /// Name this branch (debugging, tracing, rankers).
+    pub fn named(&mut self, name: &'static str) -> &mut Self {
+        self.proto.name = Some(name);
+        self
+    }
+
+    /// Static utility score for
+    /// [`HighestUtility`](crate::selection::SelectionPolicy::HighestUtility) /
+    /// [`WeightedRandom`](crate::selection::SelectionPolicy::WeightedRandom)
+    /// selection. Branches without one score 0 under HighestUtility and
+    /// weight 1.0 under WeightedRandom.
+    pub fn utility(&mut self, u: f32) -> &mut Self {
+        self.proto.utility = Some(Box::new(move |_| u));
+        self
+    }
+
+    /// Dynamic utility scored from components at branch-evaluation time.
+    /// Closure parameters must be annotated (same as preconditions).
+    pub fn utility_fn<F, Args>(&mut self, f: F) -> &mut Self
+    where
+        F: IntoUtility<Args>,
+    {
+        self.proto.utility = Some(f.build(&mut self.rec.registry));
+        self
+    }
+
     /// Add a precondition for this branch to be chosen.
     pub fn precondition<P, Args>(&mut self, p: P) -> &mut Self
     where
@@ -518,6 +620,10 @@ impl<'a> GoalBuilder<'a> {
 /// One baked decomposition alternative of a compound task. Its preconditions
 /// must all hold for its subtask list to be selected.
 pub struct Method {
+    /// The branch's declared name, if any.
+    pub name: Option<&'static str>,
+    /// The branch's declared dynamic utility, if any.
+    pub utility: Option<ScoreFn>,
     /// Conditions that must all hold for this method to be chosen.
     pub preconditions: Vec<Precondition>,
     /// Subtask indices into [`HtnDomain::tasks`](crate::domain::HtnDomain),
@@ -535,6 +641,8 @@ pub struct CompoundTask {
     pub name: &'static str,
     /// The task function's `TypeId` (graph identity for introspection).
     pub type_id: TypeId,
+    /// How this task's valid branches are ranked.
+    pub policy: SelectionPolicy,
     /// Ordered decomposition alternatives.
     pub methods: Vec<Method>,
 }
@@ -548,6 +656,154 @@ impl CompoundTask {
             .skip(skip)
             .find(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(state)))
             .map(|(i, m)| (m, i))
+    }
+
+    /// Rank this task's **valid** branches per the task's
+    /// [`SelectionPolicy`], appending declaration indices to `out` in the
+    /// order the search should try them.
+    ///
+    /// Called once per node visit: at a given choice point the scratchpad is
+    /// fixed, so precondition validity is constant across the node's attempts
+    /// and the ranked order can be snapshotted into the decomposition frame
+    /// (backtracking resumes from the snapshot instead of re-ranking —
+    /// required for [`WeightedRandom`](SelectionPolicy::WeightedRandom)
+    /// soundness).
+    ///
+    /// `nonce` disambiguates choice points for the weighted sampler (the
+    /// planner passes the current partial-plan length), keeping the sampling
+    /// stateless and deterministic.
+    pub(crate) fn rank_valid_methods(
+        &self,
+        state: &PlanState,
+        nonce: u64,
+        out: &mut SmallVec<[u32; 4]>,
+    ) {
+        out.clear();
+
+        // Validity pass: preconditions are constant at this node.
+        let valid: SmallVec<[usize; 8]> = self
+            .methods
+            .iter()
+            .enumerate()
+            .filter(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(state)))
+            .map(|(i, _)| i)
+            .collect();
+
+        match &self.policy {
+            SelectionPolicy::FirstMatch => {
+                out.extend(valid.iter().map(|&i| i as u32));
+            }
+            SelectionPolicy::HighestUtility => {
+                // Stable sort by score descending; ties keep declaration
+                // order. NaN scores sort last.
+                let mut scored: Vec<(usize, f32)> = valid
+                    .iter()
+                    .map(|&i| {
+                        let score = self.methods[i]
+                            .utility
+                            .as_ref()
+                            .map(|f| f(state))
+                            .unwrap_or(0.0);
+                        (
+                            i,
+                            if score.is_nan() {
+                                f32::NEG_INFINITY
+                            } else {
+                                score
+                            },
+                        )
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                out.extend(scored.iter().map(|&(i, _)| i as u32));
+            }
+            SelectionPolicy::WeightedRandom { seed } => {
+                let weights: SmallVec<[f32; 8]> = valid
+                    .iter()
+                    .map(|&i| {
+                        self.methods[i]
+                            .utility
+                            .as_ref()
+                            .map(|f| f(state))
+                            .unwrap_or(1.0)
+                            .max(0.0)
+                    })
+                    .collect();
+                // Stateless RNG: splitmix64 over (seed, task identity, nonce)
+                // — the same choice point always yields the same order.
+                // DefaultHasher::new() is deterministic within a process.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                self.type_id.hash(&mut hasher);
+                let mut rng = seed
+                    ^ hasher.finish().wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ nonce.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                sample_weighted_order(&weights, &mut rng, out);
+            }
+            SelectionPolicy::Custom(ranker) => {
+                let candidates: Vec<BranchCandidate<'_>> = valid
+                    .iter()
+                    .map(|&i| BranchCandidate {
+                        index: i as u32,
+                        name: self.methods[i].name,
+                        utility: None,
+                        subtasks: &self.methods[i].subtasks,
+                    })
+                    .collect();
+                // The ranker writes into a plain Vec (its trait signature);
+                // the ranked order is copied into the inline scratch after.
+                let mut ranked = Vec::with_capacity(candidates.len());
+                ranker.rank(&candidates, state, &mut ranked);
+                // Sanitize: keep unique in-range valid entries in the
+                // ranker's order, then append any valid entries the ranker
+                // omitted (declaration order) — a bad ranker must not be able
+                // to make branches unreachable.
+                let mut seen = SmallVec::<[bool; 8]>::from_elem(false, self.methods.len());
+                for mi in ranked {
+                    let i = mi as usize;
+                    if i < self.methods.len() && valid.contains(&i) && !seen[i] {
+                        seen[i] = true;
+                        out.push(mi);
+                    }
+                }
+                for &i in &valid {
+                    if !seen[i] {
+                        out.push(i as u32);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sample `0..weights.len()` without replacement, proportional to weight.
+/// Zero total weight falls back to declaration order. Deterministic given
+/// the RNG state (splitmix64 stream).
+fn sample_weighted_order(weights: &[f32], rng: &mut u64, out: &mut SmallVec<[u32; 4]>) {
+    let mut remaining: SmallVec<[usize; 8]> = (0..weights.len()).collect();
+    while !remaining.is_empty() {
+        let total: f32 = remaining.iter().map(|&i| weights[i]).sum();
+        if !(total > 0.0) {
+            // All-zero (or degenerate) weights: declaration order for the rest.
+            out.extend(remaining.drain(..).map(|i| i as u32));
+            break;
+        }
+        // splitmix64 step.
+        *rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let r = (z >> 11) as f32 / (1u64 << 53) as f32 * total;
+        let mut acc = 0.0;
+        let mut chosen = remaining.len() - 1;
+        for (k, &i) in remaining.iter().enumerate() {
+            acc += weights[i];
+            if r < acc {
+                chosen = k;
+                break;
+            }
+        }
+        out.push(remaining.remove(chosen) as u32);
     }
 }
 
@@ -568,6 +824,8 @@ pub struct PrimitiveTask {
     pub expected_effects: Vec<Effect>,
     /// The real-world action dispatched at execution (if any).
     pub action: Option<Action>,
+    /// The declared cost estimate, if any (used by cost-aware strategies).
+    pub cost: Option<ScoreFn>,
 }
 
 impl PrimitiveTask {

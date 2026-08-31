@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use ustr::Ustr;
 
 use crate::error::{HtnError, HtnResult};
+use crate::selection::SelectionPolicy;
 use crate::state::ComponentRegistry;
 use crate::summaries::{compute_summaries, TaskSummary};
 use crate::tasks::{
@@ -63,6 +64,7 @@ impl HtnDomain {
             root_name,
             TaskProto::Compound {
                 methods: Vec::new(),
+                policy: SelectionPolicy::default(),
             },
         ));
         {
@@ -84,6 +86,7 @@ impl HtnDomain {
                 f.task_name_erased(),
                 TaskProto::Compound {
                     methods: Vec::new(),
+                    policy: SelectionPolicy::default(),
                 },
             ));
             let mut builder = crate::tasks::TaskBuilder::new(&mut rec);
@@ -207,7 +210,7 @@ impl DomainBuilder {
             }
             type_index.insert(tid, i);
             tasks.push(match proto {
-                TaskProto::Compound { methods } => {
+                TaskProto::Compound { methods, policy } => {
                     if methods.is_empty() {
                         return Err(HtnError::builder(format!(
                             "compound task `{name}` has no branches — it can never decompose"
@@ -216,9 +219,12 @@ impl DomainBuilder {
                     Task::Compound(CompoundTask {
                         name,
                         type_id: tid,
+                        policy,
                         methods: methods
                             .into_iter()
                             .map(|m| Method {
+                                name: m.name,
+                                utility: m.utility,
                                 preconditions: m.preconditions,
                                 subtasks: m
                                     .subtasks
@@ -238,6 +244,7 @@ impl DomainBuilder {
                     effects,
                     expected_effects,
                     action,
+                    cost,
                 } => Task::Primitive(PrimitiveTask {
                     name,
                     type_id: tid,
@@ -245,6 +252,7 @@ impl DomainBuilder {
                     effects,
                     expected_effects,
                     action,
+                    cost,
                 }),
             });
         }

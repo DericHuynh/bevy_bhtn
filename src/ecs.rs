@@ -51,6 +51,7 @@ use bevy_ecs::world::World;
 
 use crate::domain::HtnDomain;
 use crate::planner::{HtnPlanner, Plan};
+use crate::selection::{DecompositionTrace, HtnSearchStrategy, SearchOverride};
 use crate::state::PlanState;
 use crate::tasks::Task;
 
@@ -72,10 +73,18 @@ pub struct HtnAgent {
 pub struct HtnConfig {
     /// The HTN domain agents plan against.
     pub domain: HtnDomain,
+    /// The search strategy agents use unless overridden by a
+    /// [`SearchOverride`] component (default [`DepthFirst`]).
+    ///
+    /// [`DepthFirst`]: HtnSearchStrategy::DepthFirst
+    pub strategy: HtnSearchStrategy,
     /// Whether the forward planner's look-ahead sweep runs (default `true`).
     pub lookahead: bool,
     /// The forward planner's decomposition-step budget (default `100`).
     pub sanity_limit: usize,
+    /// Whether the driver forwards [`DecompositionTrace`] events to
+    /// `Messages<DecompositionTrace>` after each plan (default `false`).
+    pub debug_trace: bool,
 }
 
 impl HtnConfig {
@@ -83,9 +92,35 @@ impl HtnConfig {
     pub fn new(domain: HtnDomain) -> Self {
         Self {
             domain,
+            strategy: HtnSearchStrategy::default(),
             lookahead: true,
             sanity_limit: 100,
+            debug_trace: false,
         }
+    }
+
+    /// Set the global search strategy.
+    pub fn with_strategy(mut self, strategy: HtnSearchStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set the decomposition-step budget.
+    pub fn with_sanity_limit(mut self, limit: usize) -> Self {
+        self.sanity_limit = limit;
+        self
+    }
+
+    /// Enable or disable the look-ahead sweep.
+    pub fn with_lookahead(mut self, enabled: bool) -> Self {
+        self.lookahead = enabled;
+        self
+    }
+
+    /// Forward [`DecompositionTrace`] events after each plan.
+    pub fn with_debug_trace(mut self, enabled: bool) -> Self {
+        self.debug_trace = enabled;
+        self
     }
 }
 
@@ -107,6 +142,17 @@ impl HtnConfig {
 /// Add it to an `App` with `app.add_systems(Update, htn_ai_system)` (exclusive
 /// systems take `&mut World` directly).
 pub fn htn_ai_system(world: &mut World) {
+    // Trace events: ensure the resource exists and double-buffer per tick.
+    if world
+        .get_resource::<bevy_ecs::message::Messages<DecompositionTrace>>()
+        .is_none()
+    {
+        world.insert_resource(bevy_ecs::message::Messages::<DecompositionTrace>::default());
+    }
+    world
+        .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
+        .update();
+
     let entities: Vec<Entity> = world
         .query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>()
         .iter(world)
@@ -117,18 +163,55 @@ pub fn htn_ai_system(world: &mut World) {
         // so domain references (preconditions, effects, actions) stay alive
         // while the world itself is mutated.
         world.resource_scope(|world, config: bevy_ecs::prelude::Mut<HtnConfig>| {
-            // 1. Plan if planless.
+            // 1. Plan if planless. A per-agent [`SearchOverride`] component
+            // replaces the global strategy/budget for this entity.
             if world
                 .get::<HtnAgent>(entity)
                 .is_some_and(|a| a.plan.is_none())
             {
                 let root = config.domain.root_task().name().to_string();
                 let state = PlanState::extract(world, entity, &config.domain.components);
+                let (strategy, sanity) = world
+                    .get::<SearchOverride>(entity)
+                    .map(|o| (o.strategy.clone().unwrap_or_else(|| config.strategy.clone()), o.sanity_limit))
+                    .unwrap_or_else(|| (config.strategy.clone(), None));
+                let sanity = sanity.unwrap_or(config.sanity_limit);
                 let mut planner = HtnPlanner::new(&config.domain);
                 planner
                     .set_lookahead(config.lookahead)
-                    .set_sanity_limit(config.sanity_limit);
-                let plan = planner.plan(&root, &state);
+                    .set_sanity_limit(sanity);
+                let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
+                let plan = match &strategy {
+                    HtnSearchStrategy::DepthFirst => {
+                        if config.debug_trace {
+                            planner.plan_traced(&root, &state, &mut trace_buf)
+                        } else {
+                            planner.plan(&root, &state)
+                        }
+                    }
+                    HtnSearchStrategy::DepthFirstFailFast => {
+                        planner.set_fail_fast(true);
+                        if config.debug_trace {
+                            planner.plan_traced(&root, &state, &mut trace_buf)
+                        } else {
+                            planner.plan(&root, &state)
+                        }
+                    }
+                    HtnSearchStrategy::Custom(searcher) => {
+                        searcher.search(&config.domain, &state).unwrap_or_else(|| {
+                            crate::planner::Plan {
+                                steps: Vec::new(),
+                                names: Vec::new(),
+                                mtr: crate::planner::Mtr(Vec::new()),
+                            }
+                        })
+                    }
+                };
+                if !trace_buf.is_empty() {
+                    world
+                        .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
+                        .write_batch(trace_buf.drain(..));
+                }
                 // An empty plan means "nothing to do" — store it as planless
                 // so a later world change can trigger a real replan instead
                 // of wedging the agent on a zero-length program.

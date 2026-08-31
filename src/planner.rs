@@ -30,6 +30,8 @@ use std::collections::VecDeque;
 use smallvec::SmallVec;
 use ustr::Ustr;
 
+use crate::selection::{DecompositionTrace, SelectionPolicy, TraceOutcome};
+
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
 use crate::state::PlanState;
@@ -164,57 +166,9 @@ impl Rollback {
 /// provably identical to restoring a clone because the prefix of an
 /// append-only Vec never changes. `skip_next` alone traces the search branch,
 /// so this stays a fully correct DFS MTR backtrack.
-/// Storage width for **task indices** in the search's transient structures,
-/// chosen once per [`HtnPlanner::plan`] call from the domain's task count:
-/// `u8` for domains of up to 256 tasks (the overwhelmingly common case),
-/// `u16` up to 65 536, `u32` beyond. The search is monomorphized per width —
-/// no branching in the hot loop — so a typical domain's queue entries shrink
-/// from 24 to 8 bytes and decomposition frames shrink proportionally.
-///
-/// Method indices stay `usize`/`u32` (method counts are tiny and pins carry
-/// them); only task indices narrow.
-trait NarrowIdx: Copy + 'static {
-    /// The exclusive upper bound of representable task counts.
-    const MAX_TASKS: usize;
-
-    fn new(idx: usize) -> Self;
-
-    fn get(self) -> usize;
-}
-
-impl NarrowIdx for u8 {
-    const MAX_TASKS: usize = u8::MAX as usize + 1;
-    fn new(idx: usize) -> Self {
-        u8::try_from(idx).expect("task index within dispatch width")
-    }
-    fn get(self) -> usize {
-        self as usize
-    }
-}
-
-impl NarrowIdx for u16 {
-    const MAX_TASKS: usize = u16::MAX as usize + 1;
-    fn new(idx: usize) -> Self {
-        u16::try_from(idx).expect("task index within dispatch width")
-    }
-    fn get(self) -> usize {
-        self as usize
-    }
-}
-
-impl NarrowIdx for u32 {
-    const MAX_TASKS: usize = u32::MAX as usize;
-    fn new(idx: usize) -> Self {
-        u32::try_from(idx).expect("task index within dispatch width")
-    }
-    fn get(self) -> usize {
-        self as usize
-    }
-}
-
-struct DecompositionFrame<I: NarrowIdx> {
+struct DecompositionFrame {
     /// The compound task index being decomposed.
-    task: I,
+    task: usize,
     /// `plan.len()` before this decomposition's subtasks were entered.
     plan_len: usize,
     /// The number of methods to skip (index+1 of the one just tried).
@@ -233,10 +187,16 @@ struct DecompositionFrame<I: NarrowIdx> {
     /// would lose siblings already popped after a failed later subtask (or
     /// leave stale ones from the abandoned choice). Inline for the common
     /// 2–5-subtask case (allocation-free commitments).
-    stack: SmallVec<[(I, Option<u32>); 4]>,
+    stack: SmallVec<[(usize, Option<u32>); 4]>,
     /// `rollback.ops.len()` before this decomposition's subtasks ran.
     /// Restoring the scratchpad rewinds the journal down to this length.
     rollback_len: usize,
+    /// The position in the node's ranked branch order to resume from on
+    /// backtrack. The order itself is *not* stored: every policy re-derives
+    /// it deterministically on revisit (the sampler's nonce is the restored
+    /// `plan.len()`), so backtracking resumes down the same ranked list
+    /// without storing it.
+    rank_resume: usize,
 }
 
 /// A forward planner over a baked [`HtnDomain`].
@@ -252,6 +212,9 @@ pub struct HtnPlanner<'a> {
     /// Decomposition-step budget before the best partial plan is returned
     /// (default: 100).
     sanity_limit: usize,
+    /// Fail-fast mode: abandon the branch on first downstream failure and
+    /// return the partial plan immediately (no backtracking).
+    fail_fast: bool,
 }
 
 impl<'a> HtnPlanner<'a> {
@@ -261,6 +224,7 @@ impl<'a> HtnPlanner<'a> {
             domain,
             lookahead: true,
             sanity_limit: 100,
+            fail_fast: false,
         }
     }
 
@@ -287,6 +251,15 @@ impl<'a> HtnPlanner<'a> {
         self
     }
 
+    /// Enable fail-fast mode: abandon the branch on first downstream failure
+    /// and return the partial plan immediately (no backtracking). Used by the
+    /// [`DepthFirstFailFast`](crate::selection::HtnSearchStrategy::DepthFirstFailFast)
+    /// strategy.
+    pub fn set_fail_fast(&mut self, enabled: bool) -> &mut Self {
+        self.fail_fast = enabled;
+        self
+    }
+
     /// Decompose `root` into a [`Plan`]. Even if no task satisfies, the search
     /// terminates after exhausting backtracking and returns the best partial
     /// plan found (with an empty task list if nothing was decomposable).
@@ -299,27 +272,37 @@ impl<'a> HtnPlanner<'a> {
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
     pub fn plan(&mut self, root: &str, state: &PlanState) -> Plan {
-        // Dispatch once on the domain's task count: the whole search runs
-        // monomorphized at the narrowest index width that can address every
-        // task, so the hot loop's metadata is as small as the domain allows.
-        let task_count = self.domain.tasks.len();
-        if task_count <= u8::MAX_TASKS {
-            self.plan_search::<u8>(root, state)
-        } else if task_count <= u16::MAX_TASKS {
-            self.plan_search::<u16>(root, state)
-        } else {
-            self.plan_search::<u32>(root, state)
-        }
+        self.plan_inner(root, state, None)
     }
 
-    /// The search itself, monomorphized over the task-index width `I`.
-    fn plan_search<I: NarrowIdx>(&mut self, root: &str, state: &PlanState) -> Plan {
+    /// Decompose `root` into a [`Plan`], appending one
+    /// [`DecompositionTrace`] per branch-selection decision to `trace`.
+    ///
+    /// Tracing is per *commitment* — one event per branch that was selected,
+    /// failed its preconditions, or was backtracked past — never per
+    /// precondition attempt inside the look-ahead sweep.
+    pub fn plan_traced(
+        &mut self,
+        root: &str,
+        state: &PlanState,
+        trace: &mut Vec<DecompositionTrace>,
+    ) -> Plan {
+        self.plan_inner(root, state, Some(trace))
+    }
+
+    /// The search itself.
+    fn plan_inner(
+        &mut self,
+        root: &str,
+        state: &PlanState,
+        mut trace: Option<&mut Vec<DecompositionTrace>>,
+    ) -> Plan {
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
-        let mut stack: VecDeque<(I, Option<u32>)> = VecDeque::with_capacity(16);
-        let mut decomp_stack: Vec<DecompositionFrame<I>> = Vec::with_capacity(8);
+        let mut stack: VecDeque<(usize, Option<u32>)> = VecDeque::with_capacity(16);
+        let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
-        let mut plan: Vec<I> = Vec::with_capacity(8);
+        let mut plan: Vec<usize> = Vec::with_capacity(8);
         // Reusable look-ahead scratch: the sweep's "unknown components" overlay
         // and its inevitable-refinement output, cleared per sweep.
         let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.components.len());
@@ -337,6 +320,13 @@ impl<'a> HtnPlanner<'a> {
         // copy, reused across sweeps (`copy_from`, no re-allocation).
         let mut sweep_owned: Option<PlanState> = None;
         let mut skip = 0;
+        // Per-choice-point ranked branch order + resume position. The order
+        // is computed once per node visit (precondition validity is constant
+        // there) and snapshotted into the frame on commit, so backtracking
+        // resumes down the ranked list without re-ranking — required for
+        // WeightedRandom soundness.
+        let mut rank_order: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut rank_pos: usize = 0;
         let mut state = state.clone();
 
         let tasks = &self.domain.tasks;
@@ -349,7 +339,7 @@ impl<'a> HtnPlanner<'a> {
                 mtr: Mtr(Vec::new()),
             };
         };
-        stack.push_back((I::new(root_idx), None));
+        stack.push_back((root_idx, None));
 
         'search: while let Some((current, occurrence_pin)) = stack.pop_front() {
             count += 1;
@@ -357,7 +347,7 @@ impl<'a> HtnPlanner<'a> {
                 return materialize(tasks, &plan, mtr);
             }
 
-            let task = &tasks[current.get()];
+            let task = &tasks[current];
 
             match task {
                 Task::Compound(compound) => {
@@ -376,11 +366,50 @@ impl<'a> HtnPlanner<'a> {
                             // every other method was proven infeasible at pin
                             // time, so this task is exhausted.
                             Some(_) => None,
-                            None => compound.find_method(&state, skip),
+                            None => match &compound.policy {
+                                // Fast path: the default declaration-order
+                                // policy scans directly, no ranking setup.
+                                SelectionPolicy::FirstMatch => compound.find_method(&state, skip),
+                                // Rank once per node visit (precondition
+                                // validity is constant there — the state
+                                // only changes deeper down, and backtracking
+                                // restores it), then walk the ranked list.
+                                _ => {
+                                    if rank_order.is_empty() {
+                                        compound.rank_valid_methods(
+                                            &state,
+                                            plan.len() as u64,
+                                            &mut rank_order,
+                                        );
+                                        if let Some(t) = trace.as_deref_mut() {
+                                            // Every method NOT in the ranked order
+                                            // failed its preconditions.
+                                            let ranked: std::collections::HashSet<u32> =
+                                                rank_order.iter().copied().collect();
+                                            for (mi, m) in compound.methods.iter().enumerate() {
+                                                if !ranked.contains(&(mi as u32)) {
+                                                    t.push(DecompositionTrace {
+                                                        compound: current as u32,
+                                                        branch: mi as u32,
+                                                        branch_name: m.name,
+                                                        outcome: TraceOutcome::PrecondFailed,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    rank_order
+                                        .get(rank_pos)
+                                        .map(|&mi| (&compound.methods[mi as usize], mi as usize))
+                                }
+                            },
                         };
                         let Some((method, idx)) = eligible else {
                             // No eligible method: unwind to the most recent
                             // decomposition and try its next choice.
+                            if self.fail_fast {
+                                break 'search;
+                            }
                             if !backtrack(
                                 &mut decomp_stack,
                                 &mut plan,
@@ -388,7 +417,11 @@ impl<'a> HtnPlanner<'a> {
                                 &mut stack,
                                 &mut rollback,
                                 &mut skip,
+                                &mut rank_order,
+                                &mut rank_pos,
                                 &mut state,
+                                tasks,
+                                &mut trace,
                             ) {
                                 break 'search;
                             }
@@ -427,11 +460,25 @@ impl<'a> HtnPlanner<'a> {
                             Lookahead::DeadEnd => {
                                 // Proven doomed without recursing: try the
                                 // next method at this site.
-                                skip = idx + 1;
+                                if pin.is_some()
+                                    || matches!(compound.policy, SelectionPolicy::FirstMatch)
+                                {
+                                    skip = idx + 1;
+                                } else {
+                                    rank_pos += 1;
+                                }
                                 continue;
                             }
                             Lookahead::Refine(pins_found) => {
                                 mtr.push(idx);
+                                if let Some(t) = trace.as_deref_mut() {
+                                    t.push(DecompositionTrace {
+                                        compound: current as u32,
+                                        branch: idx as u32,
+                                        branch_name: method.name,
+                                        outcome: TraceOutcome::Selected,
+                                    });
+                                }
                                 let frame = DecompositionFrame {
                                     task: current,
                                     plan_len: plan.len(),
@@ -443,6 +490,10 @@ impl<'a> HtnPlanner<'a> {
                                     pinned: pin,
                                     stack: stack.iter().copied().collect(),
                                     rollback_len: rollback.len(),
+                                    // Resume position in the node's ranked
+                                    // order (the order is re-derived
+                                    // deterministically on revisit).
+                                    rank_resume: rank_pos + 1,
                                 };
                                 decomp_stack.push(frame);
                                 // Push subtask occurrences in reverse so the
@@ -454,9 +505,11 @@ impl<'a> HtnPlanner<'a> {
                                         .iter()
                                         .find(|(p, _)| p == pos)
                                         .map(|&(_, m)| m as u32);
-                                    stack.push_front((I::new(*sub_idx), sub_pin));
+                                    stack.push_front((*sub_idx, sub_pin));
                                 }
                                 skip = 0;
+                                rank_order.clear();
+                                rank_pos = 0;
                                 continue 'search;
                             }
                         }
@@ -480,6 +533,9 @@ impl<'a> HtnPlanner<'a> {
                         skip = 0;
                         continue;
                     }
+                    if self.fail_fast {
+                        break 'search;
+                    }
                     if !backtrack(
                         &mut decomp_stack,
                         &mut plan,
@@ -487,7 +543,11 @@ impl<'a> HtnPlanner<'a> {
                         &mut stack,
                         &mut rollback,
                         &mut skip,
+                        &mut rank_order,
+                        &mut rank_pos,
                         &mut state,
+                        tasks,
+                        &mut trace,
                     ) {
                         break 'search;
                     }
@@ -508,14 +568,18 @@ impl<'a> HtnPlanner<'a> {
 /// by truncation, the scratchpad by rollback, and re-queues the frame's task
 /// for its next method choice. Returns `false` when the search is exhausted.
 #[allow(clippy::too_many_arguments)]
-fn backtrack<I: NarrowIdx>(
-    decomp_stack: &mut Vec<DecompositionFrame<I>>,
-    plan: &mut Vec<I>,
+fn backtrack(
+    decomp_stack: &mut Vec<DecompositionFrame>,
+    plan: &mut Vec<usize>,
     mtr: &mut Vec<usize>,
-    stack: &mut VecDeque<(I, Option<u32>)>,
+    stack: &mut VecDeque<(usize, Option<u32>)>,
     rollback: &mut Rollback,
     skip: &mut usize,
+    rank_order: &mut SmallVec<[u32; 4]>,
+    rank_pos: &mut usize,
     state: &mut PlanState,
+    tasks: &[Task],
+    trace: &mut Option<&mut Vec<DecompositionTrace>>,
 ) -> bool {
     loop {
         match decomp_stack.pop() {
@@ -537,6 +601,27 @@ fn backtrack<I: NarrowIdx>(
                     continue;
                 }
                 *skip = frame.skip_next;
+                // Resume this node's ranked list past the committed choice:
+                // the order is re-derived on the node's next visit (all
+                // policies are deterministic per (state, nonce), and the
+                // nonce — the restored plan length — matches the original
+                // visit, so the resumed order is identical).
+                rank_order.clear();
+                *rank_pos = frame.rank_resume;
+                if let Some(t) = trace.as_deref_mut() {
+                    // The branch the unwound frame was committed to.
+                    let branch = frame.skip_next.saturating_sub(1);
+                    let name = match &tasks[frame.task] {
+                        Task::Compound(c) => c.methods.get(branch).and_then(|m| m.name),
+                        _ => None,
+                    };
+                    t.push(DecompositionTrace {
+                        compound: frame.task as u32,
+                        branch: branch as u32,
+                        branch_name: name,
+                        outcome: TraceOutcome::Backtracked,
+                    });
+                }
                 stack.push_front((frame.task, frame.pinned));
                 return true;
             }
@@ -547,10 +632,10 @@ fn backtrack<I: NarrowIdx>(
 
 /// Convert a plan of (narrow) task indices into the compiled step program:
 /// contiguous `u32` task indices plus the parallel interned-name list.
-fn materialize<I: NarrowIdx>(tasks: &[Task], plan: &[I], mtr: Vec<usize>) -> Plan {
+fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>) -> Plan {
     Plan {
-        steps: plan.iter().map(|&i| i.get() as u32).collect(),
-        names: plan.iter().map(|&i| tasks[i.get()].name().into()).collect(),
+        steps: plan.iter().map(|&i| i as u32).collect(),
+        names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
         mtr: Mtr(mtr),
     }
 }

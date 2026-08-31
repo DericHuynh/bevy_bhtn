@@ -61,6 +61,7 @@ pub mod ecs;
 pub mod error;
 pub mod lookahead;
 pub mod planner;
+pub mod selection;
 pub mod state;
 pub mod summaries;
 pub mod tasks;
@@ -78,6 +79,7 @@ pub mod prelude {
     pub use crate::ecs::*;
     pub use crate::error::*;
     pub use crate::planner::*;
+    pub use crate::selection::*;
     pub use crate::state::*;
     pub use crate::summaries::{FieldSet, TaskSummary};
     pub use crate::tasks::*;
