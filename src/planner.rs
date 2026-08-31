@@ -4,36 +4,35 @@
 //! top of a task stack. Compound tasks pick the first method whose preconditions
 //! hold (at or after a per-decomposition `skip`), push their subtasks, and
 //! record the method index into the MTR. Primitive tasks whose preconditions
-//! hold are appended to the plan and their (expected) effects are applied to a
-//! working copy of the state. When a task can't be satisfied, the planner
-//! backtracks to the most recent decomposition, tries the next method, and
-//! restores the plan/MTR.
+//! hold are appended to the plan and their (expected) effects are applied to
+//! the working [`PlanState`] scratchpad. When a task can't be satisfied, the
+//! planner backtracks to the most recent decomposition, tries the next method,
+//! and restores the plan/MTR/state.
 //!
 //! # Performance
 //!
 //! The hot loop works on **`usize` task indices**, never names. The working
 //! stack and the backtracking frames hold `usize` indices into
-//! [`HtnDomain::tasks`]. Domains intern task names as [`Ustr`] keys in a
-//! precomputed `name -> index` map, so subtask resolution is O(1), not a linear
-//! scan.
+//! [`HtnDomain::tasks`]. Task names are interned as [`Ustr`] keys in a
+//! precomputed `name -> index` map, so root resolution is O(1).
 //!
 //! `plan` and `mtr` are **append-only**, so backtracking frames store only the
-//! two **lengths** (not cloned `Vec`s) — on backtrack a `truncate` restores the
-//! exact prefix, which is provably identical to restoring a full clone but
-//! avoids ~2 heap allocations + O(n) copies per recursion level. This is the
-//! dominant win for domains that recursively decompose a root toward the sanity
-//! limit (e.g. the miner benchmark). Task names are only materialized as
-//! [`Ustr`]s when the final [`Plan`] is constructed.
+//! two **lengths** (not cloned `Vec`s) — on backtrack a `truncate` restores
+//! the exact prefix, which is provably identical to restoring a full clone but
+//! avoids ~2 heap allocations + O(n) copies per recursion level. State
+//! rollback is similarly allocation-light: before a primitive's effects run,
+//! only the slots they write are snapshotted onto a pre-allocated rollback
+//! stack; backtracking pops and restores exactly those. Task names are only
+//! materialized as [`Ustr`]s when the final [`Plan`] is constructed.
 
 use std::collections::VecDeque;
 
-use bevy_reflect::TypeRegistry;
 use ustr::Ustr;
 
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
+use crate::state::{ErasedValue, PlanState};
 use crate::tasks::Task;
-use crate::HtnState;
 
 /// The method traversal record of a completed plan: the index of the chosen
 /// method at each decomposition level. Used to compare plans by priority
@@ -93,19 +92,15 @@ impl Plan {
 /// Planner state used during one decomposition site for backtracking.
 ///
 /// Stores **task indices** (not names) so frames stay tiny and copy-free.
-///
-/// # Backtracking via lengths
-///
-/// [`HtnPlanner`] builds `plan` and `mtr` **append-only** during a monotonic
-/// recursive descent (primitives and method indices are only ever `push`ed).
-/// So instead of deep-cloning both `Vec`s into every frame (which costs ~2n
-/// allocations + O(n) copies per recursion level — catastrophic when a domain
-/// recursively decomposes its root toward the sanity limit), we snapshot just
-/// the two lengths. On backtrack we `truncate` back to those lengths, which is
-/// provably identical to restoring a clone because the prefix of an append-only
-/// Vec never changes. `skip_next` alone traces the search branch, so this stays
-/// a fully correct DFS MTR backtrack.
-#[derive(Debug)]
+/// `plan` and `mtr` are append-only within one `plan()` call — recursive
+/// descent (primitives and method indices are only ever `push`ed). So instead
+/// of deep-cloning both `Vec`s into every frame (which costs ~2n allocations
+/// + O(n) copies per recursion level — catastrophic when a domain recursively
+/// decomposes its root toward the sanity limit), we snapshot just the two
+/// lengths. On backtrack we `truncate` back to those lengths, which is
+/// provably identical to restoring a clone because the prefix of an
+/// append-only Vec never changes. `skip_next` alone traces the search branch,
+/// so this stays a fully correct DFS MTR backtrack.
 struct DecompositionFrame {
     /// The compound task index being decomposed.
     task: usize,
@@ -128,15 +123,18 @@ struct DecompositionFrame {
     /// leave stale ones from the abandoned choice). Empty (and allocation-free)
     /// for the common last-subtask case.
     stack: Vec<(usize, Option<usize>)>,
+    /// `rollback.len()` before this decomposition's subtasks ran. Restoring
+    /// the scratchpad is a pop-and-restore loop down to this length.
+    rollback_len: usize,
 }
 
-/// A forward planner over a parsed [`HtnDomain`].
+/// A forward planner over a baked [`HtnDomain`].
 ///
-/// Planning mutates no external state: it clones the initial state and works on
-/// its own copy, so it can be called repeatedly and cheaply across turns.
+/// Planning mutates no external state: it works on its own clone of the
+/// extracted [`PlanState`] scratchpad, so it can be called repeatedly and
+/// cheaply across turns.
 pub struct HtnPlanner<'a> {
     domain: &'a HtnDomain,
-    registry: &'a TypeRegistry,
     /// Whether the look-ahead sweep runs before each method commitment
     /// (default: enabled).
     lookahead: bool,
@@ -146,12 +144,10 @@ pub struct HtnPlanner<'a> {
 }
 
 impl<'a> HtnPlanner<'a> {
-    /// Create a planner bound to a domain and a type registry (for reflection
-    /// evaluation / effect application).
-    pub fn new(domain: &'a HtnDomain, registry: &'a TypeRegistry) -> Self {
+    /// Create a planner bound to a domain.
+    pub fn new(domain: &'a HtnDomain) -> Self {
         Self {
             domain,
-            registry,
             lookahead: true,
             sanity_limit: 100,
         }
@@ -184,27 +180,33 @@ impl<'a> HtnPlanner<'a> {
     /// terminates after exhausting backtracking and returns the best partial
     /// plan found (with an empty task list if nothing was decomposable).
     ///
+    /// `state` is only read: the planner works on its own clone of the
+    /// scratchpad.
+    ///
     /// Before committing each method choice, a look-ahead sweep
     /// ([`lookahead`]) proves the remaining sequence can possibly succeed;
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
-    pub fn plan<S: HtnState>(&mut self, root: &str, initial_state: &S) -> Plan {
+    pub fn plan(&mut self, root: &str, state: &PlanState) -> Plan {
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
         let mut stack: VecDeque<(usize, Option<usize>)> = VecDeque::with_capacity(16);
         let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
         let mut plan: Vec<usize> = Vec::with_capacity(8);
-        // Reusable look-ahead scratch: the sweep's "unknown fields" overlay
+        // Reusable look-ahead scratch: the sweep's "unknown components" overlay
         // and its inevitable-refinement output, cleared per sweep.
-        let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.fields.len());
+        let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.components.len());
         let mut sweep_pins: Vec<(usize, usize)> = Vec::with_capacity(4);
         // Reusable scratch for the commitment's resolved subtask list and the
         // sweep's sequence view of it.
         let mut resolved_buf: Vec<(usize, usize)> = Vec::with_capacity(8);
         let mut seq_buf: Vec<usize> = Vec::with_capacity(8);
+        // Rollback stack: `(slot, old value)` pairs pushed before each effect
+        // application; backtracking restores down to the frame's length.
+        let mut rollback: Vec<(usize, Option<Box<dyn ErasedValue>>)> = Vec::with_capacity(16);
         let mut skip = 0;
-        let mut state = initial_state.clone();
+        let mut state = state.clone();
 
         let tasks = &self.domain.tasks;
 
@@ -216,8 +218,6 @@ impl<'a> HtnPlanner<'a> {
             };
         };
         stack.push_back((root_idx, None));
-
-        let registry = self.registry;
 
         'search: while let Some((current, occurrence_pin)) = stack.pop_front() {
             count += 1;
@@ -241,17 +241,13 @@ impl<'a> HtnPlanner<'a> {
                             Some(pm) if pm >= skip => compound
                                 .methods
                                 .get(pm)
-                                .filter(|m| {
-                                    m.preconditions
-                                        .iter()
-                                        .all(|c| c.evaluate(state.as_reflect()))
-                                })
+                                .filter(|m| m.preconditions.iter().all(|c| c.evaluate(&state)))
                                 .map(|m| (m, pm)),
                             // The pinned method was already tried and failed;
                             // every other method was proven infeasible at pin
                             // time, so this task is exhausted.
                             Some(_) => None,
-                            None => compound.find_method(state.as_reflect(), skip),
+                            None => compound.find_method(&state, skip),
                         };
                         let Some((method, idx)) = eligible else {
                             // No eligible method: unwind to the most recent
@@ -261,7 +257,9 @@ impl<'a> HtnPlanner<'a> {
                                 &mut plan,
                                 &mut mtr,
                                 &mut stack,
+                                &mut rollback,
                                 &mut skip,
+                                &mut state,
                             ) {
                                 break 'search;
                             }
@@ -271,10 +269,8 @@ impl<'a> HtnPlanner<'a> {
                         // Resolve this method's subtasks to (position, index)
                         // — needed to push the queue regardless of the sweep.
                         resolved_buf.clear();
-                        for (pos, sub) in method.subtasks.iter().enumerate() {
-                            if let Some(idx) = self.domain.task_index(*sub) {
-                                resolved_buf.push((pos, idx));
-                            }
+                        for (pos, &sub) in method.subtasks.iter().enumerate() {
+                            resolved_buf.push((pos, sub as usize));
                         }
                         // Look-ahead: can any refinement of this choice
                         // possibly succeed? Scoped to the method's own
@@ -287,7 +283,6 @@ impl<'a> HtnPlanner<'a> {
                             seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
                             lookahead::sweep(
                                 self.domain,
-                                registry,
                                 &state,
                                 &seq_buf,
                                 sanity_limit.saturating_sub(count),
@@ -316,6 +311,7 @@ impl<'a> HtnPlanner<'a> {
                                     mtr_len: mtr.len(),
                                     pinned: pin,
                                     stack: stack.iter().copied().collect(),
+                                    rollback_len: rollback.len(),
                                 };
                                 decomp_stack.push(frame);
                                 // Push subtask occurrences in reverse so the
@@ -334,13 +330,20 @@ impl<'a> HtnPlanner<'a> {
                     }
                 }
                 Task::Primitive(primitive) => {
-                    if primitive.preconditions_met(state.as_reflect()) {
+                    if primitive.preconditions_met(&state) {
                         plan.push(current);
-                        for e in primitive.effects.iter() {
-                            e.apply_dyn(state.as_reflect_mut(), registry);
-                        }
-                        for e in primitive.expected_effects.iter() {
-                            e.apply_dyn(state.as_reflect_mut(), registry);
+                        // Snapshot every slot the effects write before the
+                        // first write, so backtracking can restore them.
+                        for e in primitive
+                            .effects
+                            .iter()
+                            .chain(primitive.expected_effects.iter())
+                        {
+                            for &w in e.writes() {
+                                let old = state.snapshot(w);
+                                rollback.push((w, old));
+                            }
+                            e.apply(&mut state);
                         }
                         skip = 0;
                         continue;
@@ -350,7 +353,9 @@ impl<'a> HtnPlanner<'a> {
                         &mut plan,
                         &mut mtr,
                         &mut stack,
+                        &mut rollback,
                         &mut skip,
+                        &mut state,
                     ) {
                         break 'search;
                     }
@@ -371,20 +376,30 @@ impl<'a> HtnPlanner<'a> {
 
 /// Unwind one decomposition frame (or, for a pinned task whose only viable
 /// method failed, keep unwinding past it). Restores the append-only prefixes
-/// by truncation and re-queues the frame's task for its next method choice.
-/// Returns `false` when the search is exhausted.
+/// by truncation, the scratchpad by rollback, and re-queues the frame's task
+/// for its next method choice. Returns `false` when the search is exhausted.
+#[allow(clippy::too_many_arguments)]
 fn backtrack(
     decomp_stack: &mut Vec<DecompositionFrame>,
     plan: &mut Vec<usize>,
     mtr: &mut Vec<usize>,
     stack: &mut VecDeque<(usize, Option<usize>)>,
+    rollback: &mut Vec<(usize, Option<Box<dyn ErasedValue>>)>,
     skip: &mut usize,
+    state: &mut PlanState,
 ) -> bool {
     loop {
         match decomp_stack.pop() {
             Some(frame) => {
                 plan.truncate(frame.plan_len);
                 mtr.truncate(frame.mtr_len);
+                // Restore the scratchpad: undo every effect applied since the
+                // frame committed (newest first).
+                while rollback.len() > frame.rollback_len {
+                    if let Some((slot, old)) = rollback.pop() {
+                        state.restore(slot, old);
+                    }
+                }
                 // Restore the queue to its state at commitment time: the
                 // failed subtree's remnants go, the suffix (with its
                 // occurrence pins) comes back.

@@ -1,38 +1,44 @@
-//! Deeper, relationship-driven throughput benchmark for `cdda_htn`.
+//! Deeper, relationship-driven throughput benchmark for `bevy_bhtn`.
 //!
 //! The miner benchmark measures flat-planning throughput. This one stresses the
-//! planner on a **deep** domain (`htn/outpost.htn`, depth >= 5 with dozens
-//! of method options) **and** makes every entity carry a *real Bevy
-//! Relationship* (`ServesCache` / `CacheMembers`) instead of a flat struct: each
-//! colonist points at a supply-cache entity and its plan state is seeded from
-//! cache resources read through the relationship, so the per-entity AI cost
-//! includes a relationship traversal (the exact pattern a squad/inventory system
-//! in the game would use).
+//! planner on a **deep** domain (the outpost domain, depth >= 5 with dozens of
+//! method options) **and** makes every entity carry a *real Bevy Relationship*
+//! (`ServesCache` / `CacheMembers`) instead of a flat struct: each colonist
+//! points at a supply-cache entity and its plan scratchpad is seeded from cache
+//! resources read through the relationship, so the per-entity AI cost includes
+//! a relationship traversal (the exact pattern a squad/inventory system in the
+//! game would use).
 //!
 //! Like the miner bench, this runs through a real Bevy `Schedule` with
 //! `Query::par_iter_mut` over the multi-threaded executor at 10k / 50k / 200k
 //! entities, plus single-actor latency cases — and per actor it runs a
 //! **plan → execute → replan cycle 10 times** against the cache-seeded working
-//! state (the colonist component itself stays immutable, so every measured
-//! iteration starts from identical states without a reset pass).
+//! scratchpad (rebuilt from the colonist's immutable seed every run, so every
+//! measured iteration starts from identical states without a reset pass).
 
 mod common;
 
 use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::state::PlanState;
+use bevy_bhtn::HtnDomain;
 use bevy_ecs::component::Component;
 use bevy_ecs::prelude::*;
-use bevy_reflect::Reflect;
-use bevy_reflect::TypeRegistry;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use ustr::Ustr;
 
-use common::{execute_plan_step, register_outpost, OutpostState, OUTPOST_HTN};
+use common::{
+    execute_plan_step, outpost_domain, outpost_scratch, Ammo, Food, Fuel, Health, Morale, Zone,
+};
 
 /// How many plan → execute → replan cycles each actor runs per measured
 /// iteration.
 const REPLAN_CYCLES: usize = 10;
+
+/// The root task of the outpost domain (the task function's name).
+const ROOT: &str = "secure_outpost";
 
 /// The supply cache a colonist draws from. Owned by the *cache* entity; read by
 /// the planner through the [`ServesCache`] relationship when seeding a colonist's
@@ -55,28 +61,27 @@ struct ServesCache(#[entities] pub Entity);
 #[relationship_target(relationship = ServesCache)]
 struct CacheMembers(Vec<Entity>);
 
+/// The per-entity planning scratchpad: a dense snapshot of the outpost
+/// components the domain's closures read and write.
+#[derive(Component, Default)]
+struct Scratch(PlanState);
+
+/// The colonist's own (pre-cache) scratchpad seed, immutable across runs.
+#[derive(Component, Clone)]
+struct ColonistSeed(PlanState);
+
 /// The output of the planner, written back onto each colonist.
 #[derive(Component, Debug, Default)]
-struct Plan(Vec<Ustr>);
+struct PlanOutput(Vec<Ustr>);
 
 /// Counter written by [`run_ai`].
 #[derive(Resource, Default)]
-struct AiProcessed(std::sync::atomic::AtomicUsize);
+struct AiProcessed(AtomicUsize);
 
-/// Immutable domain + registry + pre-built relationship lookup.
+/// Immutable baked domain shared by every AI system run.
 #[derive(Resource)]
 struct HtnResources {
-    domain: bevy_bhtn::HtnDomain,
-    registry: TypeRegistry,
-}
-
-impl HtnResources {
-    fn new() -> Self {
-        let mut registry = TypeRegistry::default();
-        register_outpost(&mut registry);
-        let domain = bevy_bhtn::parse_htn(OUTPOST_HTN).expect("parse outpost HTN");
-        Self { domain, registry }
-    }
+    domain: HtnDomain,
 }
 
 /// The supply caches, keyed by entity, so the AI can read cache resources via the
@@ -84,67 +89,68 @@ impl HtnResources {
 #[derive(Resource, Default)]
 struct CacheStore(HashMap<Entity, CacheResources>);
 
-fn build_plan_state(colonist: &OutpostState, cache: &CacheResources) -> OutpostState {
-    OutpostState {
-        fuel: colonist.fuel + cache.fuel / 4,
-        food: colonist.food + cache.food / 4,
-        ammo: colonist.ammo + cache.ammo / 4,
-        // Intentionally spread out per colony so the deep planner's branches
-        // differ across entities (and the plan is never a trivial "done").
-        health: colonist.health,
-        morale: colonist.morale,
-        perimeter: colonist.perimeter,
-        reinforced: colonist.reinforced,
-        armored: colonist.armored,
-        caches: colonist.caches,
-        position: colonist.position,
-    }
+/// Seed a colonist's scratchpad from its own base components (no cache
+/// contribution yet — that is applied per run through the relationship).
+fn colonist_seed(domain: &HtnDomain, i: usize) -> PlanState {
+    PlanState::build(&domain.components)
+        .set(Fuel(1 + (i % 8) as i32))
+        .set(Food(1 + (i % 30) as i32))
+        .set(Health(50 + (i % 60) as i32))
+        .set(Morale(5 + (i % 90) as i32))
+        .set(Ammo(1 + (i % 12) as i32))
+        .set(Zone::Outside)
+        .finish()
+}
+
+/// Apply the cache contribution to a working scratchpad (a quarter share of
+/// each cache resource, the same split the former monolithic-state bench used).
+fn apply_cache(domain: &HtnDomain, state: &mut PlanState, cache: &CacheResources) {
+    let reg = &domain.components;
+    // Unwrap: every component below is touched by the outpost domain's
+    // closures, so it is guaranteed registered.
+    state.get_mut::<Fuel>(reg.get::<Fuel>().unwrap()).0 += cache.fuel / 4;
+    state.get_mut::<Food>(reg.get::<Food>().unwrap()).0 += cache.food / 4;
+    state.get_mut::<Ammo>(reg.get::<Ammo>().unwrap()).0 += cache.ammo / 4;
 }
 
 /// The AI system: for each colonist, use its `ServesCache` relationship to find
-/// its supply cache, seed a plan state from it, then run the 10-cycle
-/// plan → execute → replan loop against that working state and write the final
-/// plan. The colonist component stays immutable (the cache-seeded state is
+/// its supply cache, seed a working scratchpad from its immutable seed plus the
+/// cache share, then run the 10-cycle plan → execute → replan loop and write
+/// the final plan. The seed stays immutable (the cache-seeded scratchpad is
 /// ephemeral), so measured iterations need no reset pass.
 fn run_ai(
     resources: Res<HtnResources>,
     caches: Res<CacheStore>,
     processed: Res<AiProcessed>,
-    mut q: Query<(&OutpostState, &ServesCache, &mut Plan)>,
+    mut q: Query<(&ColonistSeed, &ServesCache, &mut Scratch, &mut PlanOutput)>,
 ) {
-    processed.0.store(0, std::sync::atomic::Ordering::Relaxed);
-    q.par_iter_mut().for_each(|(colonist, serves, mut plan)| {
-        // The relationship traversal: resolve the cache entity -> resources.
-        let cache = caches
-            .0
-            .get(&serves.0)
-            .cloned()
-            .unwrap_or(CacheResources::default());
-        let mut start = build_plan_state(colonist, &cache);
-        let mut planner = HtnPlanner::new(&resources.domain, &resources.registry);
-        let mut planned = planner.plan("SecureOutpost", &start);
-        for _ in 0..REPLAN_CYCLES {
-            common::execute_plan_step(
-                &resources.domain,
-                &resources.registry,
-                start.as_reflect_mut(),
-                &planned,
-            );
-            planned = planner.plan("SecureOutpost", &start);
-        }
-        plan.0 = planned.task_names().to_vec();
-        processed
-            .0
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
+    processed.0.store(0, Ordering::Relaxed);
+    q.par_iter_mut()
+        .for_each(|(seed, serves, mut scratch, mut output)| {
+            // The relationship traversal: resolve the cache entity -> resources.
+            let cache = caches
+                .0
+                .get(&serves.0)
+                .cloned()
+                .unwrap_or(CacheResources::default());
+            let domain = &resources.domain;
+            scratch.0 = seed.0.clone();
+            apply_cache(domain, &mut scratch.0, &cache);
+            let mut planner = HtnPlanner::new(domain);
+            let mut planned = planner.plan(ROOT, &scratch.0);
+            for _ in 0..REPLAN_CYCLES {
+                execute_plan_step(domain, &mut scratch.0, &planned);
+                planned = planner.plan(ROOT, &scratch.0);
+            }
+            output.0 = planned.task_names().to_vec();
+            processed.0.fetch_add(1, Ordering::Relaxed);
+        });
 }
 
 /// Spawn `n` colonists, each provisioned by one of `n / SQUAD_MIN` cache
 /// entities via a `ServesCache` relationship.
 fn spawn_world(n: usize, squad: usize) -> (World, Schedule) {
     let mut res = World::new();
-    res.insert_resource(HtnResources::new());
-    res.insert_resource(AiProcessed::default());
     let mut caches = CacheStore::default();
 
     // Spawn the supply caches first (one per up-to-`squad` colonists).
@@ -165,27 +171,26 @@ fn spawn_world(n: usize, squad: usize) -> (World, Schedule) {
         .collect();
     res.insert_resource(caches);
 
+    let domain = outpost_domain();
     let mut idx = 0usize;
     res.spawn_batch((0..n).map(|i| {
         let cache = cache_entities[idx / squad];
         idx += 1;
         (
-            OutpostState {
-                fuel: 1 + (i % 8) as i32,
-                food: 1 + (i % 30) as i32,
-                health: 50 + (i % 60) as i32,
-                morale: 5 + (i % 90) as i32,
-                ammo: 1 + (i % 12) as i32,
-                ..Default::default()
-            },
             // Cross-entity relationship: provisioned by `cache`.
             ServesCache(cache),
-            // Pre-insert the output component so the AI system writes into it
-            // directly in parallel (steady-state: every actor already has a plan).
-            Plan(Vec::new()),
+            ColonistSeed(colonist_seed(&domain, i)),
+            // Pre-insert the scratchpad and output components so the AI system
+            // writes into them directly in parallel (steady-state: every actor
+            // already has a plan).
+            Scratch::default(),
+            PlanOutput::default(),
         )
     }))
     .count();
+
+    res.insert_resource(HtnResources { domain });
+    res.insert_resource(AiProcessed::default());
 
     let mut schedule = Schedule::default();
     schedule.add_systems(run_ai);
@@ -193,7 +198,8 @@ fn spawn_world(n: usize, squad: usize) -> (World, Schedule) {
 }
 
 pub fn deep_planner(c: &mut Criterion) {
-    let single_state = OutpostState::default();
+    let domain = outpost_domain();
+    let single_state = outpost_scratch(&domain, common::fresh_outpost());
 
     let mut group = c.benchmark_group("cdda_htn_deep_bevy_ecs");
 
@@ -210,43 +216,39 @@ pub fn deep_planner(c: &mut Criterion) {
     }
 
     // Single-actor deep latency: the same 10-cycle replan loop, working state
-    // rebuilt per iteration.
-    let resources = HtnResources::new();
+    // reset per iteration.
     group.bench_function("deep_plan_one_actor_latency", |b| {
         b.iter(|| {
-            let mut start = single_state.clone();
-            let mut planner = HtnPlanner::new(&resources.domain, &resources.registry);
+            let mut state = single_state.clone();
+            let mut planner = HtnPlanner::new(&domain);
             for _ in 0..REPLAN_CYCLES {
-                let plan = planner.plan("SecureOutpost", &start);
-                execute_plan_step(
-                    &resources.domain,
-                    &resources.registry,
-                    start.as_reflect_mut(),
-                    &plan,
-                );
+                let plan = planner.plan(ROOT, &state);
+                execute_plan_step(&domain, &mut state, &plan);
                 black_box(&plan);
             }
         });
     });
     // Also a seed with relation resources to keep the deep benchmark honest.
-    let seeded_cache = CacheResources {
-        fuel: 20,
-        food: 40,
-        ammo: 8,
+    let seeded_state = {
+        let mut state = single_state.clone();
+        apply_cache(
+            &domain,
+            &mut state,
+            &CacheResources {
+                fuel: 20,
+                food: 40,
+                ammo: 8,
+            },
+        );
+        state
     };
-    let seeded_state = build_plan_state(&single_state, &seeded_cache);
     group.bench_function("deep_plan_related_latency", |b| {
         b.iter(|| {
-            let mut start = seeded_state.clone();
-            let mut planner = HtnPlanner::new(&resources.domain, &resources.registry);
+            let mut state = seeded_state.clone();
+            let mut planner = HtnPlanner::new(&domain);
             for _ in 0..REPLAN_CYCLES {
-                let plan = planner.plan("SecureOutpost", &start);
-                execute_plan_step(
-                    &resources.domain,
-                    &resources.registry,
-                    start.as_reflect_mut(),
-                    &plan,
-                );
+                let plan = planner.plan(ROOT, &state);
+                execute_plan_step(&domain, &mut state, &plan);
                 black_box(&plan);
             }
         });

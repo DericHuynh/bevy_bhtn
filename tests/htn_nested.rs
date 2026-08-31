@@ -1,160 +1,167 @@
-//! Nested-plan and replanning tests for `cdda_htn`.
+//! Nested-plan and replanning tests for `bevy_bhtn`.
 //!
 //! The planner is stateless — `HtnPlanner::plan` clones the state and returns a
-//! fresh [`Plan`]. That makes "changing requirements mid-execution" a matter of
-//! re-planning against an updated world state each turn, which is exactly how a
-//! turn-based game (and the reference `bevy_htn` "ReplanRequest" flow) consumes
-//! it. These tests pin that behaviour: deep nesting decomposes in the right
-//! order, and a plan adapts when the world changes between turns.
+//! fresh [`bevy_bhtn::planner::Plan`]. That makes "changing requirements
+//! mid-execution" a matter of re-planning against an updated world state each
+//! turn, which is exactly how a turn-based game (and the reference `bevy_htn`
+//! "ReplanRequest" flow) consumes it. These tests pin that behaviour: deep
+//! nesting decomposes in the right order, and a plan adapts when the world
+//! changes between turns.
 
 mod common;
 use common::HtnTestBed;
 
-use bevy_bhtn::Task;
-use bevy_reflect::std_traits::ReflectDefault;
-use bevy_reflect::Reflect;
-use bevy_reflect::TypeRegistry;
+use bevy_bhtn::prelude::*;
+use bevy_ecs::prelude::Component;
+use ustr::Ustr;
 
 // ---------------------------------------------------------------------------
 // A three-level nested domain: root -> middle -> leaves.
 // ---------------------------------------------------------------------------
 
-#[derive(Reflect, Default, Clone, Copy, Debug, PartialEq, Eq)]
-#[reflect(Default)]
+#[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
 enum Room {
     #[default]
     Outside,
     Hall,
+    #[allow(dead_code)]
     Vault,
 }
 
-#[derive(Reflect, Clone, Debug, Default)]
-struct NestedState {
-    room: Room,
-    torch_lit: bool,
-    chest_open: bool,
+#[derive(Component, Clone, Default, Debug)]
+struct TorchLit(pub bool);
+#[derive(Component, Clone, Default, Debug)]
+struct ChestOpen(pub bool);
+
+fn get_treasure(task: &mut TaskBuilder) {
+    task.branch().then(traverse).then(open_chest);
 }
 
-fn register_nested(registry: &mut TypeRegistry) {
-    registry.register::<NestedState>();
-    registry.register::<Room>();
+fn traverse(task: &mut TaskBuilder) {
+    task.branch().then(enter_hall).then(light_torch);
 }
 
-const NESTED_HTN: &str = r#"
-schema {
-    version: 0.1.0
+fn enter_hall(task: &mut TaskBuilder) {
+    task.precondition(|room: &Room| *room == Room::Outside)
+        .effect(|room: &mut Room| *room = Room::Hall);
 }
 
-compound_task "GetTreasure" {
-    method "go" {
-        subtasks: [Traverse, OpenChest]
-    }
+fn light_torch(task: &mut TaskBuilder) {
+    task.effect(|torch: &mut TorchLit| torch.0 = true);
 }
 
-compound_task "Traverse" {
-    method "light hall" {
-        subtasks: [EnterHall, LightTorch]
-    }
+fn open_chest(task: &mut TaskBuilder) {
+    task.precondition(|torch: &TorchLit| torch.0)
+        .precondition(|room: &Room| *room != Room::Outside)
+        .effect(|chest: &mut ChestOpen| chest.0 = true);
 }
 
-primitive_task "EnterHall" {
-    operator: NoopOperator
-    preconditions: [room == Room::Outside]
-    effects: [room = Room::Hall]
+fn nested_domain() -> HtnDomain {
+    HtnDomain::from_root(get_treasure)
+        .build()
+        .expect("nested domain is well-formed")
 }
-
-primitive_task "LightTorch" {
-    operator: NoopOperator
-    effects: [torch_lit = true]
-}
-
-primitive_task "OpenChest" {
-    operator: NoopOperator
-    preconditions: [torch_lit == true, room != Room::Outside]
-    effects: [chest_open = true]
-}
-"#;
 
 #[test]
 fn deep_nested_plan_decomposes_in_order() {
-    let bed = HtnTestBed::new(NESTED_HTN, "GetTreasure", register_nested);
-    let plan = bed.plan_forward(&NestedState::default());
-    // Level 1 (GetTreasure) -> Level 2 (Entrance) -> leaves, in order.
-    assert_eq!(plan, vec!["EnterHall", "LightTorch", "OpenChest"]);
+    let bed = HtnTestBed::new(nested_domain(), "get_treasure");
+    let state = PlanState::build(&bed.domain().components).finish();
+    let plan = bed.plan_forward(&state);
+    // Level 1 (get_treasure) -> Level 2 (traverse) -> leaves, in order.
+    assert_eq!(
+        plan,
+        vec![
+            Ustr::from("enter_hall"),
+            Ustr::from("light_torch"),
+            Ustr::from("open_chest")
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Mid-execution replanning: the world changes between turns.
 // ---------------------------------------------------------------------------
 
-const SURVIVAL_HTN: &str = r#"
-schema {
-    version: 0.1.0
+#[derive(Component, Clone, Default, Debug)]
+struct Temperature(pub i32);
+#[derive(Component, Clone, Default, Debug)]
+struct Sheltered(pub bool);
+#[derive(Component, Clone, Default, Debug)]
+struct Supplies(pub i32);
+
+fn survive(task: &mut TaskBuilder) {
+    task.branch()
+        .precondition(|temp: &Temperature| temp.0 < 15)
+        .precondition(|sheltered: &Sheltered| !sheltered.0)
+        .then(seek_shelter)
+        .then(warm_up);
+    task.branch()
+        .precondition(|temp: &Temperature| temp.0 < 15)
+        .precondition(|sheltered: &Sheltered| sheltered.0)
+        .then(warm_up);
+    task.branch()
+        .precondition(|temp: &Temperature| temp.0 >= 15)
+        .then(scavenge);
+    task.branch().then(wait);
 }
 
-compound_task "Survive" {
-    method "cold and unsheltered" {
-        preconditions: [temperature < 15, sheltered == false]
-        subtasks: [SeekShelter, WarmUp]
+fn seek_shelter(task: &mut TaskBuilder) {
+    task.precondition(|sheltered: &Sheltered| !sheltered.0)
+        .effect(|sheltered: &mut Sheltered| sheltered.0 = true);
+}
+
+fn warm_up(task: &mut TaskBuilder) {
+    task.precondition(|sheltered: &Sheltered| sheltered.0)
+        .effect(|temp: &mut Temperature| temp.0 += 20);
+}
+
+fn scavenge(task: &mut TaskBuilder) {
+    task.precondition(|temp: &Temperature| temp.0 >= 15)
+        .effect(|supplies: &mut Supplies| supplies.0 += 1);
+}
+
+fn wait(_task: &mut TaskBuilder) {}
+
+fn survival_domain() -> HtnDomain {
+    HtnDomain::from_root(survive)
+        .build()
+        .expect("survival domain is well-formed")
+}
+
+/// A survival scratchpad with the given temperature (shelterless, empty-handed).
+fn survival_state(domain: &HtnDomain, temperature: i32) -> PlanState {
+    PlanState::build(&domain.components)
+        .set(Temperature(temperature))
+        .finish()
+}
+
+/// Read component `T` out of a scratchpad (via the domain's slot registry).
+fn read<'a, T: PlanComponent>(domain: &'a HtnDomain, state: &'a PlanState) -> &'a T {
+    state.get::<T>(domain.components.get::<T>().unwrap())
+}
+
+/// Apply a single planned primitive's effects to `state` (simulating executing
+/// that step of the plan).
+fn apply_effects(bed: &HtnTestBed, task_name: &str, state: &mut PlanState) {
+    let Some(Task::Primitive(p)) = bed.domain().get_task(task_name) else {
+        panic!("task `{task_name}` not a primitive");
+    };
+    for e in p.effects.iter() {
+        e.apply(state);
     }
-    method "cold but sheltered" {
-        preconditions: [temperature < 15, sheltered == true]
-        subtasks: [WarmUp]
-    }
-    method "warm enough" {
-        preconditions: [temperature >= 15]
-        subtasks: [Scavenge]
-    }
-    method "fallback" {
-        subtasks: [Wait]
-    }
-}
-
-primitive_task "SeekShelter" {
-    operator: NoopOperator
-    preconditions: [sheltered == false]
-    effects: [sheltered = true]
-}
-
-primitive_task "WarmUp" {
-    operator: NoopOperator
-    preconditions: [sheltered == true]
-    effects: [temperature += 20]
-}
-
-primitive_task "Scavenge" {
-    operator: NoopOperator
-    preconditions: [temperature >= 15]
-    effects: [supplies += 1]
-}
-
-primitive_task "Wait" {
-    operator: NoopOperator
-}
-"#;
-
-#[derive(Reflect, Clone, Debug, Default)]
-struct SurvivalState {
-    temperature: i32,
-    sheltered: bool,
-    supplies: i32,
-}
-
-fn register_survival(registry: &mut TypeRegistry) {
-    registry.register::<SurvivalState>();
 }
 
 #[test]
 fn plan_adapts_when_world_changes_mid_execution() {
-    let bed = HtnTestBed::new(SURVIVAL_HTN, "Survive", register_survival);
+    let bed = HtnTestBed::new(survival_domain(), "survive");
 
     // Turn 1: it's cold — plan to take shelter then warm up.
-    let mut state = SurvivalState {
-        temperature: 5,
-        ..Default::default()
-    };
+    let mut state = survival_state(bed.domain(), 5);
     let plan_1 = bed.plan_forward(&state);
-    assert_eq!(plan_1, vec!["SeekShelter", "WarmUp"]);
+    assert_eq!(
+        plan_1,
+        vec![Ustr::from("seek_shelter"), Ustr::from("warm_up")]
+    );
 
     // Execute the shelter step (the world changes).
     apply_effects(&bed, &plan_1[0], &mut state);
@@ -162,48 +169,30 @@ fn plan_adapts_when_world_changes_mid_execution() {
     // Turn 2: still cold (warm-up not yet done) — replan should still aim to
     // warm up, now shelter is secured.
     let plan_2 = bed.plan_forward(&state);
-    assert_eq!(plan_2, vec!["WarmUp"]);
+    assert_eq!(plan_2, vec![Ustr::from("warm_up")]);
 
     // Turn 3: warm up executes, temperature rises above the threshold.
     apply_effects(&bed, &plan_2[0], &mut state);
-    assert!(state.temperature >= 15);
+    assert!(read::<Temperature>(bed.domain(), &state).0 >= 15);
 
     // Turn 4: requirement changed — now it's warm, so switch to scavenging.
     let plan_3 = bed.plan_forward(&state);
-    assert_eq!(plan_3, vec!["Scavenge"]);
+    assert_eq!(plan_3, vec![Ustr::from("scavenge")]);
 }
 
 #[test]
 fn changing_requirements_force_a_new_root_branch() {
-    let bed = HtnTestBed::new(SURVIVAL_HTN, "Survive", register_survival);
+    let bed = HtnTestBed::new(survival_domain(), "survive");
     // Start warm -> scavenge immediately.
-    let warm = SurvivalState {
-        temperature: 20,
-        ..Default::default()
-    };
-    // A requirement *becomes* unmet: weather drops mid-execution.
-    let mut state = warm.clone();
+    let state = survival_state(bed.domain(), 20);
     let plan_warm = bed.plan_forward(&state);
-    assert_eq!(plan_warm, vec!["Scavenge"]);
+    assert_eq!(plan_warm, vec![Ustr::from("scavenge")]);
 
     // Requirements change (cold snap) mid-plan -> replan to shelter.
-    state.temperature = 5;
-    state.sheltered = false;
-    let plan_cold = bed.plan_forward(&state);
-    assert_eq!(plan_cold, vec!["SeekShelter", "WarmUp"]);
-}
-
-/// Apply a single planned primitive's effects to `state` (simulating executing
-/// that step of the plan).
-fn apply_effects<S: Reflect + Default + Clone + std::fmt::Debug>(
-    bed: &HtnTestBed,
-    task_name: &str,
-    state: &mut S,
-) {
-    let Some(Task::Primitive(p)) = bed.domain().get_task(task_name) else {
-        panic!("task `{task_name}` not a primitive");
-    };
-    for e in p.effects.iter() {
-        e.apply(state.as_reflect_mut(), bed.registry());
-    }
+    let cold = survival_state(bed.domain(), 5);
+    let plan_cold = bed.plan_forward(&cold);
+    assert_eq!(
+        plan_cold,
+        vec![Ustr::from("seek_shelter"), Ustr::from("warm_up")]
+    );
 }

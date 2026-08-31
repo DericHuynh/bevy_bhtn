@@ -1,65 +1,63 @@
-//! Parse-time inferred summaries of tasks and methods.
+//! Bake-time inferred summaries of tasks and methods.
 //!
 //! Compound tasks and their methods declare no preconditions or effects of
 //! their own — their interaction with world state is implicit in their
 //! decomposition tree. Following Olz, Biundo & Bercher (AAAI 2021, JAIR 2025),
-//! we infer **state-independent summaries** for every task at parse time so the
+//! we infer **state-independent summaries** for every task at bake time so the
 //! planners (and any look-ahead pruning) can reason about compound tasks
 //! without decomposing them.
 //!
 //! The classic algorithms work over propositional facts; this crate's state is
-//! a typed reflected struct, so the adaptation works over **state fields**:
-//! a primitive "reads" the fields its conditions inspect and "writes" the
-//! fields its effects assign. Three sets are inferred per task:
+//! a set of independent ECS components, so the adaptation works over
+//! **component slots** (the [`ComponentRegistry`](crate::state::ComponentRegistry)
+//! indices): a primitive "reads" the components its preconditions inspect and
+//! "writes" the components its effects mutate. Three sets are inferred per
+//! task:
 //!
-//! - **required fields** (executability-relaxed preconditions,
-//!   under-approximation): every refinement of the task reads the field before
-//!   any refinement writes it. Sound to treat as "this task needs a suitable
-//!   value for the field".
+//! - **required components** (executability-relaxed preconditions,
+//!   under-approximation): every refinement of the task reads the component
+//!   before any refinement writes it. Sound to treat as "this task needs a
+//!   suitable value for the component".
 //! - **possible writes** (over-approximation): some refinement writes the
-//!   field. Sound to treat as "the field's value may change".
+//!   component. Sound to treat as "the component's value may change".
 //! - **guaranteed writes** (under-approximation): every refinement writes the
-//!   field. Sound to treat as "the field will definitely be assigned".
+//!   component. Sound to treat as "the component will definitely be assigned".
 //!
 //! All three are computed as fixpoints over the decomposition graph (mirroring
 //! the paper's `EmptyRefinements` + method-shortening +
 //! decomposition-reachability pipeline): possible and guaranteed writes as
-//! least fixpoints, and required fields as a greatest fixpoint (a safety
+//! least fixpoints, and required components as a greatest fixpoint (a safety
 //! property over all refinements) guarded by least-fixpoint termination and
-//! f-vanishing checks — so recursive domains converge correctly: e.g. a
-//! terminating self-recursive task whose every refinement reads `food` before
-//! writing it still infers `food` as required.
+//! f-vanishing checks — so recursive domains converge correctly.
 //!
 //! Summaries are **sound approximations, not exact semantics**: a pruned
-//! field is provably (relaxed-)absent, but a kept field isn't guaranteed
-//! present. Exact inference is PSPACE/EXPTIME-complete; these polynomial sets
-//! matched the exact ones on nearly all IPC 2020 benchmark tasks.
-
-use std::collections::HashMap;
-
-use ustr::Ustr;
+//! component is provably (relaxed-)absent, but a kept component isn't
+//! guaranteed present. Exact inference is PSPACE/EXPTIME-complete; these
+//! polynomial sets matched the exact ones on nearly all IPC 2020 benchmark
+//! tasks.
 
 use crate::domain::HtnDomain;
+
 use crate::tasks::Task;
 
 // ---------------------------------------------------------------------------
 // FieldSet
 // ---------------------------------------------------------------------------
 
-/// A compact bitset over the domain's interned state-field indices (see
-/// [`HtnDomain::fields`]).
+/// A compact bitset over the domain's component-slot indices (see
+/// [`ComponentRegistry`]).
 ///
 /// All operations assume both sets share the same universe (the same domain's
-/// field table). Field indices are dense and domains touch only a handful of
-/// fields, so a `Vec<u64>` bitset keeps summary set operations to a few word
-/// ops in the planner's hot path.
+/// component table). Slot indices are dense and domains touch only a handful
+/// of components, so a `Vec<u64>` bitset keeps summary set operations to a few
+/// word ops in the planner's hot path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldSet {
     bits: Vec<u64>,
 }
 
 impl FieldSet {
-    /// An empty set over a universe of `universe` fields.
+    /// An empty set over a universe of `universe` slots.
     pub fn new(universe: usize) -> Self {
         let words = universe.div_ceil(64);
         Self {
@@ -67,7 +65,7 @@ impl FieldSet {
         }
     }
 
-    /// Add field `idx` to the set.
+    /// Add slot `idx` to the set.
     pub fn insert(&mut self, idx: usize) {
         let (word, bit) = (idx / 64, idx % 64);
         if word < self.bits.len() {
@@ -75,13 +73,13 @@ impl FieldSet {
         }
     }
 
-    /// Whether field `idx` is in the set.
+    /// Whether slot `idx` is in the set.
     pub fn contains(&self, idx: usize) -> bool {
         let (word, bit) = (idx / 64, idx % 64);
         word < self.bits.len() && self.bits[word] & (1 << bit) != 0
     }
 
-    /// Remove field `idx` from the set.
+    /// Remove slot `idx` from the set.
     pub fn remove(&mut self, idx: usize) {
         let (word, bit) = (idx / 64, idx % 64);
         if word < self.bits.len() {
@@ -89,33 +87,33 @@ impl FieldSet {
         }
     }
 
-    /// Remove every field from the set.
+    /// Remove every slot from the set.
     pub fn clear(&mut self) {
         self.bits.fill(0);
     }
 
-    /// Add every field of `other` to this set.
+    /// Add every slot of `other` to this set.
     pub fn union_with(&mut self, other: &Self) {
         for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
             *w |= o;
         }
     }
 
-    /// Keep only fields present in both sets.
+    /// Keep only slots present in both sets.
     pub fn intersect_with(&mut self, other: &Self) {
         for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
             *w &= o;
         }
     }
 
-    /// Remove every field of `other` from this set.
+    /// Remove every slot of `other` from this set.
     pub fn subtract(&mut self, other: &Self) {
         for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
             *w &= !o;
         }
     }
 
-    /// Whether every field of this set is also in `other`.
+    /// Whether every slot of this set is also in `other`.
     pub fn is_subset_of(&self, other: &Self) -> bool {
         self.bits
             .iter()
@@ -123,17 +121,17 @@ impl FieldSet {
             .all(|(a, b)| a & !b == 0)
     }
 
-    /// Whether the set contains no fields.
+    /// Whether the set contains no slots.
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|w| *w == 0)
     }
 
-    /// The number of fields in the set.
+    /// The number of slots in the set.
     pub fn count(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    /// Iterate the field indices in the set, in ascending order.
+    /// Iterate the slot indices in the set, in ascending order.
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.bits.iter().enumerate().flat_map(|(w, bits)| {
             (0..64)
@@ -149,18 +147,18 @@ impl FieldSet {
 
 /// The inferred, state-independent summary of one task (see [module docs]).
 ///
-/// Beyond the three field sets, this carries the domain-structure analysis
+/// Beyond the three component sets, this carries the domain-structure analysis
 /// (SCC/reachability over the decomposition graph, in the spirit of Toad's
 /// self-embedding criterion and Alford's stratification): all of it is
-/// computed once at parse time and read O(1) by the planners.
+/// computed once at bake time and read O(1) by the planners.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskSummary {
-    /// Fields every refinement reads before any refinement writes them
+    /// Components every refinement reads before any refinement writes them
     /// (executability-relaxed preconditions; under-approximation).
     pub required_fields: FieldSet,
-    /// Fields some refinement writes (over-approximation).
+    /// Components some refinement writes (over-approximation).
     pub possible_writes: FieldSet,
-    /// Fields every refinement writes (under-approximation).
+    /// Components every refinement writes (under-approximation).
     pub guaranteed_writes: FieldSet,
     /// Whether the task has at least one finite refinement. A task that can
     /// only refine forever can never complete, so any method whose sequence
@@ -188,69 +186,19 @@ pub struct TaskSummary {
 
 /// Compute and store summaries for every task in `domain`.
 ///
-/// Called from [`HtnDomain`]'s parse-time index rebuild; fills
-/// [`HtnDomain::fields`], the internal field-index map, and one
-/// [`TaskSummary`] per task index. Also fills each compound method's
+/// Called from [`HtnDomain::build`](crate::domain::HtnDomain::build); fills
+/// one [`TaskSummary`] per task index plus each compound method's
 /// `possible_writes` (the union of its subtasks' possible writes), which the
 /// forward planner's look-ahead sweep uses for optimistic state propagation.
 pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
-    // ---- 1. Intern every field name the domain touches --------------------
-    let mut field_index: HashMap<Ustr, usize> = HashMap::new();
-    let mut fields: Vec<Ustr> = Vec::new();
-    let intern = |name: &str, field_index: &mut HashMap<Ustr, usize>, fields: &mut Vec<Ustr>| {
-        let key = Ustr::from(name);
-        *field_index.entry(key).or_insert_with(|| {
-            fields.push(key);
-            fields.len() - 1
-        })
-    };
-
-    for task in &domain.tasks {
-        match task {
-            Task::Primitive(p) => {
-                for c in &p.preconditions {
-                    for f in c.read_fields() {
-                        intern(f, &mut field_index, &mut fields);
-                    }
-                }
-                for e in p.effects.iter().chain(p.expected_effects.iter()) {
-                    intern(e.field(), &mut field_index, &mut fields);
-                    if let Some(src) = e.source_field() {
-                        intern(src, &mut field_index, &mut fields);
-                    }
-                }
-            }
-            Task::Compound(c) => {
-                for m in &c.methods {
-                    for c in &m.preconditions {
-                        for f in c.read_fields() {
-                            intern(f, &mut field_index, &mut fields);
-                        }
-                    }
-                }
-            }
-            Task::Goal(g) => {
-                for e in &g.effects {
-                    intern(e.field(), &mut field_index, &mut fields);
-                    if let Some(src) = e.source_field() {
-                        intern(src, &mut field_index, &mut fields);
-                    }
-                }
-            }
-        }
-    }
-
     let n = domain.tasks.len();
-    let nf = fields.len();
-    let idx = |name: &str| -> usize {
-        field_index
-            .get(&Ustr::from(name))
-            .copied()
-            .expect("field was interned above")
-    };
+    // The component registry was populated during recording: every component
+    // any precondition reads or any effect writes is already registered, so
+    // the universe is fixed and slot indices are stable.
+    let nf = domain.components.len();
 
-    // ---- 2. Base sets for primitive tasks ---------------------------------
-    // reads: fields inspected by preconditions (conditions evaluate before
+    // ---- 1. Base sets for primitive tasks ---------------------------------
+    // reads: components inspected by preconditions (conditions evaluate before
     // effects apply, so every read is required within the task itself).
     // possible writes: effects + expected effects (the planner applies both
     // during search). guaranteed writes: effects only — expected effects are
@@ -263,36 +211,41 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
             continue;
         };
         for c in &p.preconditions {
-            for f in c.read_fields() {
-                reads[i].insert(idx(f));
+            for &r in c.reads() {
+                reads[i].insert(r);
             }
         }
         for e in p.effects.iter().chain(p.expected_effects.iter()) {
-            pw[i].insert(idx(e.field()));
+            for &w in e.writes() {
+                pw[i].insert(w);
+            }
         }
         for e in &p.effects {
-            gw[i].insert(idx(e.field()));
+            for &w in e.writes() {
+                gw[i].insert(w);
+            }
         }
     }
 
-    // ---- 3. Termination: least fixpoint of "has a finite refinement" ------
+    // Subtask index accessor: baked methods hold direct task indices.
+    let sub_index = |_m: &crate::tasks::Method, sub: u32| -> usize { sub as usize };
+
+    // ---- 2. Termination: least fixpoint of "has a finite refinement" ------
     // T(c) = ∃ method whose every subtask terminates. A task that can only
     // refine forever has no finite refinements at all — nothing it "does" in
-    // any refinement sense, so every consumer (required fields, min yield,
+    // any refinement sense, so every consumer (required components, min yield,
     // look-ahead dead-ends) treats it as empty/incompletable.
-    let term = vec![false; n];
     let term = {
-        let mut term = term;
+        let mut term = vec![false; n];
         loop {
             let mut changed = false;
             for (i, task) in domain.tasks.iter().enumerate() {
                 let v = match task {
                     Task::Primitive(_) | Task::Goal(_) => true,
-                    Task::Compound(c) => c.methods.iter().any(|m| {
-                        m.subtasks
-                            .iter()
-                            .all(|sub| domain.index_of.get(sub).map_or(true, |&j| term[j]))
-                    }),
+                    Task::Compound(c) => c
+                        .methods
+                        .iter()
+                        .any(|m| m.subtasks.iter().all(|&sub| term[sub_index(m, sub)])),
                 };
                 if v && !term[i] {
                     term[i] = true;
@@ -306,7 +259,7 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         term
     };
 
-    // ---- 4. Possible writes: least fixpoint of ∪ over method subtasks -----
+    // ---- 3. Possible writes: least fixpoint of ∪ over method subtasks -----
     // Over-approximation: some refinement of c writes f iff some method's
     // subtask chain can write f. Recursion converges to the union over all
     // reachable primitive descendants.
@@ -318,10 +271,8 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
             };
             let mut set = FieldSet::new(nf);
             for m in &c.methods {
-                for sub in &m.subtasks {
-                    if let Some(&j) = domain.index_of.get(sub) {
-                        set.union_with(&pw[j]);
-                    }
+                for &sub in &m.subtasks {
+                    set.union_with(&pw[sub_index(m, sub)]);
                 }
             }
             if set != pw[i] {
@@ -334,7 +285,7 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
     }
 
-    // ---- 5. Guaranteed writes: least fixpoint of ∩ over methods -----------
+    // ---- 4. Guaranteed writes: least fixpoint of ∩ over methods -----------
     // f is written by *every* refinement of the sequence ⟨t1..tn⟩ iff some
     // single ti writes f in every refinement of ti (each refinement is the
     // concatenation of one refinement per subtask). So per method:
@@ -351,10 +302,8 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
             let mut acc: Option<FieldSet> = None;
             for m in &c.methods {
                 seq.clear();
-                for sub in &m.subtasks {
-                    if let Some(&j) = domain.index_of.get(sub) {
-                        seq.union_with(&gw[j]);
-                    }
+                for &sub in &m.subtasks {
+                    seq.union_with(&gw[sub_index(m, sub)]);
                 }
                 acc = Some(match acc {
                     None => seq.clone(),
@@ -375,7 +324,7 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
     }
 
-    // ---- 6. Min yield: least fixpoint of min over methods -----------------
+    // ---- 5. Min yield: least fixpoint of min over methods -----------------
     // The shortest primitive sequence some refinement produces: a primitive
     // yields itself (1); a compound takes the cheapest method's subtask sum.
     // Descending fixpoint from `usize::MAX` (saturating arithmetic makes
@@ -396,10 +345,8 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
             let mut best = usize::MAX;
             for m in &c.methods {
                 let mut sum = 0usize;
-                for sub in &m.subtasks {
-                    if let Some(&j) = domain.index_of.get(sub) {
-                        sum = sum.saturating_add(min_yield[j]);
-                    }
+                for &sub in &m.subtasks {
+                    sum = sum.saturating_add(min_yield[sub_index(m, sub)]);
                     if sum == usize::MAX {
                         break;
                     }
@@ -421,13 +368,14 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
     }
 
-    // ---- 7. Required fields (executability-relaxed preconditions) ---------
-    // Per field f, a refinement "first touches" f at its first primitive that
-    // reads or writes f (a method-precondition read touches at decomposition
-    // time, before any subtask runs). f is required for task c iff **every
-    // finite refinement** of c first touches f with a READ. That is a safety
-    // property over all refinements, so it is computed as a **greatest**
-    // fixpoint of exact identities, guarded by two least fixpoints:
+    // ---- 6. Required components (executability-relaxed preconditions) -----
+    // Per component f, a refinement "first touches" f at its first primitive
+    // that reads or writes f (a method-precondition read touches at
+    // decomposition time, before any subtask runs). f is required for task c
+    // iff **every finite refinement** of c first touches f with a READ. That
+    // is a safety property over all refinements, so it is computed as a
+    // **greatest** fixpoint of exact identities, guarded by two least
+    // fixpoints:
     //
     //   T   — c has at least one finite refinement (least fixpoint). Tasks
     //       that can only refine forever have no refinements at all; following
@@ -447,7 +395,6 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
     //
     // The greatest fixpoint is exact for terminating tasks; the T guard keeps
     // the claim conservative (under-approximating) for non-terminating ones.
-    // (`term` was computed in step 3.)
 
     let mut req: Vec<FieldSet> = (0..n).map(|_| FieldSet::new(nf)).collect();
     let mut evan: Vec<bool> = vec![false; n];
@@ -464,11 +411,10 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
                 let v = match task {
                     Task::Primitive(_) => !touches(i),
                     Task::Goal(_) => true,
-                    Task::Compound(c) => c.methods.iter().any(|m| {
-                        m.subtasks
-                            .iter()
-                            .all(|sub| domain.index_of.get(sub).map_or(true, |&j| evan[j]))
-                    }),
+                    Task::Compound(c) => c
+                        .methods
+                        .iter()
+                        .any(|m| m.subtasks.iter().all(|&sub| evan[sub_index(m, sub)])),
                 };
                 if v && !evan[i] {
                     evan[i] = true;
@@ -499,27 +445,19 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
                 for m in &c.methods {
                     // R_seq(m): does every refinement via this method first
                     // touch f with a read?
-                    let mut seq = m.preconditions.iter().any(|c| {
-                        c.read_fields()
-                            .any(|f| domain.field_index.get(&Ustr::from(f)) == Some(&fi))
-                    });
-                    for sub in &m.subtasks {
-                        match domain.index_of.get(sub) {
-                            Some(&j) => {
-                                if r[j] {
-                                    seq = true;
-                                    break;
-                                }
-                                if !evan[j] {
-                                    // First relevant subtask doesn't start
-                                    // with a read: the touch is a write.
-                                    break;
-                                }
-                                // Vanishing: the first touch may come later.
-                            }
-                            // Unknown subtask: the planner drops it too.
-                            None => continue,
+                    let mut seq = m.preconditions.iter().any(|c| c.reads().contains(&fi));
+                    for &sub in &m.subtasks {
+                        let j = sub_index(m, sub);
+                        if r[j] {
+                            seq = true;
+                            break;
                         }
+                        if !evan[j] {
+                            // First relevant subtask doesn't start with a
+                            // read: the touch is a write.
+                            break;
+                        }
+                        // Vanishing: the first touch may come later.
                     }
                     if !seq {
                         v = false;
@@ -543,7 +481,7 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
     }
 
-    // ---- 8. Structure flags: reachability over the decomposition graph ----
+    // ---- 7. Structure flags: reachability over the decomposition graph ----
     // Edges are compound → compound-subtask, tagged by position: an edge is
     // *non-last* when the subtask is not its method's final subtask (c can
     // appear with material after it) and *non-first* when it is not the first
@@ -561,18 +499,17 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         };
         for m in &c.methods {
             let last = m.subtasks.len().saturating_sub(1);
-            for (p, sub) in m.subtasks.iter().enumerate() {
-                if let Some(&j) = domain.index_of.get(sub) {
-                    if matches!(domain.tasks[j], Task::Compound(_)) {
-                        if !adj[i].contains(&j) {
-                            adj[i].push(j);
-                        }
-                        if p != last {
-                            nl_pred[j][i] = true;
-                        }
-                        if p != 0 {
-                            nf_pred[j][i] = true;
-                        }
+            for (p, &sub) in m.subtasks.iter().enumerate() {
+                let j = sub_index(m, sub);
+                if matches!(domain.tasks[j], Task::Compound(_)) {
+                    if !adj[i].contains(&j) {
+                        adj[i].push(j);
+                    }
+                    if p != last {
+                        nl_pred[j][i] = true;
+                    }
+                    if p != 0 {
+                        nf_pred[j][i] = true;
                     }
                 }
             }
@@ -610,50 +547,24 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         tail_recursive[i] = !right_gen;
     }
 
-    // ---- 9. Per-method possible writes + per-condition read indices -------
+    // ---- 8. Per-method possible writes ------------------------------------
     // The union of the method's subtasks' possible writes — what the forward
-    // planner's look-ahead sweep uses to propagate optimistic state — and the
-    // field indices each precondition reads, precomputed so the sweep's
-    // known/unknown checks need no per-call hash lookups.
-    let cond_reads = |c: &crate::conditions::HtnCondition, field_index: &HashMap<Ustr, usize>| {
-        let mut reads: [Option<usize>; 2] = [None, None];
-        for (slot, f) in reads.iter_mut().zip(c.read_fields()) {
-            *slot = field_index.get(&Ustr::from(f)).copied();
-        }
-        reads
-    };
+    // planner's look-ahead sweep uses to propagate optimistic state. (Each
+    // precondition's read slots live on the `Precondition` itself, captured
+    // at build time.)
     for task in &mut domain.tasks {
-        match task {
-            Task::Primitive(p) => {
-                p.prec_reads = p
-                    .preconditions
-                    .iter()
-                    .map(|c| cond_reads(c, &field_index))
-                    .collect();
-            }
-            Task::Compound(c) => {
-                for m in &mut c.methods {
-                    let mut set = FieldSet::new(nf);
-                    for sub in &m.subtasks {
-                        if let Some(&j) = domain.index_of.get(sub) {
-                            set.union_with(&pw[j]);
-                        }
-                    }
-                    m.possible_writes = set;
-                    m.prec_reads = m
-                        .preconditions
-                        .iter()
-                        .map(|c| cond_reads(c, &field_index))
-                        .collect();
+        if let Task::Compound(c) = task {
+            for m in &mut c.methods {
+                let mut set = FieldSet::new(nf);
+                for &sub in &m.subtasks {
+                    set.union_with(&pw[sub as usize]);
                 }
+                m.possible_writes = set;
             }
-            Task::Goal(_) => {}
         }
     }
 
-    // ---- 10. Store ---------------------------------------------------------
-    domain.fields = fields;
-    domain.field_index = field_index;
+    // ---- 9. Store ----------------------------------------------------------
     domain.summaries = (0..n)
         .map(|i| TaskSummary {
             required_fields: req[i].clone(),

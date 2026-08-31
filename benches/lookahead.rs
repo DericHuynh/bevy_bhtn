@@ -1,11 +1,11 @@
-//! Look-ahead pruning A/B benchmark for `cdda_htn`.
+//! Look-ahead pruning A/B benchmark for `bevy_bhtn`.
 //!
 //! Measures what the look-ahead sweep (`src/lookahead.rs`, Olz & Bercher SoCS
 //! 2023) buys — and what it costs — by planning the **same domains** (the
-//! shared `htn/` fixtures) with [`HtnPlanner::set_lookahead`] on vs off, each
-//! running the same **plan → execute → replan cycle 10 times** per measured
-//! iteration (state reset per iteration, so every iteration does identical
-//! work):
+//! shared function-defined fixtures) with [`HtnPlanner::set_lookahead`] on vs
+//! off, each running the same **plan → execute → replan cycle 10 times** per
+//! measured iteration (state reset per iteration, so every iteration does
+//! identical work):
 //!
 //! - **`exponential_backtrack`** — a doomed method whose dead end is only
 //!   detectable via optimistic propagation: a chain of 12 binary-choice gates
@@ -19,10 +19,10 @@
 //!   recursion is never entered; without it the planner burns its whole step
 //!   budget (the default 100, i.e. the realistic setting) and returns a
 //!   partial plan.
-//! - **`outpost_deep`** — the realistic `htn/outpost.htn` domain (depth >= 5,
-//!   dozens of methods, genuine in-branch backtracking). This is the honesty
-//!   check: on a healthy domain the sweep should be roughly neutral (small
-//!   overhead or small gain), not a regression.
+//! - **`outpost_deep`** — the realistic outpost domain (depth >= 5, dozens of
+//!   methods, genuine in-branch backtracking). This is the honesty check: on a
+//!   healthy domain the sweep should be roughly neutral (small overhead or
+//!   small gain), not a regression.
 //!
 //! Unlike `ai_throughput` / `deep_ai`, this bench calls the planner directly
 //! instead of through a Bevy `Schedule`: it isolates the *algorithmic* win of
@@ -31,15 +31,14 @@
 
 mod common;
 
-use bevy_bhtn::parse_htn;
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_reflect::Reflect;
+use bevy_bhtn::state::PlanState;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use common::{
-    execute_plan_step, fresh_outpost, register_gate, register_outpost, GateState,
-    DOOMED_RECURSION_HTN, EXPONENTIAL_HTN, OUTPOST_HTN,
+    doomed_recursion_domain, execute_plan_step, fresh_outpost, gate_domain, outpost_domain,
+    outpost_scratch,
 };
 
 /// How many plan → execute → replan cycles each case runs per measured
@@ -49,15 +48,13 @@ const REPLAN_CYCLES: usize = 10;
 fn bench_lookahead(c: &mut Criterion) {
     // --- exponential_backtrack: 2^12 leaf failures vs one sweep ------------
     {
-        let domain = parse_htn(EXPONENTIAL_HTN).expect("exponential fixture parses");
-        let mut registry = bevy_reflect::TypeRegistry::default();
-        register_gate(&mut registry);
-        let initial = GateState::default();
+        let domain = gate_domain();
+        let initial = PlanState::build(&domain.components).finish();
 
         let mut group = c.benchmark_group("exponential_backtrack");
         group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
         for (label, on) in [("off", false), ("on", true)] {
-            let mut planner = HtnPlanner::new(&domain, &registry);
+            let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
             // Raise the budget so the off case shows the real exponential
             // enumeration instead of stopping at the default sanity limit.
@@ -66,8 +63,8 @@ fn bench_lookahead(c: &mut Criterion) {
                 b.iter(|| {
                     let mut state = initial.clone();
                     for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("Root", black_box(&state));
-                        execute_plan_step(&domain, &registry, state.as_reflect_mut(), &plan);
+                        let plan = planner.plan("gate_root", black_box(&state));
+                        execute_plan_step(&domain, &mut state, &plan);
                         black_box(plan.task_names().len());
                     }
                 })
@@ -78,22 +75,20 @@ fn bench_lookahead(c: &mut Criterion) {
 
     // --- doomed_recursion: sanity-limit burn vs one sweep -------------------
     {
-        let domain = parse_htn(DOOMED_RECURSION_HTN).expect("doomed fixture parses");
-        let mut registry = bevy_reflect::TypeRegistry::default();
-        register_gate(&mut registry);
-        let initial = GateState::default();
+        let domain = doomed_recursion_domain();
+        let initial = PlanState::build(&domain.components).finish();
 
         let mut group = c.benchmark_group("doomed_recursion");
         group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
         for (label, on) in [("off", false), ("on", true)] {
-            let mut planner = HtnPlanner::new(&domain, &registry);
+            let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
                     for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("Act", black_box(&state));
-                        execute_plan_step(&domain, &registry, state.as_reflect_mut(), &plan);
+                        let plan = planner.plan("act", black_box(&state));
+                        execute_plan_step(&domain, &mut state, &plan);
                         black_box(plan.task_names().len());
                     }
                 })
@@ -104,22 +99,20 @@ fn bench_lookahead(c: &mut Criterion) {
 
     // --- outpost_deep: realistic domain, sweep overhead/gain check ----------
     {
-        let domain = parse_htn(OUTPOST_HTN).expect("outpost fixture parses");
-        let mut registry = bevy_reflect::TypeRegistry::default();
-        register_outpost(&mut registry);
-        let initial = fresh_outpost();
+        let domain = outpost_domain();
+        let initial = outpost_scratch(&domain, fresh_outpost());
 
         let mut group = c.benchmark_group("outpost_deep");
         group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
         for (label, on) in [("off", false), ("on", true)] {
-            let mut planner = HtnPlanner::new(&domain, &registry);
+            let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
                     for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("SecureOutpost", black_box(&state));
-                        execute_plan_step(&domain, &registry, state.as_reflect_mut(), &plan);
+                        let plan = planner.plan("secure_outpost", black_box(&state));
+                        execute_plan_step(&domain, &mut state, &plan);
                         black_box(plan.task_names().len());
                     }
                 })

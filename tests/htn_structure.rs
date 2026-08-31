@@ -1,4 +1,4 @@
-//! Tests for the parse-time domain structure analysis (slice of the
+//! Tests for the bake-time domain structure analysis (slice of the
 //! summaries work): per-task termination, minimum yield, and the
 //! recursion-shape flags (recursive / self-embedding / tail-recursive), plus
 //! the planner's min-yield budget pruning.
@@ -11,117 +11,88 @@
 //! sequence any refinement produces — a lower bound on decomposition work,
 //! used by the look-ahead sweep to refute methods that cannot finish within
 //! the planner's step budget.
+//!
+//! Domains are task-function graphs built inline; the parameterized deep-chain
+//! generator is baked as a macro-generated static graph (task-function
+//! identity needs static graphs, so the two tested depths are pre-baked).
 
 mod common;
+use common::{Gold, Noise};
 
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_reflect::Reflect;
-use bevy_reflect::TypeRegistry;
+use bevy_bhtn::state::PlanState;
+use bevy_bhtn::{HtnDomain, TaskBuilder};
+use bevy_ecs::prelude::*;
 
-#[derive(Reflect, Clone, Debug, Default)]
-struct ChainState {
-    count: i32,
-    gold: i32,
-    noise: bool,
-}
-
-fn register_chain(registry: &mut TypeRegistry) {
-    registry.register::<ChainState>();
-}
+/// A generic work counter (former `count` field).
+#[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
+struct Count(pub i32);
 
 /// One domain exercising every flag: flat work, terminating tail-recursive
 /// and self-embedding recursion, and non-terminating recursion.
-const STRUCTURE_HTN: &str = r#"
-schema {
-    version: 0.1.0
-}
-
-compound_task "Work" {
-    method "dig" {
-        subtasks: [Dig, Haul]
+fn structure_domain() -> HtnDomain {
+    // Synthetic root so every top-level task is baked (from_root records the
+    // transitive .then graph only); tests plan the individual tasks by name.
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(work);
+        task.branch().then(loop_);
+        task.branch().then(spiral);
+        task.branch().then(descend);
+        task.branch().then(tail);
+        task.branch().then(emb);
     }
-    method "sell" {
-        subtasks: [Sell]
+    fn work(task: &mut TaskBuilder) {
+        task.branch().then(dig).then(haul);
+        task.branch().then(sell);
     }
-}
-
-primitive_task "Dig" {
-    operator: NoopOperator
-    preconditions: [gold > 0]
-    effects: [count += 1]
-}
-
-primitive_task "Haul" {
-    operator: NoopOperator
-    effects: [count += 1]
-}
-
-primitive_task "Sell" {
-    operator: NoopOperator
-    effects: [count += 1]
-}
-
-compound_task "Loop" {
-    method "done" {
-        subtasks: [Tick]
+    fn dig(task: &mut TaskBuilder) {
+        task.precondition(|gold: &Gold| gold.0 > 0)
+            .effect(|count: &mut Count| count.0 += 1);
     }
-    method "again" {
-        subtasks: [Loop, Tick]
+    fn haul(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 += 1);
     }
+    fn sell(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 += 1);
+    }
+    fn loop_(task: &mut TaskBuilder) {
+        task.branch().then(tick);
+        task.branch().then(loop_).then(tick);
+    }
+    fn tick(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 += 1);
+    }
+    fn spiral(task: &mut TaskBuilder) {
+        task.branch().then(spiral).then(tick);
+    }
+    fn descend(task: &mut TaskBuilder) {
+        task.branch().then(descend).then(eat);
+        task.branch().then(eat);
+    }
+    fn eat(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 += 1);
+    }
+    fn tail(task: &mut TaskBuilder) {
+        task.branch().then(tick);
+        task.branch().then(tick).then(tail);
+    }
+    fn emb(task: &mut TaskBuilder) {
+        task.branch().then(tick);
+        task.branch().then(emb).then(tick).then(emb);
+    }
+    HtnDomain::from_root(root)
+        .build()
+        .expect("structure domain is well-formed")
 }
-
-primitive_task "Tick" {
-    operator: NoopOperator
-    effects: [count += 1]
-}
-
-compound_task "Spiral" {
-    method "only" {
-        subtasks: [Spiral, Tick]
-    }
-}
-
-compound_task "Descend" {
-    method "step" {
-        subtasks: [Descend, Eat]
-    }
-    method "stop" {
-        subtasks: [Eat]
-    }
-}
-
-primitive_task "Eat" {
-    operator: NoopOperator
-    effects: [count += 1]
-}
-
-compound_task "Tail" {
-    method "base" {
-        subtasks: [Tick]
-    }
-    method "recurse" {
-        subtasks: [Tick, Tail]
-    }
-}
-
-compound_task "Emb" {
-    method "base" {
-        subtasks: [Tick]
-    }
-    method "cycle" {
-        subtasks: [Emb, Tick, Emb]
-    }
-}
-"#;
 
 #[test]
 fn structure_analysis_pins_flags_and_min_yield() {
-    let domain = bevy_bhtn::parse_htn(STRUCTURE_HTN).expect("parses");
+    let domain = structure_domain();
     let summary = |name: &str| domain.task_summary(name).expect("summary");
 
     // Flat task: cheapest method is `sell` (one primitive); no recursion, so
     // tail-recursive holds vacuously.
-    let work = summary("Work");
+    let work = summary("work");
     assert_eq!(work.min_yield, 1);
     assert!(work.terminating);
     assert!(!work.recursive);
@@ -129,9 +100,9 @@ fn structure_analysis_pins_flags_and_min_yield() {
     assert!(work.tail_recursive);
 
     // Terminating recursion with the recursive task always non-last
-    // (⟨Loop, Tick⟩): right-generating → not tail-recursive, but material
+    // (⟨loop_, tick⟩): right-generating → not tail-recursive, but material
     // never precedes it → not self-embedding.
-    let loop_summary = summary("Loop");
+    let loop_summary = summary("loop_");
     assert!(loop_summary.terminating);
     assert_eq!(loop_summary.min_yield, 1);
     assert!(loop_summary.recursive);
@@ -139,31 +110,31 @@ fn structure_analysis_pins_flags_and_min_yield() {
     assert!(!loop_summary.tail_recursive);
 
     // Non-terminating recursion: no finite refinement at all.
-    let spiral = summary("Spiral");
+    let spiral = summary("spiral");
     assert!(!spiral.terminating);
     assert_eq!(spiral.min_yield, usize::MAX);
     assert!(spiral.recursive);
 
-    // Same shape as Loop via a different method set.
-    let descend = summary("Descend");
+    // Same shape as loop_ via a different method set.
+    let descend = summary("descend");
     assert!(descend.terminating);
     assert_eq!(descend.min_yield, 1);
     assert!(descend.recursive);
     assert!(!descend.self_embedding);
     assert!(!descend.tail_recursive);
 
-    // Tail recursion (⟨Tick, Tail⟩): the recursive task is always last →
+    // Tail recursion (⟨tick, tail⟩): the recursive task is always last →
     // tail-recursive, left-generating only → not self-embedding.
-    let tail = summary("Tail");
+    let tail = summary("tail");
     assert!(tail.terminating);
     assert_eq!(tail.min_yield, 1);
     assert!(tail.recursive);
     assert!(!tail.self_embedding);
     assert!(tail.tail_recursive);
 
-    // Self-embedding (⟨Emb, Tick, Emb⟩): material on BOTH sides — the
+    // Self-embedding (⟨emb, tick, emb⟩): material on BOTH sides — the
     // context-free core. This is Toad's exact-translation boundary.
-    let emb = summary("Emb");
+    let emb = summary("emb");
     assert!(emb.terminating);
     assert_eq!(emb.min_yield, 1);
     assert!(emb.recursive);
@@ -171,58 +142,139 @@ fn structure_analysis_pins_flags_and_min_yield() {
     assert!(!emb.tail_recursive);
 }
 
-/// A 30-deep compound chain: `min_yield(C0) = 30`. With a step budget of 10
-/// the method cannot possibly finish, and the min-yield check must refute it
-/// at the frame — where the old planner (without the check) burned the budget
-/// executing the chain's prefix and returned a partial plan.
-fn deep_chain_domain(depth: usize) -> String {
-    let mut s = String::from(
-        "schema {\n    version: 0.1.0\n}\n\n\
-         compound_task \"Root\" {\n\
-         \x20   method \"deep\" {\n        subtasks: [C0]\n    }\n\
-         \x20   method \"quick\" {\n        subtasks: [Ok]\n    }\n}\n\n",
-    );
-    for i in 0..depth {
-        let body = if i + 1 == depth {
-            format!("P{i}")
-        } else {
-            format!("P{i}, C{}", i + 1)
-        };
-        s.push_str(&format!(
-            "compound_task \"C{i}\" {{\n    method \"only\" {{\n        subtasks: [{body}]\n    }}\n}}\n\n"
-        ));
-        s.push_str(&format!(
-            "primitive_task \"P{i}\" {{\n    operator: NoopOperator\n    effects: [noise = true]\n}}\n\n"
-        ));
+// ---------------------------------------------------------------------------
+// Deep-chain generator (macro-baked static graphs)
+// ---------------------------------------------------------------------------
+
+/// Generates one chain link + its primitive. The token stream is
+/// `c0 p0 c1 c1 p1 c2 … cN-1 pN-1` — each link's `next` is the following
+/// link's own name, and the final two tokens are the base link.
+macro_rules! chain_tasks {
+    ($last_link:ident $last_prim:ident) => {
+        pub fn $last_link(task: &mut TaskBuilder) {
+            task.branch().then($last_prim);
+        }
+        pub fn $last_prim(task: &mut TaskBuilder) {
+            task.effect(|noise: &mut Noise| noise.0 = true);
+        }
+    };
+    ($link:ident $prim:ident $next:ident $($rest:tt)*) => {
+        pub fn $link(task: &mut TaskBuilder) {
+            task.branch().then($prim).then($next);
+        }
+        pub fn $prim(task: &mut TaskBuilder) {
+            task.effect(|noise: &mut Noise| noise.0 = true);
+        }
+        chain_tasks!($($rest)*);
+    };
+}
+
+/// Bakes a deep-chain domain module: `root` (deep method → `c0`, quick method
+/// → `ok`) plus the linear chain, and a constructor fn named after the module.
+macro_rules! deep_chain_mod {
+    ($mod_name:ident, $($tokens:tt)*) => {
+        mod $mod_name {
+            use super::{Gold, Noise};
+            use bevy_bhtn::TaskBuilder;
+
+            pub fn root(task: &mut TaskBuilder) {
+                task.branch().then(c0);
+                task.branch().then(ok);
+            }
+            pub fn ok(task: &mut TaskBuilder) {
+                task.effect(|gold: &mut Gold| gold.0 = 1);
+            }
+            chain_tasks!($($tokens)*);
+        }
+
+        fn $mod_name() -> HtnDomain {
+            HtnDomain::from_root($mod_name::root)
+                .build()
+                .expect("deep-chain domain is well-formed")
+        }
+    };
+}
+
+deep_chain_mod!(
+    chain30,
+    c0 p0 c1
+    c1 p1 c2
+    c2 p2 c3
+    c3 p3 c4
+    c4 p4 c5
+    c5 p5 c6
+    c6 p6 c7
+    c7 p7 c8
+    c8 p8 c9
+    c9 p9 c10
+    c10 p10 c11
+    c11 p11 c12
+    c12 p12 c13
+    c13 p13 c14
+    c14 p14 c15
+    c15 p15 c16
+    c16 p16 c17
+    c17 p17 c18
+    c18 p18 c19
+    c19 p19 c20
+    c20 p20 c21
+    c21 p21 c22
+    c22 p22 c23
+    c23 p23 c24
+    c24 p24 c25
+    c25 p25 c26
+    c26 p26 c27
+    c27 p27 c28
+    c28 p28 c29
+    c29 p29
+);
+
+deep_chain_mod!(
+    chain5,
+    c0 p0 c1
+    c1 p1 c2
+    c2 p2 c3
+    c3 p3 c4
+    c4 p4
+);
+
+/// A `depth`-deep compound chain: `min_yield(c0) = depth`. With a step budget
+/// of 10 the method cannot possibly finish, and the min-yield check must
+/// refute it at the frame — where the old planner (without the check) burned
+/// the budget executing the chain's prefix and returned a partial plan.
+///
+/// Task-function identity is static, so only the two tested depths (5 and 30)
+/// are baked; the generator keeps its old signature and dispatches on them.
+fn deep_chain_domain(depth: usize) -> HtnDomain {
+    match depth {
+        5 => chain5(),
+        30 => chain30(),
+        _ => panic!("only depths 5 and 30 are baked as static task graphs"),
     }
-    s.push_str("primitive_task \"Ok\" {\n    operator: NoopOperator\n    effects: [gold = 1]\n}\n");
-    s
 }
 
 #[test]
 fn min_yield_refutes_method_that_cannot_finish_within_budget() {
-    let domain = bevy_bhtn::parse_htn(&deep_chain_domain(30)).expect("parses");
-    let mut registry = TypeRegistry::default();
-    register_chain(&mut registry);
-    let state = ChainState::default();
+    let domain = deep_chain_domain(30);
+    let state = PlanState::build(&domain.components).finish();
 
-    assert_eq!(domain.task_summary("C0").unwrap().min_yield, 30);
+    assert_eq!(domain.task_summary("c0").unwrap().min_yield, 30);
 
     // On: the deep method needs ≥ 30 steps but only ~9 remain — refuted at
     // the frame, and the quick method plans.
-    let mut planner = HtnPlanner::new(&domain, &registry);
+    let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
-    assert_eq!(planner.plan("Root", &state).task_names(), ["Ok"]);
+    assert_eq!(planner.plan("root", &state).task_names(), ["ok"]);
 
     // Off: plain backtracking enters the chain and burns the budget on its
     // prefix (the documented fallback semantics).
-    let mut planner = HtnPlanner::new(&domain, &registry);
+    let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
     planner.set_lookahead(false);
-    let plan = planner.plan("Root", &state);
+    let plan = planner.plan("root", &state);
     let names = plan.task_names();
-    assert_eq!(names[0], "P0");
-    assert!(!names.contains(&"Ok".into()));
+    assert_eq!(names[0], "p0");
+    assert!(!names.contains(&"ok".into()));
 }
 
 #[test]
@@ -230,27 +282,21 @@ fn min_yield_does_not_refute_within_budget() {
     // Same shape, 5 deep, default budget: the chain must plan to completion —
     // a wrong min-yield computation (e.g. counting compounds twice, or
     // flagging recursive tasks as infinite) would over-refute here.
-    let domain = bevy_bhtn::parse_htn(&deep_chain_domain(5)).expect("parses");
-    let mut registry = TypeRegistry::default();
-    register_chain(&mut registry);
-    let state = ChainState::default();
+    let domain = deep_chain_domain(5);
+    let state = PlanState::build(&domain.components).finish();
 
-    assert_eq!(domain.task_summary("C0").unwrap().min_yield, 5);
+    assert_eq!(domain.task_summary("c0").unwrap().min_yield, 5);
 
-    let mut planner = HtnPlanner::new(&domain, &registry);
+    let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("Root", &state).task_names(),
-        ["P0", "P1", "P2", "P3", "P4"]
+        planner.plan("root", &state).task_names(),
+        ["p0", "p1", "p2", "p3", "p4"]
     );
 
-    // And the recursive domains from STRUCTURE_HTN keep planning under the
-    // default budget (their min yields are small despite recursion).
-    let domain = bevy_bhtn::parse_htn(STRUCTURE_HTN).expect("parses");
-    let mut registry = TypeRegistry::default();
-    register_chain(&mut registry);
-    let mut planner = HtnPlanner::new(&domain, &registry);
-    assert_eq!(
-        planner.plan("Loop", &ChainState::default()).task_names(),
-        ["Tick"]
-    );
+    // And the recursive domains from the structure domain keep planning under
+    // the default budget (their min yields are small despite recursion).
+    let domain = structure_domain();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    assert_eq!(planner.plan("loop_", &state).task_names(), ["tick"]);
 }
