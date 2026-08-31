@@ -46,12 +46,19 @@ use bevy_ecs::system::EntityCommands;
 // ---------------------------------------------------------------------------
 
 /// Every item kind in the game. Data, not code: recipes reference these.
+/// `Scrap`, `Berry` and `Bottle` are irrelevant to the test's goal — they
+/// exist to prove the planner stays focused on the goal recipe.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 enum ItemKind {
     #[default]
     Stick,
     Rag,
     Spear,
+    Scrap,
+    Berry,
+    Bottle,
+    Bandage,
+    Torch,
 }
 
 /// A tile position on the 5×5 grid.
@@ -486,126 +493,291 @@ fn pocket_holds(world: &mut World, survivor: Entity, kind: ItemKind) -> Option<E
     None
 }
 
+// ---------------------------------------------------------------------------
+// The shared world harness
+// ---------------------------------------------------------------------------
+
+/// The shared CDDA-like world: a survivor at (0,0) wearing a jacket that
+/// holds a stick and a bottle; rag/scrap/berry/bottle scattered on the
+/// ground; the full recipe book; the tick schedule
+/// (perceive → sync → plan/execute → movement → pickup → craft → index).
+struct CddaWorld {
+    world: World,
+    schedule: Schedule,
+    survivor: Entity,
+    #[allow(dead_code)] // kept for future per-clothing assertions
+    jacket: Entity,
+}
+
+/// Where every ground item lies (shared by all scenarios).
+const GROUND_ITEMS: [(ItemKind, Pos); 4] = [
+    (ItemKind::Rag, Pos { x: 4, y: 4 }),
+    (ItemKind::Scrap, Pos { x: 2, y: 2 }),
+    (ItemKind::Berry, Pos { x: 0, y: 3 }),
+    (ItemKind::Bottle, Pos { x: 3, y: 1 }),
+];
+
+impl CddaWorld {
+    fn new(goal: ItemKind) -> Self {
+        let mut world = World::new();
+
+        // Data-driven game content: the full recipe book. Whichever recipe
+        // the goal names is the only one the planner may pursue.
+        let recipes = RecipeBook(vec![
+            Recipe {
+                output: ItemKind::Spear,
+                inputs: vec![ItemKind::Stick, ItemKind::Rag],
+            },
+            Recipe {
+                output: ItemKind::Bandage,
+                inputs: vec![ItemKind::Scrap, ItemKind::Berry],
+            },
+            Recipe {
+                output: ItemKind::Torch,
+                inputs: vec![ItemKind::Bottle, ItemKind::Scrap],
+            },
+        ]);
+
+        world.insert_resource(HtnConfig::new(
+            HtnDomain::from_root(behave)
+                .build()
+                .expect("well-formed domain"),
+        ));
+
+        let survivor = world
+            .spawn((
+                Pos { x: 0, y: 0 },
+                Travel::default(),
+                Arrived::default(),
+                Focus::default(),
+                CraftGoal(goal),
+                PocketContents::default(),
+                GroundKnowledge::default(),
+                recipes,
+                HtnAgent::default(),
+            ))
+            .id();
+        let jacket = world.spawn((Jacket, WornBy(survivor))).id();
+        // Carried from the start: a spear input (stick) and an irrelevant
+        // bottle the planner must leave alone unless the goal needs it.
+        world.spawn((ItemKind::Stick, InPocket(jacket)));
+        world.spawn((ItemKind::Bottle, InPocket(jacket)));
+
+        for (kind, pos) in GROUND_ITEMS {
+            world.spawn((kind, pos, OnGround));
+        }
+
+        world.insert_resource(SpatialIndex::default());
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                perception,
+                sync_pockets,
+                htn_ai_system, // exclusive: plans, validates, executes one step
+                movement,
+                pick_up_items,
+                craft_items,
+                update_spatial_index,
+            )
+                .chain(),
+        );
+
+        Self {
+            world,
+            schedule,
+            survivor,
+            jacket,
+        }
+    }
+
+    /// Run ticks until `kind` sits in a pocket of the survivor's clothing;
+    /// returns the tick count. The simulation is fully deterministic (no
+    /// randomness, no hash-iteration-order dependence), so tests pin the
+    /// exact number.
+    fn run_until_crafted(&mut self, kind: ItemKind) -> usize {
+        let mut ticks = 0;
+        while pocket_holds(&mut self.world, self.survivor, kind).is_none() {
+            ticks += 1;
+            assert!(
+                ticks <= 100,
+                "the survivor never crafted {kind:?} (100 ticks)"
+            );
+            self.schedule.run(&mut self.world);
+        }
+        // One more tick so the sync/perception systems settle the summaries.
+        self.schedule.run(&mut self.world);
+        ticks
+    }
+
+    /// Every item kind still present in the world (pockets + ground).
+    fn kinds(&mut self) -> Vec<ItemKind> {
+        let mut q = self.world.query::<&ItemKind>();
+        q.iter(&self.world).copied().collect()
+    }
+
+    fn ground_kind_at(&self, pos: Pos) -> Option<ItemKind> {
+        self.world
+            .resource::<SpatialIndex>()
+            .0
+            .get(&pos)
+            .copied()
+            .map(|e| {
+                *self
+                    .world
+                    .get::<ItemKind>(e)
+                    .expect("indexed entity has a kind")
+            })
+    }
+
+    fn position(&self) -> Pos {
+        *self
+            .world
+            .get::<Pos>(self.survivor)
+            .expect("survivor alive")
+    }
+
+    fn pocket_count(&self, kind: ItemKind) -> u32 {
+        self.world
+            .get::<PocketContents>(self.survivor)
+            .expect("survivor alive")
+            .count(kind)
+    }
+
+    fn idle(&self) -> bool {
+        self.world
+            .get::<HtnAgent>(self.survivor)
+            .expect("survivor alive")
+            .plan
+            .is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The scenarios
+// ---------------------------------------------------------------------------
+
+/// The survivor walks to the rag, picks it up, and crafts the spear. The
+/// simulation is deterministic, so the tick count is pinned exactly: 8 tiles
+/// of walking plus the drift-replan cadence and the pickup/craft ticks.
 #[test]
 fn survivor_walks_picks_up_and_crafts_a_spear() {
-    let mut world = World::new();
+    let mut sim = CddaWorld::new(ItemKind::Spear);
+    let ticks = sim.run_until_crafted(ItemKind::Spear);
+    assert_eq!(ticks, 13, "deterministic tick count for the spear run");
 
-    // --- Data-driven game content ------------------------------------------
-    let recipes = RecipeBook(vec![Recipe {
-        output: ItemKind::Spear,
-        inputs: vec![ItemKind::Stick, ItemKind::Rag],
-    }]);
+    // The spear exists, in a pocket of the survivor's clothing.
+    assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());
 
-    // --- Domain + driver config ---------------------------------------------
-    world.insert_resource(HtnConfig::new(
-        HtnDomain::from_root(behave)
-            .build()
-            .expect("well-formed domain"),
-    ));
+    // The inputs were consumed.
+    let kinds = sim.kinds();
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Stick).count(), 0);
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Rag).count(), 0);
 
-    // --- The survivor: wears a jacket holding a stick -----------------------
-    let survivor = world
-        .spawn((
-            Pos { x: 0, y: 0 },
-            Travel::default(),
-            Arrived::default(),
-            Focus::default(),
-            CraftGoal(ItemKind::Spear),
-            PocketContents::default(),
-            GroundKnowledge::default(),
-            recipes,
-            HtnAgent::default(),
-        ))
-        .id();
-    let jacket = world.spawn((Jacket, WornBy(survivor))).id();
-    world.spawn((ItemKind::Stick, InPocket(jacket)));
-
-    // --- The rag lies on the ground across the map ---------------------------
-    world.spawn((ItemKind::Rag, Pos { x: 4, y: 4 }, OnGround));
-
-    world.insert_resource(SpatialIndex::default());
-
-    // --- The tick: perceive → sync → plan/execute → world systems -----------
-    let mut schedule = Schedule::default();
-    schedule.add_systems(
-        (
-            perception,
-            sync_pockets,
-            htn_ai_system, // exclusive: plans, validates, executes one step
-            movement,
-            pick_up_items,
-            craft_items,
-            update_spatial_index,
-        )
-            .chain(),
-    );
-
-    // --- Run until the spear is crafted into a pocket ------------------------
-    let mut ticks = 0;
-    while pocket_holds(&mut world, survivor, ItemKind::Spear).is_none() {
-        ticks += 1;
-        assert!(
-            ticks <= 100,
-            "the survivor never crafted a spear (100 ticks)"
+    // The rag is off the ground; every distractor is exactly where it was.
+    assert_eq!(sim.ground_kind_at(Pos { x: 4, y: 4 }), None);
+    for (kind, pos) in GROUND_ITEMS.iter().skip(1) {
+        assert_eq!(
+            sim.ground_kind_at(*pos),
+            Some(*kind),
+            "{kind:?} still lies where it was placed"
         );
-        schedule.run(&mut world);
     }
-    // One more tick so the sync/perception systems settle the summaries.
-    schedule.run(&mut world);
-
-    // --- The spear exists, in a pocket of the survivor's clothing ------------
-    let spear = pocket_holds(&mut world, survivor, ItemKind::Spear)
-        .expect("the spear was crafted into a pocket");
-    assert!(
-        world.get::<ItemKind>(spear).is_some(),
-        "the spear is a real item entity"
-    );
-
-    // --- The inputs were consumed --------------------------------------------
-    let mut remaining = world.query::<(Entity, &ItemKind)>();
-    let kinds: Vec<ItemKind> = remaining.iter(&world).map(|(_, k)| *k).collect();
+    // No irrelevant recipe was ever crafted.
     assert_eq!(
-        kinds.iter().filter(|k| **k == ItemKind::Stick).count(),
+        kinds
+            .iter()
+            .filter(|k| matches!(**k, ItemKind::Bandage | ItemKind::Torch))
+            .count(),
         0,
-        "the stick was consumed by crafting"
+        "no irrelevant recipe was crafted"
     );
+
+    // The survivor walked across the map to the rag.
+    assert_eq!(sim.position(), Pos { x: 4, y: 4 });
+
+    // The pocket summary agrees with the relationship graph: spear crafted,
+    // stick consumed, the irrelevant bottle untouched.
+    assert_eq!(sim.pocket_count(ItemKind::Spear), 1);
+    assert_eq!(sim.pocket_count(ItemKind::Stick), 0);
+    assert_eq!(sim.pocket_count(ItemKind::Rag), 0);
+    assert_eq!(sim.pocket_count(ItemKind::Bottle), 1);
+    assert_eq!(sim.pocket_count(ItemKind::Scrap), 0);
+    assert_eq!(sim.pocket_count(ItemKind::Berry), 0);
+
+    // The agent is idle: the goal branch is terminal.
+    assert!(sim.idle());
+}
+
+/// Crafting a bandage needs two ground items in sequence (scrap, then berry
+/// — recipe-input order): two full walk-and-fetch trips, still pinned
+/// exactly, and still no distraction toward the other recipes.
+#[test]
+fn survivor_crafts_a_bandage_from_two_ground_items() {
+    let mut sim = CddaWorld::new(ItemKind::Bandage);
+    let ticks = sim.run_until_crafted(ItemKind::Bandage);
+    assert_eq!(ticks, 13, "deterministic tick count for the bandage run");
+
+    assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Bandage).is_some());
+
+    // Both inputs were consumed; the spear path is untouched.
+    let kinds = sim.kinds();
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Scrap).count(), 0);
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Berry).count(), 0);
+    assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Rag).count(), 1);
     assert_eq!(
-        kinds.iter().filter(|k| **k == ItemKind::Rag).count(),
+        kinds.iter().filter(|k| **k == ItemKind::Spear).count(),
         0,
-        "the rag was consumed by crafting"
+        "the spear recipe was never pursued"
     );
 
-    // --- The rag is off the ground and out of the spatial index --------------
-    let index = world.resource::<SpatialIndex>();
-    assert!(
-        !index
-            .0
-            .values()
-            .any(|e| world.get::<ItemKind>(*e) == Some(&ItemKind::Rag)),
-        "the rag no longer occupies the spatial index"
-    );
+    // The survivor stands where the last fetch happened (the berry).
+    assert_eq!(sim.position(), Pos { x: 0, y: 3 });
 
-    // --- The survivor actually walked to the rag ------------------------------
+    assert_eq!(sim.pocket_count(ItemKind::Bandage), 1);
+    assert_eq!(sim.pocket_count(ItemKind::Scrap), 0);
+    assert_eq!(sim.pocket_count(ItemKind::Berry), 0);
+    // The stick and bottle are irrelevant to a bandage and still carried.
+    assert_eq!(sim.pocket_count(ItemKind::Stick), 1);
+    assert_eq!(sim.pocket_count(ItemKind::Bottle), 1);
+
+    assert!(sim.idle());
+}
+
+/// Crafting a torch needs a bottle and scrap — and the survivor already
+/// carries a bottle: the planner must use the carried one and leave the
+/// ground bottle lying at (3,1) untouched. One fetch only — the shortest
+/// scenario.
+#[test]
+fn survivor_crafts_a_torch_using_the_carried_bottle() {
+    let mut sim = CddaWorld::new(ItemKind::Torch);
+    let ticks = sim.run_until_crafted(ItemKind::Torch);
+    assert_eq!(ticks, 7, "deterministic tick count for the torch run");
+
+    assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Torch).is_some());
+
+    // The carried bottle was consumed; the ground bottle is untouched.
+    assert_eq!(sim.pocket_count(ItemKind::Bottle), 0);
     assert_eq!(
-        world.get::<Pos>(survivor),
-        Some(&Pos { x: 4, y: 4 }),
-        "the survivor walked across the map to the rag"
+        sim.ground_kind_at(Pos { x: 3, y: 1 }),
+        Some(ItemKind::Bottle),
+        "the ground bottle was never fetched — the carried one was used"
     );
+    assert_eq!(kinds_count(&mut sim, ItemKind::Bottle), 1);
 
-    // --- The derived pocket summary agrees with the relationship graph -------
-    let contents = world.get::<PocketContents>(survivor).unwrap();
-    assert_eq!(contents.count(ItemKind::Spear), 1);
-    assert_eq!(contents.count(ItemKind::Stick), 0);
-    assert_eq!(contents.count(ItemKind::Rag), 0);
+    // The scrap was fetched and consumed; the rag is irrelevant here.
+    assert_eq!(kinds_count(&mut sim, ItemKind::Scrap), 0);
+    assert_eq!(kinds_count(&mut sim, ItemKind::Rag), 1);
 
-    // --- The agent is idle: the goal branch is terminal -----------------------
-    let agent = world.get::<HtnAgent>(survivor).unwrap();
-    assert!(
-        agent.plan.is_none(),
-        "the goal is satisfied; no further plan"
-    );
+    // The survivor stands where the scrap was.
+    assert_eq!(sim.position(), Pos { x: 2, y: 2 });
 
-    // Silence the unused-import lint for Duration in case the tick budget
-    // grows a wall-clock guard.
-    let _ = std::time::Duration::from_secs(0);
+    assert_eq!(sim.pocket_count(ItemKind::Torch), 1);
+    assert_eq!(sim.pocket_count(ItemKind::Stick), 1);
+
+    assert!(sim.idle());
+}
+
+fn kinds_count(sim: &mut CddaWorld, kind: ItemKind) -> usize {
+    sim.kinds().iter().filter(|k| **k == kind).count()
 }
