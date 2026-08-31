@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "lookahead"
 harness = false
+
+[[bench]]
+name = "wide_sets"
+harness = false

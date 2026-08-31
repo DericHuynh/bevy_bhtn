@@ -60,6 +60,7 @@ pub mod domain;
 pub mod ecs;
 pub mod error;
 pub mod lookahead;
+pub mod order;
 pub mod planner;
 pub mod selection;
 pub mod state;
@@ -69,6 +70,7 @@ pub mod tasks;
 pub use back_planner::*;
 pub use domain::*;
 pub use error::*;
+pub use order::*;
 pub use summaries::{FieldSet, TaskSummary};
 pub use tasks::*;
 
@@ -78,6 +80,7 @@ pub mod prelude {
     pub use crate::domain::*;
     pub use crate::ecs::*;
     pub use crate::error::*;
+    pub use crate::order::*;
     pub use crate::planner::*;
     pub use crate::selection::*;
     pub use crate::state::*;

@@ -57,6 +57,7 @@ use bevy_ecs::system::EntityCommands;
 use smallvec::{smallvec, SmallVec};
 use ustr::Ustr;
 
+use crate::order::SubtaskOrder;
 use crate::selection::{BranchCandidate, SelectionPolicy};
 use crate::state::{ComponentRegistry, PlanComponent, PlanState};
 use crate::summaries::FieldSet;
@@ -358,7 +359,17 @@ pub(crate) struct MethodProto {
     pub(crate) name: Option<&'static str>,
     pub(crate) utility: Option<ScoreFn>,
     pub(crate) preconditions: Vec<Precondition>,
-    pub(crate) subtasks: Vec<(TypeId, &'static str)>,
+    /// Subtask references in declaration order, each tagged with whether it
+    /// was appended via [`MethodBuilder::then`] (totally ordered after every
+    /// prior member) or [`MethodBuilder::subtask`] (unordered relative to
+    /// other unordered members).
+    pub(crate) subtasks: Vec<(TypeId, &'static str, bool)>,
+    /// Whether any [`MethodBuilder::subtask`] was used (the branch is not a
+    /// pure `then` chain).
+    pub(crate) unordered: bool,
+    /// Explicit [`MethodBuilder::before`] constraints as
+    /// `(predecessor position, successor position)` pairs.
+    pub(crate) edges: Vec<(u32, u32)>,
 }
 
 /// What a task function recorded, prior to baking.
@@ -590,16 +601,109 @@ impl<'a> MethodBuilder<'a> {
         self
     }
 
-    /// Append a subtask, referenced by its function. The function is queued
-    /// for expansion (each task function is recorded exactly once; recursive
-    /// and repeated references become plain graph edges).
+    /// Append a subtask at the end of the current total order: it runs after
+    /// every member declared before it.
     pub fn then<F: TaskFn>(&mut self, f: F) -> &mut Self {
         let tid = TypeId::of::<F>();
-        self.proto.subtasks.push((tid, F::task_name()));
+        self.proto.subtasks.push((tid, F::task_name(), true));
         self.rec.queue.push_back(Box::new(f));
         self
     }
+
+    /// Add a subtask with no ordering commitment relative to other unordered
+    /// subtasks (it still runs after every [`MethodBuilder::then`] member
+    /// declared before it). Returns a handle for [`MethodBuilder::before`]
+    /// constraints. The search schedules the branch's unordered members in
+    /// any topological order of the constraints, backtracking over
+    /// alternatives.
+    pub fn subtask<F: TaskFn>(&mut self, f: F) -> SubtaskHandle {
+        let pos = self.proto.subtasks.len() as u32;
+        let tid = TypeId::of::<F>();
+        self.proto.subtasks.push((tid, F::task_name(), false));
+        self.proto.unordered = true;
+        self.rec.queue.push_back(Box::new(f));
+        SubtaskHandle { pos }
+    }
+
+    /// Require that `before` completes before `after` starts. Called
+    /// multiple times to build a constraint DAG over this branch's members;
+    /// a cycle is a build-time error.
+    pub fn before(&mut self, before: SubtaskHandle, after: SubtaskHandle) -> &mut Self {
+        self.proto.edges.push((before.pos, after.pos));
+        self
+    }
+
+    /// All subtasks in the set may execute in any order (each exactly once).
+    /// Sugar for repeated [`MethodBuilder::subtask`] with no
+    /// [`MethodBuilder::before`] constraints.
+    ///
+    /// Takes a **tuple** of task functions (up to 8), matching Bevy's tuple
+    /// convention — an array would coerce every distinct function item to
+    /// the same `fn(&mut TaskBuilder)` pointer type and collapse their
+    /// identities (see [`AnyOrder`]).
+    ///
+    /// ```
+    /// # use bevy_bhtn::tasks::TaskBuilder;
+    /// # #[derive(bevy_ecs::prelude::Component, Clone, Default)]
+    /// # struct Gold(i32);
+    /// fn root(task: &mut TaskBuilder) {
+    ///     // The three gathers may run in any order; the search backtracks
+    ///     // over linearizations if one order fails.
+    ///     task.branch().any_order((gather_wood, gather_food, gather_stone));
+    /// }
+    /// # fn gather_wood(task: &mut TaskBuilder) { task.effect(|g: &mut Gold| g.0 += 1); }
+    /// # fn gather_food(task: &mut TaskBuilder) { task.effect(|g: &mut Gold| g.0 += 1); }
+    /// # fn gather_stone(task: &mut TaskBuilder) { task.effect(|g: &mut Gold| g.0 += 1); }
+    /// ```
+    pub fn any_order<T: AnyOrder>(&mut self, tasks: T) -> &mut Self {
+        tasks.any_order(self);
+        self
+    }
 }
+
+/// A handle to one member of a branch's subtask set, returned by
+/// [`MethodBuilder::subtask`] and consumed by [`MethodBuilder::before`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubtaskHandle {
+    pub(crate) pos: u32,
+}
+
+/// Task-function groups accepted by [`MethodBuilder::any_order`].
+///
+/// Implemented for tuples of up to 8 task functions. Tuples (rather than
+/// arrays or iterators) are required for identity: an array `[a, b, c]` of
+/// distinct task functions coerces every element to the single fn-pointer
+/// type `fn(&mut TaskBuilder)`, so all members would share one `TypeId` and
+/// collapse into the same task. A tuple keeps each function item's own
+/// zero-sized type — the crate's core identity mechanism.
+pub trait AnyOrder {
+    /// Record every member as an unordered subtask of the branch.
+    fn any_order(self, b: &mut MethodBuilder<'_>);
+}
+
+macro_rules! impl_any_order {
+    ($($name:ident),*) => {
+        #[allow(non_snake_case, unused_variables)]
+        impl<$($name: TaskFn),*> AnyOrder for ($($name,)*) {
+            fn any_order(self, b: &mut MethodBuilder<'_>) {
+                let ($($name,)*) = self;
+                $(
+                    b.subtask($name);
+                )*
+            }
+        }
+    };
+}
+
+impl_any_order!();
+impl_any_order!(A);
+impl_any_order!(A, B);
+impl_any_order!(A, B, C);
+impl_any_order!(A, B, C, D);
+impl_any_order!(A, B, C, D, E);
+impl_any_order!(A, B, C, D, E, F2);
+impl_any_order!(A, B, C, D, E, F2, G);
+impl_any_order!(A, B, C, D, E, F2, G, H);
 
 /// Configure a goal task (a set of desired effects for back-planning).
 pub struct GoalBuilder<'a> {
@@ -644,8 +748,11 @@ pub struct Method {
     /// Conditions that must all hold for this method to be chosen.
     pub preconditions: Vec<Precondition>,
     /// Subtask indices into [`HtnDomain::tasks`](crate::domain::HtnDomain),
-    /// in execution order.
+    /// in declaration order (the member set; see [`Self::order`]).
     pub subtasks: Vec<u32>,
+    /// How the members are ordered: a total `then` chain (the default) or a
+    /// partially-ordered set scheduled by the search.
+    pub order: SubtaskOrder,
     /// Fields that *some* refinement of this method's subtasks may write
     /// (bake-time over-approximation; computed with the summaries).
     pub(crate) possible_writes: FieldSet,

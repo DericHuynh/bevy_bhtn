@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use ustr::Ustr;
 
 use crate::error::{HtnError, HtnResult};
+use crate::order::{topo_order_count, SubtaskOrder, LINEARIZATION_CAP};
 use crate::selection::SelectionPolicy;
 use crate::state::ComponentRegistry;
 use crate::summaries::{compute_summaries, TaskSummary};
@@ -216,28 +217,37 @@ impl DomainBuilder {
                             "compound task `{name}` has no branches — it can never decompose"
                         )));
                     }
-                    Task::Compound(CompoundTask {
-                        name,
-                        type_id: tid,
-                        policy,
-                        methods: methods
-                            .into_iter()
-                            .map(|m| Method {
+                    // Bake each method's subtask order: a pure `then` chain
+                    // stays total; branches that used `subtask`/`before`
+                    // build their constraint DAG (validated acyclic) and
+                    // precompute the linearization count + first order.
+                    let baked_methods: HtnResult<Vec<Method>> = methods
+                        .into_iter()
+                        .map(|m| {
+                            let order = bake_subtask_order(&m, name)?;
+                            Ok(Method {
                                 name: m.name,
                                 utility: m.utility,
                                 preconditions: m.preconditions,
                                 subtasks: m
                                     .subtasks
                                     .iter()
-                                    .map(|(tid, _)| {
+                                    .map(|(tid, _, _)| {
                                         *self.rec.index_of.get(tid).expect("queued task recorded")
                                             as u32
                                     })
                                     .collect(),
+                                order,
                                 possible_writes: Default::default(),
                                 min_cost: 0.0,
                             })
-                            .collect(),
+                        })
+                        .collect();
+                    Task::Compound(CompoundTask {
+                        name,
+                        type_id: tid,
+                        policy,
+                        methods: baked_methods?,
                     })
                 }
                 TaskProto::Primitive {
@@ -286,4 +296,68 @@ impl DomainBuilder {
         compute_summaries(&mut domain);
         Ok(domain)
     }
+}
+
+/// Bake one method's [`SubtaskOrder`] from its recorded members: a pure
+/// `then` chain stays total; a branch that used `subtask`/`before` builds
+/// the per-member predecessor bitmask, validates the DAG (acyclic, ≤ 64
+/// members), and precomputes the (capped) linearization count and the first
+/// topological order. Single-order sets normalize back to [`SubtaskOrder::Total`].
+fn bake_subtask_order(m: &crate::tasks::MethodProto, task_name: &str) -> HtnResult<SubtaskOrder> {
+    if !m.unordered && m.edges.is_empty() {
+        return Ok(SubtaskOrder::Total);
+    }
+    let n = m.subtasks.len();
+    if n > 64 {
+        return Err(HtnError::builder(format!(
+            "compound task `{task_name}` has a partially-ordered branch with {n} members — the limit is 64"
+        )));
+    }
+    let mut preds = smallvec::SmallVec::<[u64; 4]>::from_elem(0, n);
+    // `then` members run after every prior member; `subtask` members after
+    // every prior `then` member (unordered relative to other subtask
+    // members).
+    for (p, &(_, _, is_then)) in m.subtasks.iter().enumerate() {
+        if is_then {
+            for q in 0..p {
+                preds[p] |= 1 << q;
+            }
+        }
+    }
+    for (p, &(_, _, is_then)) in m.subtasks.iter().enumerate() {
+        if !is_then {
+            for (q, &(_, _, then_q)) in m.subtasks.iter().enumerate().take(p) {
+                if then_q {
+                    preds[p] |= 1 << q;
+                }
+            }
+        }
+    }
+    for &(a, b) in &m.edges {
+        debug_assert!(a < n as u32 && b < n as u32, "handle out of range");
+        preds[b as usize] |= 1 << a;
+    }
+    let orders = topo_order_count(&preds, LINEARIZATION_CAP);
+    if orders == 0 {
+        return Err(HtnError::builder(format!(
+            "compound task `{task_name}` has a branch whose `before` constraints form a cycle"
+        )));
+    }
+    let first: smallvec::SmallVec<[u8; 4]> = crate::order::linearize(&preds, 0)
+        .expect("acyclic, so order 0 exists")
+        .into_iter()
+        .collect();
+    let is_declaration = first.iter().enumerate().all(|(p, &q)| p == q as usize);
+    if orders == 1 && is_declaration {
+        // Fully constrained AND the single order is the declaration order:
+        // schedule it on the total-order fast path. (A single order that
+        // differs from the declaration order stays partial — `Total` would
+        // push the wrong sequence.)
+        return Ok(SubtaskOrder::Total);
+    }
+    Ok(SubtaskOrder::Partial {
+        preds,
+        orders: orders as u32,
+        first,
+    })
 }

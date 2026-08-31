@@ -37,6 +37,7 @@
 //! tasks.
 
 use crate::domain::HtnDomain;
+use crate::order::SubtaskOrder;
 
 use crate::tasks::Task;
 
@@ -499,18 +500,37 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
                     // R_seq(m): does every refinement via this method first
                     // touch f with a read?
                     let mut seq = m.preconditions.iter().any(|c| c.reads().contains(&fi));
-                    for &sub in &m.subtasks {
-                        let j = sub_index(m, sub);
-                        if r[j] {
-                            seq = true;
-                            break;
+                    if !seq {
+                        match &m.order {
+                            SubtaskOrder::Total => {
+                                for &sub in &m.subtasks {
+                                    let j = sub_index(m, sub);
+                                    if r[j] {
+                                        seq = true;
+                                        break;
+                                    }
+                                    if !evan[j] {
+                                        // First relevant subtask doesn't start
+                                        // with a read: the touch is a write.
+                                        break;
+                                    }
+                                    // Vanishing: the first touch may come later.
+                                }
+                            }
+                            SubtaskOrder::Partial { .. } => {
+                                // Set semantics, conservative under-
+                                // approximation: f is required iff some member
+                                // starts with a read of f and **no** member can
+                                // write f — then every linearization first
+                                // touches f with that read. If any member can
+                                // write f, some linearization touches f with a
+                                // write first, so f is not required.
+                                seq = m.subtasks.iter().any(|&sub| r[sub_index(m, sub)])
+                                    && m.subtasks
+                                        .iter()
+                                        .all(|&sub| !pw[sub_index(m, sub)].contains(fi));
+                            }
                         }
-                        if !evan[j] {
-                            // First relevant subtask doesn't start with a
-                            // read: the touch is a write.
-                            break;
-                        }
-                        // Vanishing: the first touch may come later.
                     }
                     if !seq {
                         v = false;
@@ -552,16 +572,19 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         };
         for m in &c.methods {
             let last = m.subtasks.len().saturating_sub(1);
+            // In a partially-ordered set every member can have material
+            // before or after it, regardless of its declaration position.
+            let set_semantics = m.order.is_partial();
             for (p, &sub) in m.subtasks.iter().enumerate() {
                 let j = sub_index(m, sub);
                 if matches!(domain.tasks[j], Task::Compound(_)) {
                     if !adj[i].contains(&j) {
                         adj[i].push(j);
                     }
-                    if p != last {
+                    if set_semantics || p != last {
                         nl_pred[j][i] = true;
                     }
-                    if p != 0 {
+                    if set_semantics || p != 0 {
                         nf_pred[j][i] = true;
                     }
                 }

@@ -60,6 +60,14 @@ pub(crate) enum Lookahead {
 /// cleared and reused across sweeps to keep the per-commitment cost
 /// allocation-light. `budget` is the planner's remaining step allowance:
 /// sequences whose minimum yield cannot fit it are refuted outright.
+///
+/// `set_semantics` marks the sequence as a **partially-ordered member set**
+/// (each member runs exactly once, in a search-chosen order): every member's
+/// possible writes are optimistic-unknown before any check, and no effects
+/// are applied sequentially. Pruning weakens but stays sound — a dead-end
+/// verdict means every member fails in every linearization, and a pin means
+/// every other method fails in every linearization.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep(
     domain: &HtnDomain,
     state: &PlanState,
@@ -69,6 +77,7 @@ pub(crate) fn sweep(
     unknown: &mut FieldSet,
     pins: &mut Vec<(usize, usize)>,
     surviving_buf: &mut Vec<usize>,
+    set_semantics: bool,
 ) -> Lookahead {
     // The sweep is only sound when the inferred summaries are present (they
     // define what "possibly written" and "terminating" mean).
@@ -78,6 +87,15 @@ pub(crate) fn sweep(
 
     unknown.clear();
     pins.clear();
+    // Set semantics: the members run in a search-chosen order, so every
+    // member's possible writes are optimistic-unknown before any check, and
+    // no member's effects are applied sequentially (the private state clone
+    // is never needed).
+    if set_semantics {
+        for &idx in sequence {
+            unknown.union_with(&domain.summaries[idx].possible_writes);
+        }
+    }
     // The private state clone is only needed once a primitive's effects must
     // be applied; compound-only prefixes evaluate against the caller's state.
     // The scratch is owned by the planner and reused across sweeps
@@ -107,7 +125,8 @@ pub(crate) fn sweep(
                         return Lookahead::DeadEnd;
                     }
                 }
-                if seq_position + 1 < sequence.len()
+                if !set_semantics
+                    && seq_position + 1 < sequence.len()
                     && (!p.effects.is_empty() || !p.expected_effects.is_empty())
                 {
                     // Only apply effects when a later task could observe them;

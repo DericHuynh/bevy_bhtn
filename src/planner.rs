@@ -34,6 +34,7 @@ use crate::selection::{DecompositionTrace, SelectionPolicy, TraceOutcome};
 
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
+use crate::order::{linearize, SubtaskOrder};
 use crate::state::PlanState;
 use crate::tasks::Task;
 
@@ -115,6 +116,23 @@ impl Plan {
     }
 }
 
+/// One entry of the search's task queue: a task occurrence (with its
+/// optional look-ahead pin) or a pending linearization retry of a
+/// partially-ordered method.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    Task(usize, Option<u32>),
+    /// Re-commit the partial-order method `method` of compound `task` with
+    /// its `lin`-th topological order (0-indexed). Queued by `backtrack` when
+    /// a partial method's subtree failed but linearizations remain; popped
+    /// immediately (it never coexists with deeper commitments).
+    Linearize {
+        task: u32,
+        method: u32,
+        lin: u32,
+    },
+}
+
 /// Rollback journal for the search: snapshotted slot bytes plus the
 /// `(slot, size)` ops that produced them, both append-only. Restoring pops
 /// both stacks in lockstep — a bit-identical move of each old value back into
@@ -187,7 +205,7 @@ struct DecompositionFrame {
     /// would lose siblings already popped after a failed later subtask (or
     /// leave stale ones from the abandoned choice). Inline for the common
     /// 2–5-subtask case (allocation-free commitments).
-    stack: SmallVec<[(usize, Option<u32>); 4]>,
+    stack: SmallVec<[Step; 4]>,
     /// `rollback.ops.len()` before this decomposition's subtasks ran.
     /// Restoring the scratchpad rewinds the journal down to this length.
     rollback_len: usize,
@@ -202,6 +220,12 @@ struct DecompositionFrame {
     /// mirrors the `plan` truncation: every primitive pushed after the
     /// commitment is removed, so `g` returns to its commitment value.
     g_commit: f32,
+    /// The next linearization to try when this partial-order method's subtree
+    /// fails (1-based; 0 for total-order methods, which have no retries).
+    /// `lin_total` is the method's baked (capped) topological-order count; a
+    /// retry is queued only while `lin < lin_total`.
+    lin: u32,
+    lin_total: u32,
 }
 
 /// A forward planner over a baked [`HtnDomain`].
@@ -320,7 +344,7 @@ impl<'a> HtnPlanner<'a> {
     ) -> Plan {
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
-        let mut stack: VecDeque<(usize, Option<u32>)> = VecDeque::with_capacity(16);
+        let mut stack: VecDeque<Step> = VecDeque::with_capacity(16);
         let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
         let mut plan: Vec<usize> = Vec::with_capacity(8);
@@ -367,10 +391,10 @@ impl<'a> HtnPlanner<'a> {
                 mtr: Mtr(Vec::new()),
             };
         };
-        stack.push_back((root_idx, None));
+        stack.push_back(Step::Task(root_idx, None));
 
         'search: loop {
-            let Some((current, occurrence_pin)) = stack.pop_front() else {
+            let Some(step) = stack.pop_front() else {
                 // The task queue drained: the current partial plan is
                 // *complete*. Under branch-and-bound, record it when it
                 // strictly beats the best so far and keep searching; the
@@ -404,6 +428,72 @@ impl<'a> HtnPlanner<'a> {
                     None => materialize(tasks, &plan, mtr.clone()),
                 };
             }
+
+            // A pending linearization retry: re-commit the same partial-order
+            // method with its next topological order. The frame covering this
+            // attempt was pushed by the backtrack that queued this entry, and
+            // the queue/state were restored to commitment time — so this is
+            // exactly the original commitment, with a different member order.
+            let (current, occurrence_pin) = match step {
+                Step::Task(current, pin) => (current, pin),
+                Step::Linearize { task, method, lin } => {
+                    let compound = match &tasks[task as usize] {
+                        Task::Compound(c) => c,
+                        // Defensive: only compound commitments queue retries.
+                        _ => break 'search,
+                    };
+                    let m = &compound.methods[method as usize];
+                    let SubtaskOrder::Partial { preds, .. } = &m.order else {
+                        // Defensive: total methods never queue retries.
+                        break 'search;
+                    };
+                    let Some(order) = linearize(preds, lin as usize) else {
+                        // Unreachable when the baked order count is consistent
+                        // with the enumeration; recover through the normal
+                        // backtrack path (which exhausts cleanly).
+                        if !backtrack(
+                            &mut decomp_stack,
+                            &mut plan,
+                            &mut mtr,
+                            &mut stack,
+                            &mut rollback,
+                            &mut skip,
+                            &mut rank_order,
+                            &mut rank_pos,
+                            &mut g,
+                            &mut state,
+                            tasks,
+                            &mut trace,
+                        ) {
+                            break 'search;
+                        }
+                        continue 'search;
+                    };
+                    // Re-commit: the method's MTR entry was removed by the
+                    // backtrack, so re-record it.
+                    mtr.push(method as usize);
+                    if let Some(t) = trace.as_deref_mut() {
+                        t.push(DecompositionTrace {
+                            compound: task,
+                            branch: method,
+                            branch_name: m.name,
+                            outcome: TraceOutcome::Selected,
+                        });
+                    }
+                    // Push the linearized member sequence, without occurrence
+                    // pins — the sweep's pins were derived for the first
+                    // order; retries run unpinned (an optimization, never a
+                    // soundness requirement).
+                    for &pos in order.iter().rev() {
+                        let sub_idx = m.subtasks[pos as usize] as usize;
+                        stack.push_front(Step::Task(sub_idx, None));
+                    }
+                    skip = 0;
+                    rank_order.clear();
+                    rank_pos = 0;
+                    continue 'search;
+                }
+            };
 
             let task = &tasks[current];
 
@@ -513,7 +603,11 @@ impl<'a> HtnPlanner<'a> {
                         // subtasks — they execute immediately after this
                         // commitment, against the exact current state. (The
                         // sweep skips the last task's effects, so single-
-                        // subtask methods never clone the state.)
+                        // subtask methods never clone the state.) Partially-
+                        // ordered methods sweep their member SET: every
+                        // member's writes are optimistic-unknown and no
+                        // effects are applied, since the execution order is
+                        // chosen by the search.
                         let verdict = if self.lookahead {
                             seq_buf.clear();
                             seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
@@ -526,6 +620,7 @@ impl<'a> HtnPlanner<'a> {
                                 &mut sweep_unknown,
                                 &mut sweep_pins,
                                 &mut sweep_surviving,
+                                method.order.is_partial(),
                             )
                         } else {
                             Lookahead::Refine(Vec::new())
@@ -572,18 +667,40 @@ impl<'a> HtnPlanner<'a> {
                                     // deterministically on revisit).
                                     rank_resume: rank_pos + 1,
                                     g_commit: g,
+                                    // Partially-ordered methods retry their
+                                    // next topological order (starting at 1;
+                                    // order 0 is pushed below) before other
+                                    // methods are offered.
+                                    lin: if method.order.is_partial() { 1 } else { 0 },
+                                    lin_total: match &method.order {
+                                        SubtaskOrder::Partial { orders, .. } => *orders,
+                                        SubtaskOrder::Total => 0,
+                                    },
                                 };
                                 decomp_stack.push(frame);
                                 // Push subtask occurrences in reverse so the
                                 // first pops first, attaching each one's
                                 // inevitable-refinement pin (if the sweep
-                                // proved its other methods infeasible).
-                                for (pos, sub_idx) in resolved_buf.iter().rev() {
+                                // proved its other methods infeasible). Total-
+                                // order methods run in declaration order;
+                                // partially-ordered ones run in the baked
+                                // first topological order (the declaration
+                                // order whenever it is topological). Pins are
+                                // keyed by member position, which both orders
+                                // share.
+                                let push_order: SmallVec<[usize; 4]> = match &method.order {
+                                    SubtaskOrder::Total => (0..method.subtasks.len()).collect(),
+                                    SubtaskOrder::Partial { first, .. } => {
+                                        first.iter().map(|&p| p as usize).collect()
+                                    }
+                                };
+                                for &pos in push_order.iter().rev() {
+                                    let sub_idx = method.subtasks[pos] as usize;
                                     let sub_pin = pins_found
                                         .iter()
-                                        .find(|(p, _)| p == pos)
+                                        .find(|(p, _)| *p == pos)
                                         .map(|&(_, m)| m as u32);
-                                    stack.push_front((*sub_idx, sub_pin));
+                                    stack.push_front(Step::Task(sub_idx, sub_pin));
                                 }
                                 skip = 0;
                                 rank_order.clear();
@@ -691,7 +808,7 @@ fn backtrack(
     decomp_stack: &mut Vec<DecompositionFrame>,
     plan: &mut Vec<usize>,
     mtr: &mut Vec<usize>,
-    stack: &mut VecDeque<(usize, Option<u32>)>,
+    stack: &mut VecDeque<Step>,
     rollback: &mut Rollback,
     skip: &mut usize,
     rank_order: &mut SmallVec<[u32; 4]>,
@@ -717,6 +834,43 @@ fn backtrack(
                 // occurrence pins) comes back.
                 stack.clear();
                 stack.extend(frame.stack.iter().copied());
+                // Partially-ordered method with pending linearizations: retry
+                // the SAME method with its next topological order before other
+                // methods are offered. The state/plan/mtr/queue above were
+                // restored to commitment time, so the retry starts exactly
+                // where the original commitment did. (A pinned task's other
+                // methods are still infeasible — only its linearizations are
+                // retried.)
+                if frame.lin > 0 && frame.lin < frame.lin_total {
+                    if let Some(t) = trace.as_deref_mut() {
+                        let branch = frame.skip_next.saturating_sub(1);
+                        let name = match &tasks[frame.task] {
+                            Task::Compound(c) => c.methods.get(branch).and_then(|m| m.name),
+                            _ => None,
+                        };
+                        t.push(DecompositionTrace {
+                            compound: frame.task as u32,
+                            branch: branch as u32,
+                            branch_name: name,
+                            outcome: TraceOutcome::Backtracked,
+                        });
+                    }
+                    let lin_task = frame.task as u32;
+                    let lin_method = frame.skip_next.saturating_sub(1) as u32;
+                    let lin_try = frame.lin;
+                    // The replacement frame covers the next attempt: identical
+                    // restore points, one linearization further.
+                    decomp_stack.push(DecompositionFrame {
+                        lin: lin_try + 1,
+                        ..frame
+                    });
+                    stack.push_front(Step::Linearize {
+                        task: lin_task,
+                        method: lin_method,
+                        lin: lin_try,
+                    });
+                    return true;
+                }
                 if frame.pinned.is_some() {
                     // This task was pinned to a single method and it failed:
                     // all alternatives were proven infeasible at pin time, so
@@ -745,7 +899,7 @@ fn backtrack(
                         outcome: TraceOutcome::Backtracked,
                     });
                 }
-                stack.push_front((frame.task, frame.pinned));
+                stack.push_front(Step::Task(frame.task, frame.pinned));
                 return true;
             }
             None => return false,
