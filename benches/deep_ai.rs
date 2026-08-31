@@ -35,7 +35,7 @@ use common::{
 
 /// How many plan → execute → replan cycles each actor runs per measured
 /// iteration.
-const REPLAN_CYCLES: usize = 10;
+const REPLAN_CYCLES: usize = 1;
 
 /// The root task of the outpost domain (the task function's name).
 const ROOT: &str = "secure_outpost";

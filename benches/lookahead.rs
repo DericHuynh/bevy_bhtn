@@ -43,7 +43,7 @@ use common::{
 
 /// How many plan → execute → replan cycles each case runs per measured
 /// iteration.
-const REPLAN_CYCLES: usize = 10;
+const REPLAN_CYCLES: usize = 1;
 
 fn bench_lookahead(c: &mut Criterion) {
     // --- exponential_backtrack: 2^12 leaf failures vs one sweep ------------

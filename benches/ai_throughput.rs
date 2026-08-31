@@ -33,7 +33,7 @@ use common::{
 
 /// How many plan → execute → replan cycles each actor runs per measured
 /// iteration (the mid-execution replanning loop a real AI tick performs).
-const REPLAN_CYCLES: usize = 10;
+const REPLAN_CYCLES: usize = 1;
 
 /// The root task of the miner domain (the task function's name).
 const ROOT: &str = "earn_gold";

@@ -164,9 +164,57 @@ impl Rollback {
 /// provably identical to restoring a clone because the prefix of an
 /// append-only Vec never changes. `skip_next` alone traces the search branch,
 /// so this stays a fully correct DFS MTR backtrack.
-struct DecompositionFrame {
+/// Storage width for **task indices** in the search's transient structures,
+/// chosen once per [`HtnPlanner::plan`] call from the domain's task count:
+/// `u8` for domains of up to 256 tasks (the overwhelmingly common case),
+/// `u16` up to 65 536, `u32` beyond. The search is monomorphized per width —
+/// no branching in the hot loop — so a typical domain's queue entries shrink
+/// from 24 to 8 bytes and decomposition frames shrink proportionally.
+///
+/// Method indices stay `usize`/`u32` (method counts are tiny and pins carry
+/// them); only task indices narrow.
+trait NarrowIdx: Copy + 'static {
+    /// The exclusive upper bound of representable task counts.
+    const MAX_TASKS: usize;
+
+    fn new(idx: usize) -> Self;
+
+    fn get(self) -> usize;
+}
+
+impl NarrowIdx for u8 {
+    const MAX_TASKS: usize = u8::MAX as usize + 1;
+    fn new(idx: usize) -> Self {
+        u8::try_from(idx).expect("task index within dispatch width")
+    }
+    fn get(self) -> usize {
+        self as usize
+    }
+}
+
+impl NarrowIdx for u16 {
+    const MAX_TASKS: usize = u16::MAX as usize + 1;
+    fn new(idx: usize) -> Self {
+        u16::try_from(idx).expect("task index within dispatch width")
+    }
+    fn get(self) -> usize {
+        self as usize
+    }
+}
+
+impl NarrowIdx for u32 {
+    const MAX_TASKS: usize = u32::MAX as usize;
+    fn new(idx: usize) -> Self {
+        u32::try_from(idx).expect("task index within dispatch width")
+    }
+    fn get(self) -> usize {
+        self as usize
+    }
+}
+
+struct DecompositionFrame<I: NarrowIdx> {
     /// The compound task index being decomposed.
-    task: usize,
+    task: I,
     /// `plan.len()` before this decomposition's subtasks were entered.
     plan_len: usize,
     /// The number of methods to skip (index+1 of the one just tried).
@@ -177,7 +225,7 @@ struct DecompositionFrame {
     /// look-ahead, if any. When a pinned task's method fails, every other
     /// method was already proven infeasible at pin time — so backtracking
     /// skips them entirely.
-    pinned: Option<usize>,
+    pinned: Option<u32>,
     /// The task-queue suffix at commitment time (everything queued behind this
     /// decomposition, each entry carrying its own occurrence pin). The queue
     /// is consumed front-to-back during search, so a backtrack that re-queues
@@ -185,7 +233,7 @@ struct DecompositionFrame {
     /// would lose siblings already popped after a failed later subtask (or
     /// leave stale ones from the abandoned choice). Inline for the common
     /// 2–5-subtask case (allocation-free commitments).
-    stack: SmallVec<[(usize, Option<usize>); 4]>,
+    stack: SmallVec<[(I, Option<u32>); 4]>,
     /// `rollback.ops.len()` before this decomposition's subtasks ran.
     /// Restoring the scratchpad rewinds the journal down to this length.
     rollback_len: usize,
@@ -251,12 +299,27 @@ impl<'a> HtnPlanner<'a> {
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
     pub fn plan(&mut self, root: &str, state: &PlanState) -> Plan {
+        // Dispatch once on the domain's task count: the whole search runs
+        // monomorphized at the narrowest index width that can address every
+        // task, so the hot loop's metadata is as small as the domain allows.
+        let task_count = self.domain.tasks.len();
+        if task_count <= u8::MAX_TASKS {
+            self.plan_search::<u8>(root, state)
+        } else if task_count <= u16::MAX_TASKS {
+            self.plan_search::<u16>(root, state)
+        } else {
+            self.plan_search::<u32>(root, state)
+        }
+    }
+
+    /// The search itself, monomorphized over the task-index width `I`.
+    fn plan_search<I: NarrowIdx>(&mut self, root: &str, state: &PlanState) -> Plan {
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
-        let mut stack: VecDeque<(usize, Option<usize>)> = VecDeque::with_capacity(16);
-        let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
+        let mut stack: VecDeque<(I, Option<u32>)> = VecDeque::with_capacity(16);
+        let mut decomp_stack: Vec<DecompositionFrame<I>> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
-        let mut plan: Vec<usize> = Vec::with_capacity(8);
+        let mut plan: Vec<I> = Vec::with_capacity(8);
         // Reusable look-ahead scratch: the sweep's "unknown components" overlay
         // and its inevitable-refinement output, cleared per sweep.
         let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.components.len());
@@ -286,7 +349,7 @@ impl<'a> HtnPlanner<'a> {
                 mtr: Mtr(Vec::new()),
             };
         };
-        stack.push_back((root_idx, None));
+        stack.push_back((I::new(root_idx), None));
 
         'search: while let Some((current, occurrence_pin)) = stack.pop_front() {
             count += 1;
@@ -294,7 +357,7 @@ impl<'a> HtnPlanner<'a> {
                 return materialize(tasks, &plan, mtr);
             }
 
-            let task = &tasks[current];
+            let task = &tasks[current.get()];
 
             match task {
                 Task::Compound(compound) => {
@@ -304,11 +367,11 @@ impl<'a> HtnPlanner<'a> {
                     let pin = occurrence_pin;
                     loop {
                         let eligible = match pin {
-                            Some(pm) if pm >= skip => compound
+                            Some(pm) if pm as usize >= skip => compound
                                 .methods
-                                .get(pm)
+                                .get(pm as usize)
                                 .filter(|m| m.preconditions.iter().all(|c| c.evaluate(&state)))
-                                .map(|m| (m, pm)),
+                                .map(|m| (m, pm as usize)),
                             // The pinned method was already tried and failed;
                             // every other method was proven infeasible at pin
                             // time, so this task is exhausted.
@@ -387,9 +450,11 @@ impl<'a> HtnPlanner<'a> {
                                 // inevitable-refinement pin (if the sweep
                                 // proved its other methods infeasible).
                                 for (pos, sub_idx) in resolved_buf.iter().rev() {
-                                    let sub_pin =
-                                        pins_found.iter().find(|(p, _)| p == pos).map(|&(_, m)| m);
-                                    stack.push_front((*sub_idx, sub_pin));
+                                    let sub_pin = pins_found
+                                        .iter()
+                                        .find(|(p, _)| p == pos)
+                                        .map(|&(_, m)| m as u32);
+                                    stack.push_front((I::new(*sub_idx), sub_pin));
                                 }
                                 skip = 0;
                                 continue 'search;
@@ -443,11 +508,11 @@ impl<'a> HtnPlanner<'a> {
 /// by truncation, the scratchpad by rollback, and re-queues the frame's task
 /// for its next method choice. Returns `false` when the search is exhausted.
 #[allow(clippy::too_many_arguments)]
-fn backtrack(
-    decomp_stack: &mut Vec<DecompositionFrame>,
-    plan: &mut Vec<usize>,
+fn backtrack<I: NarrowIdx>(
+    decomp_stack: &mut Vec<DecompositionFrame<I>>,
+    plan: &mut Vec<I>,
     mtr: &mut Vec<usize>,
-    stack: &mut VecDeque<(usize, Option<usize>)>,
+    stack: &mut VecDeque<(I, Option<u32>)>,
     rollback: &mut Rollback,
     skip: &mut usize,
     state: &mut PlanState,
@@ -480,12 +545,12 @@ fn backtrack(
     }
 }
 
-/// Convert a plan of task indices into the compiled step program: contiguous
-/// `u32` task indices plus the parallel interned-name list.
-fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>) -> Plan {
+/// Convert a plan of (narrow) task indices into the compiled step program:
+/// contiguous `u32` task indices plus the parallel interned-name list.
+fn materialize<I: NarrowIdx>(tasks: &[Task], plan: &[I], mtr: Vec<usize>) -> Plan {
     Plan {
-        steps: plan.iter().map(|&i| i as u32).collect(),
-        names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
+        steps: plan.iter().map(|&i| i.get() as u32).collect(),
+        names: plan.iter().map(|&i| tasks[i.get()].name().into()).collect(),
         mtr: Mtr(mtr),
     }
 }
