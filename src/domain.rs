@@ -235,6 +235,7 @@ impl DomainBuilder {
                                     })
                                     .collect(),
                                 possible_writes: Default::default(),
+                                min_cost: 0.0,
                             })
                             .collect(),
                     })
@@ -245,6 +246,7 @@ impl DomainBuilder {
                     expected_effects,
                     action,
                     cost,
+                    static_cost,
                 } => Task::Primitive(PrimitiveTask {
                     name,
                     type_id: tid,
@@ -253,6 +255,7 @@ impl DomainBuilder {
                     expected_effects,
                     action,
                     cost,
+                    static_cost,
                 }),
             });
         }

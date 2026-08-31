@@ -78,7 +78,6 @@ pub trait BranchRanker: Send + Sync {
     /// Appends the candidate indices to `out` in preferred order. Scratch-
     /// buffer signature: no per-node allocation inside the planner.
     fn rank(&self, candidates: &[BranchCandidate<'_>], state: &PlanState, out: &mut Vec<u32>);
-
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +96,18 @@ pub enum HtnSearchStrategy {
     /// the partial plan immediately (no backtracking). Cheaper per tick,
     /// less complete — for tight per-frame budgets.
     DepthFirstFailFast,
+
+    /// Depth-first with branch-and-bound on accumulated primitive cost:
+    /// keeps the cheapest *complete* plan found within the sanity budget and
+    /// prunes any branch whose accumulated cost plus the bake-time
+    /// `min_cost` lower bound of its remaining sequence cannot strictly beat
+    /// the best plan found so far. Requires `cost`/`cost_fn` annotations
+    /// (unannotated primitives count 0, so with none declared this behaves
+    /// exactly like [`DepthFirst`](HtnSearchStrategy::DepthFirst)). Anytime
+    /// and deterministic: the first complete plan found is returned if the
+    /// budget runs out, and the cost-optimal plan when the budget suffices
+    /// to exhaust the space.
+    CostBounded,
 
     /// Caller-supplied strategy. The strategy object owns any persistent
     /// state (MCTS statistics, ACO pheromone tables, seeded RNGs) — wrap it

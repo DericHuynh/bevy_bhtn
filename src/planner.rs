@@ -197,6 +197,11 @@ struct DecompositionFrame {
     /// `plan.len()`), so backtracking resumes down the same ranked list
     /// without storing it.
     rank_resume: usize,
+    /// The accumulated primitive cost when this decomposition committed
+    /// (cost-bounded search only; 0 otherwise). Restoring it on backtrack
+    /// mirrors the `plan` truncation: every primitive pushed after the
+    /// commitment is removed, so `g` returns to its commitment value.
+    g_commit: f32,
 }
 
 /// A forward planner over a baked [`HtnDomain`].
@@ -215,6 +220,8 @@ pub struct HtnPlanner<'a> {
     /// Fail-fast mode: abandon the branch on first downstream failure and
     /// return the partial plan immediately (no backtracking).
     fail_fast: bool,
+    /// Cost-bounded branch-and-bound mode (see [`Self::set_cost_bounded`]).
+    cost_bounded: bool,
 }
 
 impl<'a> HtnPlanner<'a> {
@@ -225,6 +232,7 @@ impl<'a> HtnPlanner<'a> {
             lookahead: true,
             sanity_limit: 100,
             fail_fast: false,
+            cost_bounded: false,
         }
     }
 
@@ -257,6 +265,19 @@ impl<'a> HtnPlanner<'a> {
     /// strategy.
     pub fn set_fail_fast(&mut self, enabled: bool) -> &mut Self {
         self.fail_fast = enabled;
+        self
+    }
+
+    /// Enable cost-bounded branch-and-bound: keep the cheapest *complete*
+    /// plan found within the sanity budget and prune any branch whose
+    /// accumulated primitive cost plus the bake-time `min_cost` lower bound
+    /// of its remaining sequence cannot strictly beat it. Used by the
+    /// [`CostBounded`](crate::selection::HtnSearchStrategy::CostBounded)
+    /// strategy. Primitives without a `cost`/`cost_fn` annotation count 0,
+    /// so with no annotations at all this behaves exactly like plain
+    /// [`DepthFirst`](crate::selection::HtnSearchStrategy::DepthFirst).
+    pub fn set_cost_bounded(&mut self, enabled: bool) -> &mut Self {
+        self.cost_bounded = enabled;
         self
     }
 
@@ -320,6 +341,13 @@ impl<'a> HtnPlanner<'a> {
         // copy, reused across sweeps (`copy_from`, no re-allocation).
         let mut sweep_owned: Option<PlanState> = None;
         let mut skip = 0;
+        // Cost-bounded branch-and-bound state: the accumulated cost of the
+        // committed primitives (`g`), and the best complete plan found so far
+        // with its cost. Both stay inert unless `cost_bounded` is set.
+        let cost_bounded = self.cost_bounded;
+        let mut g = 0.0f32;
+        let mut best: Option<Plan> = None;
+        let mut best_cost = f32::INFINITY;
         // Per-choice-point ranked branch order + resume position. The order
         // is computed once per node visit (precondition validity is constant
         // there) and snapshotted into the frame on commit, so backtracking
@@ -341,10 +369,40 @@ impl<'a> HtnPlanner<'a> {
         };
         stack.push_back((root_idx, None));
 
-        'search: while let Some((current, occurrence_pin)) = stack.pop_front() {
+        'search: loop {
+            let Some((current, occurrence_pin)) = stack.pop_front() else {
+                // The task queue drained: the current partial plan is
+                // *complete*. Under branch-and-bound, record it when it
+                // strictly beats the best so far and keep searching; the
+                // first complete plan is the answer otherwise.
+                if cost_bounded && g < best_cost {
+                    best = Some(materialize(tasks, &plan, mtr.clone()));
+                    best_cost = g;
+                    if backtrack(
+                        &mut decomp_stack,
+                        &mut plan,
+                        &mut mtr,
+                        &mut stack,
+                        &mut rollback,
+                        &mut skip,
+                        &mut rank_order,
+                        &mut rank_pos,
+                        &mut g,
+                        &mut state,
+                        tasks,
+                        &mut trace,
+                    ) {
+                        continue 'search;
+                    }
+                }
+                break 'search;
+            };
             count += 1;
             if count > sanity_limit {
-                return materialize(tasks, &plan, mtr);
+                return match best {
+                    Some(b) => b,
+                    None => materialize(tasks, &plan, mtr.clone()),
+                };
             }
 
             let task = &tasks[current];
@@ -419,6 +477,7 @@ impl<'a> HtnPlanner<'a> {
                                 &mut skip,
                                 &mut rank_order,
                                 &mut rank_pos,
+                                &mut g,
                                 &mut state,
                                 tasks,
                                 &mut trace,
@@ -427,6 +486,21 @@ impl<'a> HtnPlanner<'a> {
                             }
                             continue 'search;
                         };
+
+                        // Branch-and-bound: a commitment whose cost lower
+                        // bound (accumulated cost + the method's bake-time
+                        // sequence minimum) cannot strictly beat the best
+                        // complete plan is pruned without recursing.
+                        if cost_bounded && best.is_some() && g + method.min_cost >= best_cost {
+                            if pin.is_some()
+                                || matches!(compound.policy, SelectionPolicy::FirstMatch)
+                            {
+                                skip = idx + 1;
+                            } else {
+                                rank_pos += 1;
+                            }
+                            continue;
+                        }
 
                         // Resolve this method's subtasks to (position, index)
                         // — needed to push the queue regardless of the sweep.
@@ -470,6 +544,12 @@ impl<'a> HtnPlanner<'a> {
                                 continue;
                             }
                             Lookahead::Refine(pins_found) => {
+                                // Snapshot *before* the push: on backtrack the
+                                // truncate must remove THIS method's entry, so
+                                // the node's retry replaces it instead of
+                                // appending (a stale entry would corrupt the
+                                // MTR of every plan found after a backtrack).
+                                let mtr_len = mtr.len();
                                 mtr.push(idx);
                                 if let Some(t) = trace.as_deref_mut() {
                                     t.push(DecompositionTrace {
@@ -483,10 +563,7 @@ impl<'a> HtnPlanner<'a> {
                                     task: current,
                                     plan_len: plan.len(),
                                     skip_next: idx + 1,
-                                    // Snapshot *after* the push so restoring
-                                    // truncates back to a world that includes
-                                    // this method choice.
-                                    mtr_len: mtr.len(),
+                                    mtr_len,
                                     pinned: pin,
                                     stack: stack.iter().copied().collect(),
                                     rollback_len: rollback.len(),
@@ -494,6 +571,7 @@ impl<'a> HtnPlanner<'a> {
                                     // order (the order is re-derived
                                     // deterministically on revisit).
                                     rank_resume: rank_pos + 1,
+                                    g_commit: g,
                                 };
                                 decomp_stack.push(frame);
                                 // Push subtask occurrences in reverse so the
@@ -517,7 +595,44 @@ impl<'a> HtnPlanner<'a> {
                 }
                 Task::Primitive(primitive) => {
                     if primitive.preconditions_met(&state) {
+                        // Branch-and-bound: evaluate the step cost and prune
+                        // the step when no completion through it can strictly
+                        // beat the best complete plan (every remaining step
+                        // costs ≥ 0).
+                        let step_cost = if cost_bounded {
+                            primitive
+                                .cost
+                                .as_ref()
+                                .map(|f| f(&state))
+                                .unwrap_or(0.0)
+                                .max(0.0)
+                        } else {
+                            0.0
+                        };
+                        if cost_bounded && best.is_some() && g + step_cost >= best_cost {
+                            if self.fail_fast {
+                                break 'search;
+                            }
+                            if !backtrack(
+                                &mut decomp_stack,
+                                &mut plan,
+                                &mut mtr,
+                                &mut stack,
+                                &mut rollback,
+                                &mut skip,
+                                &mut rank_order,
+                                &mut rank_pos,
+                                &mut g,
+                                &mut state,
+                                tasks,
+                                &mut trace,
+                            ) {
+                                break 'search;
+                            }
+                            continue;
+                        }
                         plan.push(current);
+                        g += step_cost;
                         // Snapshot every slot the effects write before the
                         // first write, so backtracking can restore them.
                         for e in primitive
@@ -545,6 +660,7 @@ impl<'a> HtnPlanner<'a> {
                         &mut skip,
                         &mut rank_order,
                         &mut rank_pos,
+                        &mut g,
                         &mut state,
                         tasks,
                         &mut trace,
@@ -559,7 +675,10 @@ impl<'a> HtnPlanner<'a> {
             }
         }
 
-        materialize(tasks, &plan, mtr)
+        match best {
+            Some(b) => b,
+            None => materialize(tasks, &plan, mtr),
+        }
     }
 }
 
@@ -577,6 +696,7 @@ fn backtrack(
     skip: &mut usize,
     rank_order: &mut SmallVec<[u32; 4]>,
     rank_pos: &mut usize,
+    g: &mut f32,
     state: &mut PlanState,
     tasks: &[Task],
     trace: &mut Option<&mut Vec<DecompositionTrace>>,
@@ -589,6 +709,9 @@ fn backtrack(
                 // Restore the scratchpad: undo every effect applied since the
                 // frame committed (newest first).
                 rollback.restore_to(frame.rollback_len, state);
+                // Restore the accumulated cost to its commitment value (the
+                // truncated primitives are exactly the ones added since).
+                *g = frame.g_commit;
                 // Restore the queue to its state at commitment time: the
                 // failed subtree's remnants go, the suffix (with its
                 // occurrence pins) comes back.

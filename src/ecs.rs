@@ -173,7 +173,14 @@ pub fn htn_ai_system(world: &mut World) {
                 let state = PlanState::extract(world, entity, &config.domain.components);
                 let (strategy, sanity) = world
                     .get::<SearchOverride>(entity)
-                    .map(|o| (o.strategy.clone().unwrap_or_else(|| config.strategy.clone()), o.sanity_limit))
+                    .map(|o| {
+                        (
+                            o.strategy
+                                .clone()
+                                .unwrap_or_else(|| config.strategy.clone()),
+                            o.sanity_limit,
+                        )
+                    })
                     .unwrap_or_else(|| (config.strategy.clone(), None));
                 let sanity = sanity.unwrap_or(config.sanity_limit);
                 let mut planner = HtnPlanner::new(&config.domain);
@@ -197,15 +204,21 @@ pub fn htn_ai_system(world: &mut World) {
                             planner.plan(&root, &state)
                         }
                     }
-                    HtnSearchStrategy::Custom(searcher) => {
-                        searcher.search(&config.domain, &state).unwrap_or_else(|| {
-                            crate::planner::Plan {
-                                steps: Vec::new(),
-                                names: Vec::new(),
-                                mtr: crate::planner::Mtr(Vec::new()),
-                            }
-                        })
+                    HtnSearchStrategy::CostBounded => {
+                        planner.set_cost_bounded(true);
+                        if config.debug_trace {
+                            planner.plan_traced(&root, &state, &mut trace_buf)
+                        } else {
+                            planner.plan(&root, &state)
+                        }
                     }
+                    HtnSearchStrategy::Custom(searcher) => searcher
+                        .search(&config.domain, &state)
+                        .unwrap_or_else(|| crate::planner::Plan {
+                            steps: Vec::new(),
+                            names: Vec::new(),
+                            mtr: crate::planner::Mtr(Vec::new()),
+                        }),
                 };
                 if !trace_buf.is_empty() {
                     world

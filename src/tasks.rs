@@ -375,6 +375,11 @@ pub(crate) enum TaskProto {
         expected_effects: Vec<Effect>,
         action: Option<Action>,
         cost: Option<ScoreFn>,
+        /// The constant declared via [`TaskBuilder::cost`] (if the final cost
+        /// signal is a constant) — the bake-time lower bound the `min_cost`
+        /// summary infers from. A later [`TaskBuilder::cost_fn`] clears it:
+        /// dynamic costs are opaque at bake time and conservatively count 0.
+        static_cost: Option<f32>,
     },
 }
 
@@ -399,6 +404,7 @@ pub struct TaskBuilder<'a> {
     expected_effects: Vec<Effect>,
     action: Option<Action>,
     cost: Option<ScoreFn>,
+    static_cost: Option<f32>,
     methods: Vec<MethodProto>,
     selection: Option<SelectionPolicy>,
 }
@@ -412,6 +418,7 @@ impl<'a> TaskBuilder<'a> {
             expected_effects: Vec::new(),
             action: None,
             cost: None,
+            static_cost: None,
             methods: Vec::new(),
             selection: None,
         }
@@ -426,17 +433,26 @@ impl<'a> TaskBuilder<'a> {
     }
 
     /// Constant action cost, fed to cost-aware search strategies. Inert
-    /// under [`DepthFirst`](crate::selection::HtnSearchStrategy::DepthFirst).
+    /// under [`DepthFirst`](crate::selection::HtnSearchStrategy::DepthFirst);
+    /// the [`CostBounded`](crate::selection::HtnSearchStrategy::CostBounded)
+    /// strategy uses it both as the step cost and as the bake-time lower
+    /// bound the `min_cost` summary infers. Negative costs are clamped to 0
+    /// (branch-and-bound requires non-negative step costs).
     pub fn cost(&mut self, c: f32) -> &mut Self {
+        self.static_cost = Some(c.max(0.0));
         self.cost = Some(Box::new(move |_| c));
         self
     }
 
-    /// Dynamic cost sampled from the scratchpad at plan time.
+    /// Dynamic cost sampled from the scratchpad at plan time. Clears any
+    /// constant declared by a previous [`TaskBuilder::cost`] (last call wins):
+    /// dynamic costs are opaque at bake time, so the `min_cost` summary
+    /// conservatively lower-bounds this primitive at 0.
     pub fn cost_fn<F>(&mut self, f: F) -> &mut Self
     where
         F: Fn(&PlanState) -> f32 + Send + Sync + 'static,
     {
+        self.static_cost = None;
         self.cost = Some(Box::new(f));
         self
     }
@@ -520,6 +536,7 @@ impl<'a> TaskBuilder<'a> {
                 expected_effects: self.expected_effects,
                 action: self.action,
                 cost: self.cost,
+                static_cost: self.static_cost,
             }
         };
         // The task's own TypeId was registered by the expansion loop before
@@ -632,6 +649,12 @@ pub struct Method {
     /// Fields that *some* refinement of this method's subtasks may write
     /// (bake-time over-approximation; computed with the summaries).
     pub(crate) possible_writes: FieldSet,
+    /// Lower bound on the total primitive cost of executing this method's
+    /// subtask sequence (sum of the subtasks' `min_cost` summaries; bake
+    /// time). The [`CostBounded`](crate::selection::HtnSearchStrategy::CostBounded)
+    /// strategy prunes commitments whose bound cannot beat the best complete
+    /// plan.
+    pub(crate) min_cost: f32,
 }
 
 /// A baked compound task: on decomposition, pick the first method whose
@@ -826,6 +849,10 @@ pub struct PrimitiveTask {
     pub action: Option<Action>,
     /// The declared cost estimate, if any (used by cost-aware strategies).
     pub cost: Option<ScoreFn>,
+    /// The constant declared via `.cost(c)`, if the cost signal is a constant
+    /// — the lower bound the `min_cost` summary infers from (`None` for
+    /// dynamic `cost_fn` costs, which conservatively bound at 0).
+    pub(crate) static_cost: Option<f32>,
 }
 
 impl PrimitiveTask {

@@ -365,6 +365,62 @@ fn fail_fast_returns_partial_plan_on_first_failure() {
     );
 }
 
+/// Regression: the MTR of a plan found *after* a backtrack records only the
+/// chosen method per decomposition level. The frame's `mtr_len` snapshot must
+/// precede its own method push, so the retry replaces the failed entry
+/// instead of appending after it (which yielded `[0, 1]` for a plan that
+/// only chose branch 1).
+#[test]
+fn mtr_after_backtrack_records_only_the_chosen_method() {
+    let domain = fail_fast_domain();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan("root", &state);
+    assert_eq!(plan.task_names(), ["works"]);
+    assert_eq!(
+        plan.mtr().0,
+        [1],
+        "branch 0 was backtracked past; only the chosen branch 1 remains"
+    );
+}
+
+/// Regression (nested case): a backtrack *below* the root must also replace
+/// the failed method's entry at its own level — the root's choice stays at
+/// its level and the retried compound's new choice replaces the failed one,
+/// giving `[0, 1]`, not the stale `[0, 0, 1]`.
+#[test]
+fn mtr_after_nested_backtrack_records_only_chosen_methods() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(mid);
+    }
+    fn mid(task: &mut TaskBuilder) {
+        // Branch 0 commits, then fails downstream (after `prime` applies,
+        // `impossible`'s precondition is false).
+        task.branch().then(prime).then(impossible);
+        task.branch().then(works);
+    }
+    fn prime(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 += 1);
+    }
+    fn impossible(task: &mut TaskBuilder) {
+        task.precondition(|gold: &Gold| gold.0 > 100);
+    }
+    fn works(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 1);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan("root", &state);
+    assert_eq!(plan.task_names(), ["works"]);
+    assert_eq!(
+        plan.mtr().0,
+        [0, 1],
+        "root chose branch 0; mid's failed branch 0 was replaced by branch 1"
+    );
+}
+
 #[derive(Default)]
 struct FixedSearcher;
 

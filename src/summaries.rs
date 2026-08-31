@@ -151,7 +151,7 @@ impl FieldSet {
 /// (SCC/reachability over the decomposition graph, in the spirit of Toad's
 /// self-embedding criterion and Alford's stratification): all of it is
 /// computed once at bake time and read O(1) by the planners.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TaskSummary {
     /// Components every refinement reads before any refinement writes them
     /// (executability-relaxed preconditions; under-approximation).
@@ -168,6 +168,11 @@ pub struct TaskSummary {
     /// (`usize::MAX` when [`Self::terminating`] is false). A lower bound on
     /// the decomposition work any refinement of this task requires.
     pub min_yield: usize,
+    /// Total primitive cost of the cheapest refinement (`f32::INFINITY` when
+    /// [`Self::terminating`] is false). Primitives contribute their declared
+    /// constant cost (`.cost(c)`); dynamic `cost_fn` costs are opaque at bake
+    /// time and conservatively count 0 — so this is a sound lower bound.
+    pub min_cost: f32,
     /// Whether the task can (transitively) decompose into itself.
     pub recursive: bool,
     /// Whether the task can appear at a **non-last** position of its own
@@ -368,6 +373,54 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
     }
 
+    // ---- 5b. Min cost: least fixpoint of min over methods -----------------
+    // The cheapest total primitive cost some refinement produces: a primitive
+    // yields its declared constant cost (dynamic `cost_fn` costs are opaque
+    // at bake time and count 0 — a sound lower bound); a compound takes the
+    // cheapest method's subtask sum. Same fixpoint shape as min yield, over
+    // f32 with `INFINITY` as the non-terminating sentinel (f32 addition
+    // saturates to infinity naturally). Non-terminating tasks are forced to
+    // INFINITY afterwards, mirroring min yield.
+    let mut min_cost: Vec<f32> = vec![f32::INFINITY; n];
+    for (i, task) in domain.tasks.iter().enumerate() {
+        if let Task::Primitive(p) = task {
+            min_cost[i] = p.static_cost.unwrap_or(0.0).max(0.0);
+        } else if matches!(task, Task::Goal(_)) {
+            min_cost[i] = 0.0;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for (i, task) in domain.tasks.iter().enumerate() {
+            let Task::Compound(c) = task else {
+                continue;
+            };
+            let mut best = f32::INFINITY;
+            for m in &c.methods {
+                let mut sum = 0.0f32;
+                for &sub in &m.subtasks {
+                    sum += min_cost[sub_index(m, sub)];
+                    if sum.is_infinite() {
+                        break;
+                    }
+                }
+                best = best.min(sum);
+            }
+            if best < min_cost[i] {
+                min_cost[i] = best;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for i in 0..n {
+        if !term[i] {
+            min_cost[i] = f32::INFINITY;
+        }
+    }
+
     // ---- 6. Required components (executability-relaxed preconditions) -----
     // Per component f, a refinement "first touches" f at its first primitive
     // that reads or writes f (a method-precondition read touches at
@@ -556,10 +609,13 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         if let Task::Compound(c) = task {
             for m in &mut c.methods {
                 let mut set = FieldSet::new(nf);
+                let mut cost = 0.0f32;
                 for &sub in &m.subtasks {
                     set.union_with(&pw[sub as usize]);
+                    cost += min_cost[sub as usize];
                 }
                 m.possible_writes = set;
+                m.min_cost = cost;
             }
         }
     }
@@ -572,6 +628,7 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
             guaranteed_writes: gw[i].clone(),
             terminating: term[i],
             min_yield: min_yield[i],
+            min_cost: min_cost[i],
             recursive: recursive[i],
             self_embedding: self_embedding[i],
             tail_recursive: tail_recursive[i],
