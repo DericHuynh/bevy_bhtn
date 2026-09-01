@@ -402,14 +402,12 @@ impl PlanState {
     /// All indices must hold the caller's component types; every slot must be
     /// initialized.
     pub(crate) fn disjoint_slots<const N: usize>(&mut self, idxs: [usize; N]) -> [*mut u8; N] {
-        for (i, &a) in idxs.iter().enumerate() {
-            for &b in idxs.iter().skip(i + 1) {
-                assert!(
-                    a != b,
-                    "disjoint_slots requires distinct slot indices (slots would alias)"
-                );
-            }
-        }
+        // Build-time `assert_distinct_slots` already rejects duplicate
+        // parameters; this re-check is debug-only defense in depth.
+        debug_assert!(
+            (0..N).all(|i| (i + 1..N).all(|j| idxs[i] != idxs[j])),
+            "disjoint_slots requires distinct slot indices (slots would alias)"
+        );
         let base = self.pool.as_mut_ptr();
         let mut out = [std::ptr::null_mut::<u8>(); N];
         for (out_slot, &idx) in out.iter_mut().zip(idxs.iter()) {

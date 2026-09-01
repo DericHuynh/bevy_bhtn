@@ -257,16 +257,36 @@ impl DomainBuilder {
                     action,
                     cost,
                     static_cost,
-                } => Task::Primitive(PrimitiveTask {
-                    name,
-                    type_id: tid,
-                    preconditions,
-                    effects,
-                    expected_effects,
-                    action,
-                    cost,
-                    static_cost,
-                }),
+                } => {
+                    // Bake the write-slot lists once: the executor's commit
+                    // list (effects + expected) and the back-planner's
+                    // guaranteed list (effects only).
+                    let mut write_slot_list = smallvec::SmallVec::<[usize; 4]>::new();
+                    let mut guaranteed_slot_list = smallvec::SmallVec::<[usize; 4]>::new();
+                    for e in effects.iter() {
+                        for &w in e.writes() {
+                            guaranteed_slot_list.push(w);
+                            write_slot_list.push(w);
+                        }
+                    }
+                    for e in expected_effects.iter() {
+                        for &w in e.writes() {
+                            write_slot_list.push(w);
+                        }
+                    }
+                    Task::Primitive(PrimitiveTask {
+                        name,
+                        type_id: tid,
+                        preconditions,
+                        effects,
+                        expected_effects,
+                        action,
+                        cost,
+                        static_cost,
+                        write_slot_list,
+                        guaranteed_slot_list,
+                    })
+                }
             });
         }
 

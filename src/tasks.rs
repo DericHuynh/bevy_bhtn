@@ -1069,6 +1069,13 @@ pub struct PrimitiveTask {
     /// — the lower bound the `min_cost` summary infers from (`None` for
     /// dynamic `cost_fn` costs, which conservatively bound at 0).
     pub(crate) static_cost: Option<f32>,
+    /// Baked union of all effect + expected-effect write slots (what
+    /// [`Self::write_slots`] iterates). Precomputed so the executor and
+    /// back-planner never re-collect per step.
+    pub(crate) write_slot_list: SmallVec<[usize; 4]>,
+    /// Baked write slots of the guaranteed (real) effects only (what
+    /// [`Self::guaranteed_slots`] iterates).
+    pub(crate) guaranteed_slot_list: SmallVec<[usize; 4]>,
 }
 
 impl PrimitiveTask {
@@ -1086,15 +1093,18 @@ impl PrimitiveTask {
 
     /// The union of all effect + expected-effect write slots.
     pub fn write_slots(&self) -> impl Iterator<Item = usize> + '_ {
-        self.effects
-            .iter()
-            .chain(self.expected_effects.iter())
-            .flat_map(|e| e.writes.iter().copied())
+        self.write_slot_list.iter().copied()
     }
 
     /// The write slots of the guaranteed (real) effects only.
     pub fn guaranteed_slots(&self) -> impl Iterator<Item = usize> + '_ {
-        self.effects.iter().flat_map(|e| e.writes.iter().copied())
+        self.guaranteed_slot_list.iter().copied()
+    }
+
+    /// The baked union of all effect + expected-effect write slots (the
+    /// executor's commit list — no per-step collection).
+    pub(crate) fn write_slot_slice(&self) -> &[usize] {
+        &self.write_slot_list
     }
 }
 

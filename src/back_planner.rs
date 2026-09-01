@@ -116,18 +116,15 @@ impl<'a> BackPlanner<'a> {
             let Task::Primitive(p) = task else {
                 continue;
             };
-            let produced: HashSet<usize> = p
-                .guaranteed_slots()
-                .filter(|w| needed.contains(w))
-                .collect();
-            if produced.is_empty() {
+            let produced = p.guaranteed_slots().filter(|w| needed.contains(w)).count();
+            if produced == 0 {
                 continue;
             }
             // Only consider tasks whose preconditions currently hold.
             if !p.preconditions.iter().all(|c| c.evaluate(state)) {
                 continue;
             }
-            let score = produced.len();
+            let score = produced;
             if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
                 best = Some((score, i));
             }

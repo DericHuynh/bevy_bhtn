@@ -338,10 +338,12 @@ pub fn htn_ai_system(world: &mut World) {
                 // so effects apply on top of the post-action state.
                 state.refresh(world, entity, registry);
             }
-            let writes: Vec<usize> = primitive.write_slots().collect();
+            // Commit only the baked write slots (read-only effect parameters
+            // are never committed to the real entity).
+            let writes = primitive.write_slot_slice();
             if !writes.is_empty() {
                 primitive.apply_effects(state);
-                state.write_back_with(world, entity, registry, &writes);
+                state.write_back_with(world, entity, registry, writes);
             }
 
             // 5. Advance the cursor (a finished plan is dropped for replan).
