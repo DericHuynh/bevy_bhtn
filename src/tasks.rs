@@ -61,7 +61,7 @@ use ustr::Ustr;
 
 use crate::order::SubtaskOrder;
 use crate::selection::{BranchCandidate, SelectionPolicy};
-use crate::state::{ComponentRegistry, PlanComponent, PlanState};
+use crate::state::{PlanComponent, PlanState, RegistryBuilder};
 use crate::summaries::FieldSet;
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ pub type ScoreFn = Box<dyn Fn(&PlanState) -> f32 + Send + Sync>;
 pub trait IntoPrecondition<Args> {
     /// Compile into a [`Precondition`], registering read components in
     /// `registry`.
-    fn build(self, registry: &mut ComponentRegistry) -> Precondition;
+    fn build(self, registry: &mut RegistryBuilder) -> Precondition;
 }
 
 macro_rules! impl_precondition {
@@ -153,7 +153,7 @@ macro_rules! impl_precondition {
             $($name: PlanComponent,)*
         {
             #[allow(unused_variables)]
-            fn build(self, registry: &mut ComponentRegistry) -> Precondition {
+            fn build(self, registry: &mut RegistryBuilder) -> Precondition {
                 $(let $name = registry.index::<$name>();)*
                 #[allow(unused_mut)]
                 let reads: SmallVec<[usize; 4]> = smallvec![$($name,)*];
@@ -209,7 +209,7 @@ macro_rules! impl_precondition {
 pub trait IntoEffect<Args> {
     /// Compile into an [`Effect`], registering written components in
     /// `registry`.
-    fn build(self, registry: &mut ComponentRegistry) -> Effect;
+    fn build(self, registry: &mut RegistryBuilder) -> Effect;
 }
 
 /// Reject an effect closure that takes the same component type twice: both
@@ -257,7 +257,7 @@ pub trait PlanParam {
     const IS_WRITE: bool;
 
     /// The component's slot index, registering it on first use.
-    fn register(registry: &mut ComponentRegistry) -> usize;
+    fn register(registry: &mut RegistryBuilder) -> usize;
 
     /// Build the closure argument from the slot's raw pointer.
     ///
@@ -272,7 +272,7 @@ pub trait PlanParam {
 
 impl<T: PlanComponent> PlanParam for &T {
     const IS_WRITE: bool = false;
-    fn register(registry: &mut ComponentRegistry) -> usize {
+    fn register(registry: &mut RegistryBuilder) -> usize {
         registry.index::<T>()
     }
     unsafe fn fetch(ptr: *mut u8) -> Self {
@@ -282,7 +282,7 @@ impl<T: PlanComponent> PlanParam for &T {
 
 impl<T: PlanComponent> PlanParam for &mut T {
     const IS_WRITE: bool = true;
-    fn register(registry: &mut ComponentRegistry) -> usize {
+    fn register(registry: &mut RegistryBuilder) -> usize {
         registry.index::<T>()
     }
     unsafe fn fetch(ptr: *mut u8) -> Self {
@@ -301,7 +301,7 @@ macro_rules! impl_effect_tuple {
         where
             F: Fn($($p,)*) + Send + Sync + 'static,
         {
-            fn build(self, registry: &mut ComponentRegistry) -> Effect {
+            fn build(self, registry: &mut RegistryBuilder) -> Effect {
                 $(let $p = <$p as PlanParam>::register(registry);)*
                 // Every parameter's slot must be distinct: a `&mut` pair
                 // would alias, and so would a `&mut`/`&` pair.
@@ -351,7 +351,7 @@ impl_effect_tuple!(A, B, C, D, E, F2, G, H);
 )]
 pub trait IntoUtility<Args> {
     /// Compile into a [`ScoreFn`], registering read components in `registry`.
-    fn build(self, registry: &mut ComponentRegistry) -> ScoreFn;
+    fn build(self, registry: &mut RegistryBuilder) -> ScoreFn;
 }
 
 macro_rules! impl_utility {
@@ -363,7 +363,7 @@ macro_rules! impl_utility {
             $($name: PlanComponent,)*
         {
             #[allow(unused_variables)]
-            fn build(self, registry: &mut ComponentRegistry) -> ScoreFn {
+            fn build(self, registry: &mut RegistryBuilder) -> ScoreFn {
                 $(let $name = registry.index::<$name>();)*
                 Box::new(move |state| self($(state.get::<$name>($name),)*))
             }
@@ -505,7 +505,7 @@ pub(crate) enum TaskProto {
 
 /// The recording context threaded through task functions during baking.
 pub(crate) struct Recorder {
-    pub(crate) registry: ComponentRegistry,
+    pub(crate) registry: RegistryBuilder,
     pub(crate) tasks: Vec<(TypeId, &'static str, TaskProto)>,
     pub(crate) index_of: HashMap<TypeId, usize>,
     pub(crate) queue: VecDeque<Box<dyn TaskFn>>,

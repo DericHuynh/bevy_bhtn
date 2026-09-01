@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_bhtn::state::{ComponentRegistry, PlanState};
+use bevy_bhtn::state::{PlanState, RegistryBuilder};
 use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
 use bevy_bhtn::{FieldSet, HtnDomain};
 use bevy_ecs::prelude::*;
@@ -94,9 +94,10 @@ struct Gold(pub i32);
 #[test]
 fn plan_state_drop_releases_every_slot_once() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
-    registry.index::<Gold>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    builder.index::<Gold>();
+    let registry = builder.freeze();
 
     {
         let state = PlanState::build(&registry)
@@ -115,8 +116,9 @@ fn plan_state_drop_releases_every_slot_once() {
 #[test]
 fn clone_is_deep_for_heap_owning_components() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    let registry = builder.freeze();
 
     let original = PlanState::build(&registry)
         .set(Name::new(&counter, "orig"))
@@ -143,8 +145,9 @@ fn clone_is_deep_for_heap_owning_components() {
 #[test]
 fn copy_from_replaces_destination_values_cleanly() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    let registry = builder.freeze();
 
     let source = PlanState::build(&registry)
         .set(Name::new(&counter, "source"))
@@ -169,9 +172,10 @@ fn copy_from_replaces_destination_values_cleanly() {
 #[test]
 fn write_back_clones_out_and_pool_still_owns() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
-    registry.index::<Gold>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    builder.index::<Gold>();
+    let registry = builder.freeze();
 
     let state = PlanState::build(&registry)
         .set(Name::new(&counter, "committed"))
@@ -198,8 +202,9 @@ fn write_back_clones_out_and_pool_still_owns() {
 #[test]
 fn builder_set_overwrites_dropping_old_value() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    let registry = builder.freeze();
 
     let state = PlanState::build(&registry)
         .set(Name::new(&counter, "first"))
@@ -221,9 +226,10 @@ fn builder_set_overwrites_dropping_old_value() {
 #[test]
 fn builder_finish_materializes_defaults_for_unset_slots() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
-    registry.index::<Gold>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    builder.index::<Gold>();
+    let registry = builder.freeze();
 
     let state = PlanState::build(&registry)
         .set(Name::new(&counter, "only"))
@@ -245,13 +251,14 @@ fn builder_finish_materializes_defaults_for_unset_slots() {
 #[test]
 fn builder_dropped_without_finish_releases_set_values() {
     let counter = Counters::new();
-    let mut registry = ComponentRegistry::default();
-    registry.index::<Name>();
-    registry.index::<Gold>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Name>();
+    builder.index::<Gold>();
+    let registry = builder.freeze();
 
     {
-        let builder = PlanState::build(&registry).set(Name::new(&counter, "doomed"));
-        drop(builder); // never finished
+        let builder_state = PlanState::build(&registry).set(Name::new(&counter, "doomed"));
+        drop(builder_state); // never finished
     }
 
     assert_eq!(counter.dropped(), 1, "the set value was released");
@@ -266,7 +273,7 @@ fn builder_dropped_without_finish_releases_set_values() {
 /// not grow the layout.
 #[test]
 fn registry_index_is_idempotent_per_type() {
-    let mut registry = ComponentRegistry::default();
+    let mut registry = RegistryBuilder::default();
     let first = registry.index::<Gold>();
     let second = registry.index::<Gold>();
     assert_eq!(first, second);
@@ -276,29 +283,24 @@ fn registry_index_is_idempotent_per_type() {
     assert_eq!(registry.len(), 2);
 }
 
-/// The layout is frozen once a `PlanState` shares it: late registration would
-/// move every existing slot's offsets and corrupt live scratchpads.
+/// Registration is a recording-phase operation: the builder assigns the
+/// slots, and the frozen registry resolves the same indices with no mutating
+/// API — late registration after a `PlanState` exists is a compile error,
+/// not a runtime panic.
 #[test]
-#[should_panic(expected = "frozen")]
-fn registry_freezes_once_a_plan_state_exists() {
-    fn root(task: &mut TaskBuilder) {
-        task.branch().then(gain);
-    }
-    fn gain(task: &mut TaskBuilder) {
-        task.effect(|gold: &mut Gold| gold.0 = 1);
-    }
+fn frozen_registry_resolves_builder_slot_indices() {
+    let mut builder = RegistryBuilder::default();
+    let gold = builder.index::<Gold>();
+    let name = builder.index::<Name>();
+    let registry = builder.freeze();
 
-    let domain = HtnDomain::from_root(root).build().unwrap();
+    assert_eq!(registry.get::<Gold>(), Some(gold));
+    assert_eq!(registry.get::<Name>(), Some(name));
+    assert_eq!(registry.len(), 2);
 
-    let mut registry = domain.components.clone();
     let world = World::new();
-    let _state = PlanState::extract(&world, Entity::PLACEHOLDER, &registry);
-
-    // Any further registration must panic — the layout Arc is shared.
-    #[derive(Component, Clone, Default, Debug)]
-    #[allow(dead_code)]
-    struct LateComer(u8);
-    let _ = registry.index::<LateComer>();
+    let state = PlanState::extract(&world, Entity::PLACEHOLDER, &registry);
+    assert_eq!(state.len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,9 +345,12 @@ fn high_alignment_slot_is_placed_correctly() {
     #[derive(Component, Clone, Default, Debug, PartialEq)]
     struct Small(pub u8);
 
-    let mut registry = ComponentRegistry::default();
-    let small_idx = registry.index::<Small>();
-    let big_idx = registry.index::<Big>();
+    let mut builder = RegistryBuilder::default();
+    builder.index::<Small>();
+    builder.index::<Big>();
+    let registry = builder.freeze();
+    let small_idx = registry.get::<Small>().unwrap();
+    let big_idx = registry.get::<Big>().unwrap();
 
     let state = PlanState::build(&registry)
         .set(Small(0xAB))

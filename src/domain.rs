@@ -15,7 +15,7 @@ use ustr::Ustr;
 use crate::error::{HtnError, HtnResult};
 use crate::order::{topo_order_count, SubtaskOrder, LINEARIZATION_CAP};
 use crate::selection::SelectionPolicy;
-use crate::state::ComponentRegistry;
+use crate::state::{ComponentRegistry, RegistryBuilder};
 use crate::summaries::{compute_summaries, TaskSummary};
 use crate::tasks::{
     CompoundTask, GoalBuilder, GoalFn, GoalTask, Method, PrimitiveTask, Recorder, Task, TaskFn,
@@ -47,7 +47,7 @@ impl HtnDomain {
     /// goals with [`DomainBuilder::goal`], then [`DomainBuilder::build`].
     pub fn from_root<F: TaskFn>(root: F) -> DomainBuilder {
         let mut rec = Recorder {
-            registry: ComponentRegistry::default(),
+            registry: RegistryBuilder::default(),
             tasks: Vec::new(),
             index_of: HashMap::new(),
             queue: VecDeque::new(),
@@ -310,7 +310,7 @@ impl DomainBuilder {
             root: 0,
             index_of,
             type_index,
-            components: self.rec.registry,
+            components: self.rec.registry.freeze(),
             summaries: Vec::new(),
         };
         compute_summaries(&mut domain);

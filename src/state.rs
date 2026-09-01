@@ -37,8 +37,9 @@
 //! concrete component type). The invariants that make this sound:
 //!
 //! 1. a slot's offset/size/alignment are fixed before any [`PlanState`] exists
-//!    (the registry is frozen once the domain is baked — `Arc::get_mut`
-//!    enforces this),
+//!    (registration lives on [`RegistryBuilder`] during domain recording; the
+//!    baked domain holds the frozen [`ComponentRegistry`], which has no
+//!    mutating API — the phase split is enforced by the type system),
 //! 2. every slot is initialized for the lifetime of the scratchpad (extract
 //!    and the builder write every slot; effects mutate in place through
 //!    `&mut T`, never reinitialize),
@@ -50,6 +51,7 @@
 
 use std::alloc::Layout;
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -172,37 +174,61 @@ impl std::fmt::Debug for RegistryLayout {
     }
 }
 
-/// The registry of component types a domain touches, assigning each a dense
-/// slot index with an alignment-correct byte region in the [`PlanState`] pool.
+/// The recording-phase registry: accumulates the component types a domain
+/// touches while its task functions are recorded, assigning each a dense slot
+/// index with an alignment-correct byte region in the [`PlanState`] pool.
 ///
-/// The registry is **frozen** once the domain is baked: any [`PlanState`] (or
-/// clone of one) shares the layout `Arc`, after which further registration is
-/// a bug caught by `Arc::get_mut`.
-#[derive(Clone, Default)]
+/// Registration is only possible here. The baked domain holds the frozen
+/// [`ComponentRegistry`], which has no mutating API — so "register after a
+/// `PlanState` exists" is a compile error, not a runtime panic.
+#[derive(Default)]
+pub struct RegistryBuilder {
+    layout: RegistryLayout,
+    by_type: HashMap<TypeId, usize>,
+}
+
+impl RegistryBuilder {
+    /// The slot index of component `T`, registering it (with its byte region
+    /// and monomorphized access fns) on first use.
+    pub fn index<T: PlanComponent>(&mut self) -> usize {
+        if let Some(&idx) = self.by_type.get(&TypeId::of::<T>()) {
+            return idx;
+        }
+        let idx = self.layout.push_slot::<T>(std::any::type_name::<T>());
+        self.by_type.insert(TypeId::of::<T>(), idx);
+        idx
+    }
+
+    /// Freeze the registry: the layout becomes immutably shared with every
+    /// [`PlanState`] built from it. Domain baking calls this; it is also the
+    /// public path to a hand-constructed registry for [`PlanState::build`].
+    pub fn freeze(self) -> ComponentRegistry {
+        ComponentRegistry {
+            layout: Arc::new(self.layout),
+        }
+    }
+
+    /// The number of registered components.
+    pub fn len(&self) -> usize {
+        self.layout.types.len()
+    }
+
+    /// Whether no components are registered.
+    pub fn is_empty(&self) -> bool {
+        self.layout.types.is_empty()
+    }
+}
+
+/// The frozen registry of a baked domain: every component type the domain's
+/// preconditions/effects touch, with dense slot indices into the [`PlanState`]
+/// pool. Read-only by construction — registration happens on
+/// [`RegistryBuilder`] during recording, and [`RegistryBuilder::freeze`]
+/// produces this type.
 pub struct ComponentRegistry {
     layout: Arc<RegistryLayout>,
 }
 
 impl ComponentRegistry {
-    /// The slot index of component `T`, registering it (with its byte region
-    /// and monomorphized access fns) on first use.
-    ///
-    /// Panics if the registry is frozen (a `PlanState` already shares the
-    /// layout) — registration happens only during domain recording.
-    pub fn index<T: PlanComponent>(&mut self) -> usize {
-        let layout = Arc::get_mut(&mut self.layout)
-            .expect("component registry is frozen (a PlanState already exists)");
-        let name = std::any::type_name::<T>();
-        if let Some(idx) = layout
-            .types
-            .iter()
-            .position(|(tid, _)| *tid == TypeId::of::<T>())
-        {
-            return idx;
-        }
-        layout.push_slot::<T>(name)
-    }
-
     /// Whether component `T` is registered.
     pub fn contains<T: 'static>(&self) -> bool {
         self.get::<T>().is_some()
@@ -240,6 +266,15 @@ impl ComponentRegistry {
 impl std::fmt::Debug for ComponentRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComponentRegistry")
+            .field("slots", &self.layout.types.len())
+            .field("total_bytes", &self.layout.total)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RegistryBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryBuilder")
             .field("slots", &self.layout.types.len())
             .field("total_bytes", &self.layout.total)
             .finish()
