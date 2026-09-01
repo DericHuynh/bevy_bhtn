@@ -618,6 +618,70 @@ fn effect_arity_up_to_eight_mutates() {
 }
 
 // ---------------------------------------------------------------------------
+// Mixed `&`/`&mut` effect closures: read-only parameters are registered (the
+// closure can read them) but are NOT part of the effect's write set — never
+// journaled for rollback and never committed to the real entity.
+// ---------------------------------------------------------------------------
+
+mod mixed_effect_tasks {
+    use super::*;
+
+    pub fn mixed_root(task: &mut TaskBuilder) {
+        task.branch().then(mixed_step);
+    }
+
+    /// Writes Flag and Maybe; reads Count.
+    pub fn mixed_step(task: &mut TaskBuilder) {
+        task.effect(|f: &mut Flag, c: &Count, m: &mut Maybe| {
+            f.0 = c.0 > 0;
+            m.0 = Some(c.0);
+        });
+    }
+}
+
+#[test]
+fn mixed_effect_reads_are_not_journaled_or_committed() {
+    use mixed_effect_tasks::*;
+    let domain = HtnDomain::from_root(mixed_root)
+        .build()
+        .expect("mixed-effect domain is well-formed");
+
+    // The compiled effect's write set excludes the read-only Count slot.
+    let Task::Primitive(p) = domain.get_task("mixed_step").expect("recorded") else {
+        panic!("mixed_step must be a primitive");
+    };
+    let flag = domain.components.get::<Flag>().unwrap();
+    let count = domain.components.get::<Count>().unwrap();
+    let maybe = domain.components.get::<Maybe>().unwrap();
+    let writes: Vec<usize> = p.write_slots().collect();
+    assert!(writes.contains(&flag) && writes.contains(&maybe));
+    assert!(!writes.contains(&count), "read-only params are not writes");
+
+    // Driver execution: the effect reads the world's Count through the
+    // scratchpad, but only the written slots are committed back — the world's
+    // Count is untouched even though the closure observed it.
+    use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
+    use bevy_ecs::world::World;
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain));
+    let entity = world
+        .spawn((Flag(false), Count(7), Maybe(None), HtnAgent::default()))
+        .id();
+    htn_ai_system(&mut world);
+    assert!(world.get::<Flag>(entity).unwrap().0, "Flag committed");
+    assert_eq!(
+        world.get::<Maybe>(entity).unwrap().0,
+        Some(7),
+        "Maybe committed"
+    );
+    assert_eq!(
+        world.get::<Count>(entity).unwrap().0,
+        7,
+        "read-only Count was never committed"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Builder-validation error paths (old parser-error pins)
 // ---------------------------------------------------------------------------
 

@@ -355,6 +355,10 @@ fn update_spatial_index(
 // ---------------------------------------------------------------------------
 
 /// Root: loop until the craft goal sits in a pocket.
+///
+/// The first branch is an **empty terminal branch** — `.branch().precondition(…)`
+/// with no `.then` — the idiom for a "done" method: when its precondition
+/// holds, the task decomposes to nothing and the loop stops.
 fn behave(task: &mut TaskBuilder) {
     task.branch()
         .precondition(|pockets: &PocketContents, goal: &CraftGoal| pockets.count(goal.0) > 0); // terminal: the goal is crafted — done
@@ -391,10 +395,7 @@ fn acquire_missing(task: &mut TaskBuilder) {
 /// recipe comes from the component, not the domain).
 fn select_missing(task: &mut TaskBuilder) {
     task.effect(
-        |focus: &mut Focus,
-         pockets: &mut PocketContents,
-         goal: &mut CraftGoal,
-         book: &mut RecipeBook| {
+        |focus: &mut Focus, pockets: &PocketContents, goal: &CraftGoal, book: &RecipeBook| {
             if let Some(missing) = book.first_missing(goal.0, pockets) {
                 focus.0 = missing;
             }
@@ -422,8 +423,8 @@ fn move_to_item(task: &mut TaskBuilder) {
         .effect(
             |travel: &mut Travel,
              arrived: &mut Arrived,
-             ground: &mut GroundKnowledge,
-             focus: &mut Focus| {
+             ground: &GroundKnowledge,
+             focus: &Focus| {
                 if let Some(target) = ground.pos_of(focus.0) {
                     travel.target = target;
                     arrived.0 = true;
@@ -439,7 +440,7 @@ fn pick_up(task: &mut TaskBuilder) {
     task.precondition(|arrived: &Arrived| arrived.0)
         .precondition(|focus: &Focus, ground: &GroundKnowledge| ground.contains(focus.0))
         .effect(
-            |pockets: &mut PocketContents, ground: &mut GroundKnowledge, focus: &mut Focus| {
+            |pockets: &mut PocketContents, ground: &mut GroundKnowledge, focus: &Focus| {
                 pockets.add(focus.0);
                 ground.remove(focus.0);
             },
@@ -458,7 +459,7 @@ fn do_craft(task: &mut TaskBuilder) {
         },
     )
     .effect(
-        |pockets: &mut PocketContents, goal: &mut CraftGoal, book: &mut RecipeBook| {
+        |pockets: &mut PocketContents, goal: &CraftGoal, book: &RecipeBook| {
             if let Some(recipe) = book.recipe_for(goal.0) {
                 for input in &recipe.inputs {
                     pockets.remove(*input);
@@ -505,7 +506,6 @@ struct CddaWorld {
     world: World,
     schedule: Schedule,
     survivor: Entity,
-    #[allow(dead_code)] // kept for future per-clothing assertions
     jacket: Entity,
 }
 
@@ -658,16 +658,28 @@ impl CddaWorld {
 // ---------------------------------------------------------------------------
 
 /// The survivor walks to the rag, picks it up, and crafts the spear. The
-/// simulation is deterministic, so the tick count is pinned exactly: 8 tiles
-/// of walking plus the drift-replan cadence and the pickup/craft ticks.
+/// simulation is deterministic, so the tick count is pinned exactly. Verified
+/// against a per-tick trace; the arithmetic:
+///
+/// 1 (plan + select_missing) + 8 (walk — one tile per tick, the movement
+/// system runs every tick while the driver interleaves move-ticks with
+/// drift-fail and replan ticks) + 1 (replan + select) + 1 (move re-issued,
+/// no-op walk) + 1 (pick_up: arrival confirmed, rag pocketed) + 1 (do_craft)
+/// = 13.
 #[test]
 fn survivor_walks_picks_up_and_crafts_a_spear() {
     let mut sim = CddaWorld::new(ItemKind::Spear);
     let ticks = sim.run_until_crafted(ItemKind::Spear);
     assert_eq!(ticks, 13, "deterministic tick count for the spear run");
 
-    // The spear exists, in a pocket of the survivor's clothing.
-    assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());
+    // The spear exists, in a pocket of the survivor's jacket (the first
+    // worn clothing — the pocket the pickup/craft systems target).
+    let spear_entity =
+        pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).expect("spear in a pocket");
+    assert!(sim
+        .world
+        .get::<Pockets>(sim.jacket)
+        .is_some_and(|p| p.0.contains(&spear_entity)));
 
     // The inputs were consumed.
     let kinds = sim.kinds();
@@ -711,7 +723,13 @@ fn survivor_walks_picks_up_and_crafts_a_spear() {
 
 /// Crafting a bandage needs two ground items in sequence (scrap, then berry
 /// — recipe-input order): two full walk-and-fetch trips, still pinned
-/// exactly, and still no distraction toward the other recipes.
+/// exactly, and still no distraction toward the other recipes. Verified
+/// against a per-tick trace; the arithmetic:
+///
+/// trip 1 (scrap, 4 tiles): 1 (plan + select) + 4 (walk) + 1 (pick_up —
+/// arrival lands on a move-tick, so pickup validates directly) = 6;
+/// trip 2 (berry, 3 tiles): 1 (plan + select) + 3 (walk) + 1 (move re-issued)
+/// + 1 (pick_up) + 1 (do_craft) = 7. Total 13.
 #[test]
 fn survivor_crafts_a_bandage_from_two_ground_items() {
     let mut sim = CddaWorld::new(ItemKind::Bandage);
@@ -747,7 +765,8 @@ fn survivor_crafts_a_bandage_from_two_ground_items() {
 /// Crafting a torch needs a bottle and scrap — and the survivor already
 /// carries a bottle: the planner must use the carried one and leave the
 /// ground bottle lying at (3,1) untouched. One fetch only — the shortest
-/// scenario.
+/// scenario. Verified against a per-tick trace; the arithmetic:
+/// 1 (plan + select) + 4 (walk to the scrap) + 1 (pick_up) + 1 (do_craft) = 7.
 #[test]
 fn survivor_crafts_a_torch_using_the_carried_bottle() {
     let mut sim = CddaWorld::new(ItemKind::Torch);

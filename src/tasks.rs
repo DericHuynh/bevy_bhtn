@@ -31,7 +31,9 @@
 //! }
 //!
 //! // A compound: ordered branches, each with optional preconditions and a
-//! // subtask list referencing other task functions directly.
+//! // subtask list referencing other task functions directly. A branch with
+//! // no `.then` is an **empty terminal branch** — the idiom for a "done"
+//! // method: when its precondition holds, the task decomposes to nothing.
 //! fn engage_target(task: &mut TaskBuilder) {
 //!     task.branch()
 //!         .precondition(|ammo: &Ammo, vision: &TargetVision| ammo.0 > 0 && vision.visible)
@@ -130,6 +132,12 @@ pub type ScoreFn = Box<dyn Fn(&PlanState) -> f32 + Send + Sync>;
 /// task.precondition(|ammo: &Ammo, vision: &Vision| ammo.0 > 0 && vision.visible);
 /// # }
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid precondition closure",
+    label = "this closure's parameters don't match any supported precondition signature",
+    note = "precondition closures take 0-8 shared component references: `|ammo: &Ammo, vision: &Vision| ...`",
+    note = "closure parameters must be annotated with their component types so the planner can find their slots"
+)]
 pub trait IntoPrecondition<Args> {
     /// Compile into a [`Precondition`], registering read components in
     /// `registry`.
@@ -158,10 +166,14 @@ macro_rules! impl_precondition {
     };
 }
 
-/// Conversion into a compiled [`Effect`], implemented (up to 8 parameters)
-/// for closures over exclusive component references. The `Args` parameter is
-/// inferred from the closure's `Fn` signature; closure parameters must be
-/// annotated:
+/// Conversion into a compiled [`Effect`], implemented for closures over
+/// component references where **`&mut T` marks a component the effect
+/// writes** (journaled for rollback and committed to the real entity at
+/// execution) and **`&T` marks a read-only component** (costs nothing — it is
+/// never journaled or committed). The `Args` parameter is inferred from the
+/// closure's `Fn` signature (the axum-handler pattern); closure parameters
+/// must be annotated so the concrete component types (and their slot indices)
+/// can be captured at build time:
 ///
 /// ```
 /// # use bevy_bhtn::tasks::TaskBuilder;
@@ -169,57 +181,148 @@ macro_rules! impl_precondition {
 /// # struct Cover { in_cover: bool }
 /// # #[derive(bevy_ecs::prelude::Component, Clone, Default)]
 /// # struct Vision { visible: bool }
+/// # #[derive(bevy_ecs::prelude::Component, Clone, Default)]
+/// # struct Ammo(pub u32);
 /// # fn demo(task: &mut TaskBuilder) {
-/// task.effect(|cover: &mut Cover, vision: &mut Vision| {
-///     cover.in_cover = true;
-///     vision.visible = false;
+/// // Writes Cover and Vision; reads Ammo.
+/// task.effect(|cover: &mut Cover, vision: &mut Vision, ammo: &Ammo| {
+///     if ammo.0 > 0 {
+///         cover.in_cover = true;
+///         vision.visible = false;
+///     }
 /// });
 /// # }
 /// ```
+///
+/// Up to 8 parameters may mix `&` and `&mut` freely at any arity. Read-only
+/// parameters are never journaled for rollback and never committed to the real
+/// entity — only what the closure actually mutates costs anything. No
+/// parameter may name the same component type twice (a `&mut`/`&` pair on one
+/// slot would alias).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid effect closure",
+    label = "this closure's parameters don't match any supported effect signature",
+    note = "effect closures take 0-8 annotated component parameters: `&mut T` marks a written component, `&T` a read-only one",
+    note = "any mix of `&` and `&mut` is allowed at any arity up to 8",
+    note = "no parameter may name the same component type twice"
+)]
 pub trait IntoEffect<Args> {
     /// Compile into an [`Effect`], registering written components in
     /// `registry`.
     fn build(self, registry: &mut ComponentRegistry) -> Effect;
 }
 
-/// Reject an effect closure that takes `&mut` to the same component type
-/// twice: both parameters would resolve to the same registered slot, and the
-/// compiled closure would create two aliasing `&mut` — a soundness violation.
+/// Reject an effect closure that takes the same component type twice: both
+/// parameters would resolve to the same registered slot, and a `&mut` pair
+/// would alias — a soundness violation. (Repeated *shared* reads would be
+/// harmless, but they are rejected too for a single, simple rule.)
 /// Shared-reference preconditions may repeat freely.
 fn assert_distinct_slots(indices: &[usize]) {
     for i in 0..indices.len() {
         for j in (i + 1)..indices.len() {
             assert!(
                 indices[i] != indices[j],
-                "effect closure takes `&mut` to the same component type twice — \
-                 the slots would alias; merge the parameters into one `&mut`"
+                "effect closure takes the same component type twice — a `&mut` \
+                 pair would alias; merge the parameters into one `&mut`"
             );
         }
     }
 }
 
-macro_rules! impl_effect {
-    ($($name:ident),*) => {
-        #[allow(non_snake_case)]
-        impl<F, $($name,)*> IntoEffect<fn($(&mut $name,)*)> for F
+// -- Effect-signature machinery ---------------------------------------------
+//
+// Effect closures take component parameters where `&mut T` marks a component
+// the effect *writes* (journaled for rollback and committed to the real
+// entity) and `&T` marks a read-only component (never journaled — a read
+// costs nothing). The axum-style `Args` marker is the closure's fn-pointer
+// type; the [`PlanParam`] trait lets one linear tuple impl per arity accept
+// any `&`/`&mut` mix at that arity — no combinatorial pattern enumeration.
+
+/// One parameter of an effect closure: a shared (`&T`) or exclusive (`&mut T`)
+/// reference to a registered component slot.
+///
+/// The reference kind is the type itself, so the [`IntoEffect`] tuple impls
+/// unify each closure parameter against exactly one impl — `&mut A` picks the
+/// write impl, `&A` the read one — with no combinatorial enumeration of
+/// patterns. `IS_WRITE` is a `const`, so the tuple impl's journal/commit-list
+/// filter folds at compile time (no runtime branch per parameter).
+///
+/// Effectively sealed: the only self types are `&T` and `&mut T` for
+/// [`PlanComponent`]s, and users never name this trait — any annotated
+/// component reference works through the impls automatically.
+pub trait PlanParam {
+    /// Whether this parameter writes its slot (`&mut T`) or only reads it
+    /// (`&T`). Write slots are journaled for rollback and committed to the
+    /// real entity at execution; read slots cost nothing.
+    const IS_WRITE: bool;
+
+    /// The component's slot index, registering it on first use.
+    fn register(registry: &mut ComponentRegistry) -> usize;
+
+    /// Build the closure argument from the slot's raw pointer.
+    ///
+    /// # Safety
+    /// `ptr` must point at the initialized slot for `Self`'s component, and
+    /// must be disjoint from every other parameter's slot (guaranteed by the
+    /// all-distinct slot assert at effect-build time). The returned reference
+    /// must not outlive the scratchpad the pointer points into — the compiled
+    /// effect only ever calls this while its `&mut PlanState` borrow is live.
+    unsafe fn fetch(ptr: *mut u8) -> Self;
+}
+
+impl<T: PlanComponent> PlanParam for &T {
+    const IS_WRITE: bool = false;
+    fn register(registry: &mut ComponentRegistry) -> usize {
+        registry.index::<T>()
+    }
+    unsafe fn fetch(ptr: *mut u8) -> Self {
+        &*(ptr as *const T)
+    }
+}
+
+impl<T: PlanComponent> PlanParam for &mut T {
+    const IS_WRITE: bool = true;
+    fn register(registry: &mut ComponentRegistry) -> usize {
+        registry.index::<T>()
+    }
+    unsafe fn fetch(ptr: *mut u8) -> Self {
+        &mut *(ptr as *mut T)
+    }
+}
+
+/// One linear `IntoEffect` impl per arity (0–8): each parameter unifies
+/// against [`PlanParam`] independently, so any `&`/`&mut` mix compiles at any
+/// arity. `IS_WRITE` is const-folded, so read-only parameters vanish from the
+/// write list (never journaled, never committed) at zero runtime cost.
+macro_rules! impl_effect_tuple {
+    ($($p:ident),*) => {
+        #[allow(non_snake_case, unused_variables)]
+        impl<F, $($p: PlanParam,)*> IntoEffect<fn($($p,)*)> for F
         where
-            F: Fn($(&mut $name,)*) + Send + Sync + 'static,
-            $($name: PlanComponent,)*
+            F: Fn($($p,)*) + Send + Sync + 'static,
         {
             fn build(self, registry: &mut ComponentRegistry) -> Effect {
-                $(let $name = registry.index::<$name>();)*
+                $(let $p = <$p as PlanParam>::register(registry);)*
+                // Every parameter's slot must be distinct: a `&mut` pair
+                // would alias, and so would a `&mut`/`&` pair.
+                let all = &[$($p),*];
+                assert_distinct_slots(all);
                 #[allow(unused_mut)]
-                let writes: SmallVec<[usize; 4]> = smallvec![$($name,)*];
-                assert_distinct_slots(&writes);
+                let mut writes: SmallVec<[usize; 4]> = SmallVec::new();
+                $(
+                    if <$p as PlanParam>::IS_WRITE {
+                        writes.push($p);
+                    }
+                )*
                 Effect {
                     writes,
                     apply: Box::new(move |state| {
                         // The closure's arguments are distinct registered
                         // slots, so their byte regions are disjoint by
                         // construction — the raw pointers never alias.
-                        let [$($name),*] = state.disjoint_slots([$($name,)*]);
+                        let [$($p),*] = state.disjoint_slots([$($p),*]);
                         self($(
-                            unsafe { &mut *($name as *mut $name) },
+                            unsafe { <$p as PlanParam>::fetch($p) },
                         )*)
                     }),
                 }
@@ -227,10 +330,25 @@ macro_rules! impl_effect {
         }
     };
 }
+impl_effect_tuple!();
+impl_effect_tuple!(A);
+impl_effect_tuple!(A, B);
+impl_effect_tuple!(A, B, C);
+impl_effect_tuple!(A, B, C, D);
+impl_effect_tuple!(A, B, C, D, E);
+impl_effect_tuple!(A, B, C, D, E, F2);
+impl_effect_tuple!(A, B, C, D, E, F2, G);
+impl_effect_tuple!(A, B, C, D, E, F2, G, H);
 
 /// Conversion into a compiled `f32` scorer over shared component references
 /// (used by `utility_fn`). Same axum-style `Args` inference as
 /// [`IntoPrecondition`]; closure parameters must be annotated.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid utility/cost closure",
+    label = "this closure's parameters don't match any supported scorer signature",
+    note = "utility and cost closures take 0-8 shared component references and return f32: `|d: &Distance| d.0 as f32`",
+    note = "closure parameters must be annotated with their component types so the planner can find their slots"
+)]
 pub trait IntoUtility<Args> {
     /// Compile into a [`ScoreFn`], registering read components in `registry`.
     fn build(self, registry: &mut ComponentRegistry) -> ScoreFn;
@@ -271,15 +389,6 @@ impl_utility!(A, B, C, D, E);
 impl_utility!(A, B, C, D, E, F2);
 impl_utility!(A, B, C, D, E, F2, G);
 impl_utility!(A, B, C, D, E, F2, G, H);
-
-impl_effect!(A);
-impl_effect!(A, B);
-impl_effect!(A, B, C);
-impl_effect!(A, B, C, D);
-impl_effect!(A, B, C, D, E);
-impl_effect!(A, B, C, D, E, F2);
-impl_effect!(A, B, C, D, E, F2, G);
-impl_effect!(A, B, C, D, E, F2, G, H);
 
 // ---------------------------------------------------------------------------
 // TaskFn — function items as task identity

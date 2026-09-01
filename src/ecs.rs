@@ -15,6 +15,44 @@
 //!   components, and advancing the cursor (or dropping the plan to trigger a
 //!   replan).
 //!
+//! # Working with the real world
+//!
+//! The planner simulates on a [`PlanState`] scratchpad; the world only ever
+//! changes through the driver and the game's own systems. The seam has four
+//! moving parts:
+//!
+//! 1. **Scratchpad extraction** — at plan time (and again at validation and
+//!    post-action time, refreshed in place) the driver copies every registered
+//!    component off the agent entity ([`PlanState::extract`] /
+//!    [`PlanState::refresh`]; missing components materialize as `Default`).
+//!    Preconditions and effect closures read and mutate this snapshot — never
+//!    the `World` directly.
+//! 2. **Effect commit** — when a step executes, the driver applies the
+//!    primitive's effects to the scratchpad and writes **only the slots the
+//!    effects declare as writes** (`&mut T` parameters; `&T` read parameters
+//!    are never committed) back onto the real entity via
+//!    [`PlanState::write_back_with`]. An action's commands are dispatched and
+//!    flushed first, then effects commit on top of the post-action state.
+//! 3. **Intent markers** — an action should not *do* the real-world work; it
+//!    inserts a marker component (`cmds.insert(PickupRequest)`), and a
+//!    dedicated game system realizes the intent (resolving targets, mutating
+//!    the relationship graph) and removes the marker. This keeps world logic
+//!    in ordinary systems the planner never sees.
+//! 4. **Projection components** — the planner can only simulate components.
+//!    World truth that lives in relationships or raw geometry (what is in
+//!    which pocket, what lies on the ground) is derived into planner-facing
+//!    summary components by sync systems each tick (`PocketContents` from the
+//!    `InPocket`/`Pockets` relationship graph, `GroundKnowledge` from ground
+//!    entities). The graph is the truth; the projection is what the planner
+//!    simulates.
+//!
+//! Together with the driver's **drift-replan loop** this models actions whose
+//! real duration exceeds a tick: the planner *simulates* the outcome as an
+//! effect (e.g. `Arrived(true)`), the movement system recomputes the truth
+//! every tick, and the driver's step-2 re-validation drops the plan until the
+//! world has actually caught up — each drop triggers a replan from reality
+//! next tick. See `tests/htn_cdda_world.rs` for the full pattern end to end.
+//!
 //! ```
 //! use bevy_bhtn::prelude::*;
 //! use bevy_ecs::prelude::*;
