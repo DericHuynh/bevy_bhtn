@@ -320,6 +320,25 @@ impl PlanState {
         Self { layout, pool }
     }
 
+    /// Re-extract every slot from `entity` **in place**: drops each current
+    /// value, then fetches the component (or its `Default`) into the same
+    /// slot region. No allocation — the driver's hot path reuses one
+    /// scratchpad across agents and across its plan/validate/re-extract
+    /// phases (same discipline as the look-ahead sweep's `copy_from`).
+    ///
+    /// # Panics (debug)
+    /// If `registry` is not this scratchpad's registry.
+    pub fn refresh(&mut self, world: &World, entity: Entity, registry: &ComponentRegistry) {
+        debug_assert!(Arc::ptr_eq(&self.layout, &registry.layout));
+        for i in 0..self.layout.types.len() {
+            let off = self.layout.offsets[i];
+            unsafe {
+                (self.layout.droppers[i])(self.pool.as_mut_ptr().add(off));
+                (self.layout.fetchers[i])(world, entity, self.pool.as_mut_ptr().add(off));
+            }
+        }
+    }
+
     /// Begin building a scratchpad directly from component values (no `World`
     /// needed). Unset slots materialize as `Default` on
     /// [`finish`](PlanStateBuilder::finish).

@@ -66,7 +66,7 @@ impl std::fmt::Display for Mtr {
 /// indexes the baked task array directly, with no name lookups and no string
 /// comparisons on the hot path. The interned names are kept in parallel for
 /// display and introspection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
     /// Baked step program: task indices, in execution order.
     pub steps: Vec<u32>,
@@ -293,7 +293,11 @@ struct DecompositionFrame {
     /// this task must also restore what followed it — truncating lengths alone
     /// would lose siblings already popped after a failed later subtask (or
     /// leave stale ones from the abandoned choice). Inline for the common
-    /// 2–5-subtask case (allocation-free commitments).
+    /// 2–5-subtask case (allocation-free commitments). (A persistent/
+    /// structurally-shared queue would make this O(1) — a known future
+    /// optimization; a bare length is NOT enough, because a completed
+    /// subtree's frame can still be backtracked into after the search has
+    /// consumed part of the suffix.)
     stack: SmallVec<[Step; 4]>,
     /// `rollback.ops.len()` before this decomposition's subtasks ran.
     /// Restoring the scratchpad rewinds the journal down to this length.
@@ -406,6 +410,15 @@ impl<'a> HtnPlanner<'a> {
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
     pub fn plan(&mut self, root: &str, state: &PlanState) -> Plan {
+        match self.domain.task_index(root.into()) {
+            Some(idx) => self.plan_inner(idx, state, None),
+            None => Plan::default(),
+        }
+    }
+
+    /// [`Self::plan`] by task index — no name lookup, no allocation. The
+    /// driver's hot path (the domain root is a known index).
+    pub fn plan_index(&mut self, root: usize, state: &PlanState) -> Plan {
         self.plan_inner(root, state, None)
     }
 
@@ -421,13 +434,26 @@ impl<'a> HtnPlanner<'a> {
         state: &PlanState,
         trace: &mut Vec<DecompositionTrace>,
     ) -> Plan {
+        match self.domain.task_index(root.into()) {
+            Some(idx) => self.plan_inner(idx, state, Some(trace)),
+            None => Plan::default(),
+        }
+    }
+
+    /// [`Self::plan_traced`] by task index (see [`Self::plan_index`]).
+    pub fn plan_traced_index(
+        &mut self,
+        root: usize,
+        state: &PlanState,
+        trace: &mut Vec<DecompositionTrace>,
+    ) -> Plan {
         self.plan_inner(root, state, Some(trace))
     }
 
     /// The search itself.
     fn plan_inner(
         &mut self,
-        root: &str,
+        root: usize,
         state: &PlanState,
         mut trace: Option<&mut Vec<DecompositionTrace>>,
     ) -> Plan {
@@ -472,15 +498,7 @@ impl<'a> HtnPlanner<'a> {
 
         let tasks = &self.domain.tasks;
 
-        let root = Ustr::from(root);
-        let Some(&root_idx) = self.domain.index_of.get(&root) else {
-            return Plan {
-                steps: Vec::new(),
-                names: Vec::new(),
-                mtr: Mtr(Vec::new()),
-            };
-        };
-        stack.push_back(Step::Task(root_idx, None));
+        stack.push_front(Step::Task(root, None));
 
         'search: loop {
             let Some(step) = stack.pop_front() else {
@@ -712,7 +730,7 @@ impl<'a> HtnPlanner<'a> {
                                 method.order.is_partial(),
                             )
                         } else {
-                            Lookahead::Refine(Vec::new())
+                            Lookahead::Refine
                         };
                         match verdict {
                             Lookahead::DeadEnd => {
@@ -727,7 +745,10 @@ impl<'a> HtnPlanner<'a> {
                                 }
                                 continue;
                             }
-                            Lookahead::Refine(pins_found) => {
+                            Lookahead::Refine => {
+                                // The sweep left the inevitable refinements in
+                                // `sweep_pins` (scratch discipline — no
+                                // ownership handoff).
                                 // Snapshot *before* the push: on backtrack the
                                 // truncate must remove THIS method's entry, so
                                 // the node's retry replaces it instead of
@@ -776,20 +797,30 @@ impl<'a> HtnPlanner<'a> {
                                 // first topological order (the declaration
                                 // order whenever it is topological). Pins are
                                 // keyed by member position, which both orders
-                                // share.
-                                let push_order: SmallVec<[usize; 4]> = match &method.order {
-                                    SubtaskOrder::Total => (0..method.subtasks.len()).collect(),
-                                    SubtaskOrder::Partial { first, .. } => {
-                                        first.iter().map(|&p| p as usize).collect()
+                                // share. (The stack pops last-pushed-first,
+                                // so reverse iteration + push = forward
+                                // execution order; no intermediate buffer.)
+                                match &method.order {
+                                    SubtaskOrder::Total => {
+                                        for pos in (0..method.subtasks.len()).rev() {
+                                            let sub_idx = method.subtasks[pos] as usize;
+                                            let sub_pin = sweep_pins
+                                                .iter()
+                                                .find(|(p, _)| *p == pos)
+                                                .map(|&(_, m)| m as u32);
+                                            stack.push_front(Step::Task(sub_idx, sub_pin));
+                                        }
                                     }
-                                };
-                                for &pos in push_order.iter().rev() {
-                                    let sub_idx = method.subtasks[pos] as usize;
-                                    let sub_pin = pins_found
-                                        .iter()
-                                        .find(|(p, _)| *p == pos)
-                                        .map(|&(_, m)| m as u32);
-                                    stack.push_front(Step::Task(sub_idx, sub_pin));
+                                    SubtaskOrder::Partial { first, .. } => {
+                                        for &pos in first.iter().rev() {
+                                            let sub_idx = method.subtasks[pos as usize] as usize;
+                                            let sub_pin = sweep_pins
+                                                .iter()
+                                                .find(|(p, _)| *p == pos as usize)
+                                                .map(|&(_, m)| m as u32);
+                                            stack.push_front(Step::Task(sub_idx, sub_pin));
+                                        }
+                                    }
                                 }
                                 skip = 0;
                                 rank_order.clear();
@@ -920,7 +951,10 @@ fn backtrack(
                 *g = frame.g_commit;
                 // Restore the queue to its state at commitment time: the
                 // failed subtree's remnants go, the suffix (with its
-                // occurrence pins) comes back.
+                // occurrence pins) comes back. The snapshot copy is load-
+                // bearing: a completed subtree's frame can be backtracked
+                // into after the search consumed part of the suffix, and a
+                // bare length cannot restore what was already popped.
                 stack.clear();
                 stack.extend(frame.stack.iter().copied());
                 // Partially-ordered method with pending linearizations: retry

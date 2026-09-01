@@ -43,11 +43,17 @@ use crate::summaries::FieldSet;
 use crate::tasks::{Precondition, Task};
 
 /// The verdict of one look-ahead sweep.
+///
+/// On [`Lookahead::Refine`], the inevitable refinements are left in the
+/// caller's `pins` scratch buffer (same discipline as `unknown` and
+/// `surviving_buf`) — taking ownership would swap the caller's populated
+/// `Vec` for a fresh empty one and defeat the reuse.
 pub(crate) enum Lookahead {
-    /// The sequence can possibly succeed; contains the inevitable refinements
-    /// found along it as `(position in the swept sequence, method index)` —
-    /// the caller attaches them to the corresponding subtask occurrences.
-    Refine(Vec<(usize, usize)>),
+    /// The sequence can possibly succeed; the caller's `pins` buffer holds
+    /// the inevitable refinements found along it as `(position in the swept
+    /// sequence, method index)` — the caller attaches them to the
+    /// corresponding subtask occurrences.
+    Refine,
     /// No refinement of the sequence can succeed from the current state.
     DeadEnd,
 }
@@ -82,7 +88,7 @@ pub(crate) fn sweep(
     // The sweep is only sound when the inferred summaries are present (they
     // define what "possibly written" and "terminating" mean).
     if domain.summaries.len() != domain.tasks.len() {
-        return Lookahead::Refine(Vec::new());
+        return Lookahead::Refine;
     }
 
     unknown.clear();
@@ -188,7 +194,7 @@ pub(crate) fn sweep(
         }
     }
 
-    Lookahead::Refine(std::mem::take(pins))
+    Lookahead::Refine
 }
 
 /// Whether `c` definitely fails: it reads only known components and evaluates

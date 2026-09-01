@@ -124,6 +124,17 @@ impl HtnConfig {
     }
 }
 
+/// Per-tick reusable driver buffers, parked as a resource between runs so
+/// the driver allocates nothing in steady state: the agent-entity list
+/// (cleared and refilled each tick) and one [`PlanState`] scratchpad
+/// (refreshed in place per phase — plan, validate, post-action re-extract —
+/// instead of re-allocating up to three times per agent per tick).
+#[derive(Resource, Default)]
+struct DriverScratch {
+    entities: Vec<Entity>,
+    state: Option<PlanState>,
+}
+
 /// The AI driver: one exclusive-system tick for every [`HtnAgent`].
 ///
 /// Per agent per run:
@@ -153,12 +164,21 @@ pub fn htn_ai_system(world: &mut World) {
         .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
         .update();
 
-    let entities: Vec<Entity> = world
-        .query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>()
-        .iter(world)
-        .collect();
+    // Reusable buffers: take them out of the world (their allocations move
+    // with them), work, then put them back for the next tick.
+    if world.get_resource::<DriverScratch>().is_none() {
+        world.insert_resource(DriverScratch::default());
+    }
+    let mut scratch = world
+        .remove_resource::<DriverScratch>()
+        .expect("just inserted");
+    scratch.entities.clear();
+    {
+        let mut agents = world.query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>();
+        scratch.entities.extend(agents.iter(world));
+    }
 
-    for entity in entities {
+    for &entity in &scratch.entities {
         // The config resource is scoped out of the world for the whole tick,
         // so domain references (preconditions, effects, actions) stay alive
         // while the world itself is mutated.
@@ -169,8 +189,14 @@ pub fn htn_ai_system(world: &mut World) {
                 .get::<HtnAgent>(entity)
                 .is_some_and(|a| a.plan.is_none())
             {
-                let root = config.domain.root_task().name().to_string();
-                let state = PlanState::extract(world, entity, &config.domain.components);
+                let root = config.domain.root;
+                let registry = &config.domain.components;
+                // One scratchpad, refreshed in place: planning, validation,
+                // and the post-action re-extract all reuse the same buffer.
+                let state = scratch
+                    .state
+                    .get_or_insert_with(|| PlanState::build(registry).finish());
+                state.refresh(world, entity, registry);
                 let (strategy, sanity) = world
                     .get::<SearchOverride>(entity)
                     .map(|o| {
@@ -191,34 +217,30 @@ pub fn htn_ai_system(world: &mut World) {
                 let plan = match &strategy {
                     HtnSearchStrategy::DepthFirst => {
                         if config.debug_trace {
-                            planner.plan_traced(&root, &state, &mut trace_buf)
+                            planner.plan_traced_index(root, state, &mut trace_buf)
                         } else {
-                            planner.plan(&root, &state)
+                            planner.plan_index(root, state)
                         }
                     }
                     HtnSearchStrategy::DepthFirstFailFast => {
                         planner.set_fail_fast(true);
                         if config.debug_trace {
-                            planner.plan_traced(&root, &state, &mut trace_buf)
+                            planner.plan_traced_index(root, state, &mut trace_buf)
                         } else {
-                            planner.plan(&root, &state)
+                            planner.plan_index(root, state)
                         }
                     }
                     HtnSearchStrategy::CostBounded => {
                         planner.set_cost_bounded(true);
                         if config.debug_trace {
-                            planner.plan_traced(&root, &state, &mut trace_buf)
+                            planner.plan_traced_index(root, state, &mut trace_buf)
                         } else {
-                            planner.plan(&root, &state)
+                            planner.plan_index(root, state)
                         }
                     }
-                    HtnSearchStrategy::Custom(searcher) => searcher
-                        .search(&config.domain, &state)
-                        .unwrap_or_else(|| crate::planner::Plan {
-                            steps: Vec::new(),
-                            names: Vec::new(),
-                            mtr: crate::planner::Mtr(Vec::new()),
-                        }),
+                    HtnSearchStrategy::Custom(searcher) => {
+                        searcher.search(&config.domain, state).unwrap_or_default()
+                    }
                 };
                 if !trace_buf.is_empty() {
                     world
@@ -249,9 +271,14 @@ pub fn htn_ai_system(world: &mut World) {
 
             // 3. Validate the step against the real world: if the
             // preconditions no longer hold (the world drifted since
-            // planning), drop the plan and replan next tick.
-            let mut state = PlanState::extract(world, entity, &config.domain.components);
-            if !primitive.preconditions_met(&state) {
+            // planning), drop the plan and replan next tick. The scratchpad
+            // is the shared driver buffer, refreshed in place.
+            let registry = &config.domain.components;
+            let state = scratch
+                .state
+                .get_or_insert_with(|| PlanState::build(registry).finish());
+            state.refresh(world, entity, registry);
+            if !primitive.preconditions_met(state) {
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.plan = None;
                     agent.cursor = 0;
@@ -271,12 +298,12 @@ pub fn htn_ai_system(world: &mut World) {
                 world.flush();
                 // The action may have mutated planning components: re-extract
                 // so effects apply on top of the post-action state.
-                state = PlanState::extract(world, entity, &config.domain.components);
+                state.refresh(world, entity, registry);
             }
             let writes: Vec<usize> = primitive.write_slots().collect();
             if !writes.is_empty() {
-                primitive.apply_effects(&mut state);
-                state.write_back_with(world, entity, &config.domain.components, &writes);
+                primitive.apply_effects(state);
+                state.write_back_with(world, entity, registry, &writes);
             }
 
             // 5. Advance the cursor (a finished plan is dropped for replan).
@@ -290,4 +317,7 @@ pub fn htn_ai_system(world: &mut World) {
             }
         });
     }
+
+    // Park the buffers back on the world for the next tick.
+    world.insert_resource(scratch);
 }
