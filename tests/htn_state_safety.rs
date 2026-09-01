@@ -481,6 +481,39 @@ fn rollback_moves_heap_values_without_leaks_or_double_frees() {
     counter.assert_balanced();
 }
 
+/// A search that exits **successfully** — the queue drains, the plan is
+/// complete, no backtracking happens — still has every applied effect's
+/// snapshot on the rollback journal. The journal owns deep clones, so those
+/// copies must be released when the search ends: `Journal::drop` only
+/// deallocates its buffer, so the remaining ops must be dropped through the
+/// registry's droppers (a `String` slot's heap buffer would otherwise leak on
+/// every successful plan that touched one).
+#[test]
+fn successful_plan_releases_unrestored_journal_copies() {
+    let counter = Counters::new();
+
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(write_name);
+    }
+    fn write_name(task: &mut TaskBuilder) {
+        task.effect(|n: &mut Name| n.1.push('!'));
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components)
+        .set(Name::new(&counter, "start"))
+        .finish();
+
+    let mut planner = HtnPlanner::new(&domain);
+    assert_eq!(planner.plan("root", &state).task_names(), ["write_name"]);
+    drop(state); // the planner's working clone is released inside plan()
+
+    // constructed 1 (the initial value), cloned 2 (the planner's working
+    // clone + the journal snapshot); all three must be dropped exactly once.
+    counter.assert_balanced();
+    assert_eq!(counter.dropped(), 3);
+}
+
 /// The look-ahead sweep's reused scratch (`copy_from`) deep-clones and drops
 /// heap-owning slots across sweeps without leaking or double-freeing.
 #[test]

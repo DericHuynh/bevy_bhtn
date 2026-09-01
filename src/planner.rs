@@ -36,7 +36,7 @@ use crate::selection::{DecompositionTrace, SelectionPolicy, TraceOutcome};
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
 use crate::order::{linearize, SubtaskOrder};
-use crate::state::PlanState;
+use crate::state::{DropFn, PlanState};
 use crate::tasks::Task;
 
 /// The method traversal record of a completed plan: the index of the chosen
@@ -218,19 +218,24 @@ unsafe impl Sync for Journal {}
 /// journal's copy back in, drop the journal's copy — every allocation has
 /// exactly one owner at every point. For plain-data slots the cloner is a
 /// memcpy, so the common case keeps the old cost.
-struct Rollback {
+struct Rollback<'a> {
     values: Journal,
     /// `(slot, journal offset)` per snapshot — the offset is stored because
     /// alignment padding between entries makes offsets not derivable from
     /// the current length.
     ops: Vec<(usize, usize)>,
+    /// The baked per-slot droppers: releases journal copies the search never
+    /// restored (a successful plan or a sanity-limit exit leaves snapshots on
+    /// the journal — the arena's `Drop` only deallocates bytes).
+    droppers: &'a [DropFn],
 }
 
-impl Rollback {
-    fn new(max_align: usize) -> Self {
+impl<'a> Rollback<'a> {
+    fn new(max_align: usize, droppers: &'a [DropFn]) -> Self {
         Self {
             values: Journal::new(max_align),
             ops: Vec::with_capacity(16),
+            droppers,
         }
     }
 
@@ -257,6 +262,18 @@ impl Rollback {
                 state.drop_journaled_slot(idx, self.values.ptr_at(start));
             }
             self.values.truncate(start);
+        }
+    }
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        // Snapshots the search never restored (successful-plan and
+        // sanity-limit exits) are still owned by the journal: drop each
+        // through its slot's baked dropper before the arena deallocates.
+        // Fully-restored searches leave `ops` empty, so this is a no-op there.
+        for &(idx, start) in &self.ops {
+            unsafe { (self.droppers[idx])(self.values.ptr_at(start)) };
         }
     }
 }
@@ -475,7 +492,10 @@ impl<'a> HtnPlanner<'a> {
         let mut seq_buf: Vec<usize> = Vec::with_capacity(8);
         // Rollback journal: snapshotted (deep-cloned) slot values + ops,
         // restored on backtrack down to the frame's length.
-        let mut rollback = Rollback::new(self.domain.components.max_align());
+        let mut rollback = Rollback::new(
+            self.domain.components.max_align(),
+            self.domain.components.droppers(),
+        );
         // Reusable look-ahead state clone: the sweep's lazily-created private
         // copy, reused across sweeps (`copy_from`, no re-allocation).
         let mut sweep_owned: Option<PlanState> = None;

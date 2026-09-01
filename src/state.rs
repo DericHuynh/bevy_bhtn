@@ -261,6 +261,12 @@ impl ComponentRegistry {
     pub(crate) fn max_align(&self) -> usize {
         self.layout.align
     }
+
+    /// The per-slot droppers (the planner's rollback journal releases
+    /// unrestored copies with them on drop).
+    pub(crate) fn droppers(&self) -> &[DropFn] {
+        &self.layout.droppers
+    }
 }
 
 impl std::fmt::Debug for ComponentRegistry {
