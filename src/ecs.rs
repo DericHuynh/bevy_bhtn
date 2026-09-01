@@ -53,6 +53,45 @@
 //! world has actually caught up — each drop triggers a replan from reality
 //! next tick. See `tests/htn_cdda_world.rs` for the full pattern end to end.
 //!
+//! # Hot-reloading domains (Subsecond)
+//!
+//! With the `hotpatching` feature (which enables `bevy_ecs/hotpatching`, the
+//! same [Dioxus Subsecond](https://dioxuslabs.com/learn/0.7/essentials/ui/hotreload/)
+//! engine behind Bevy's hot-patching), `HtnConfig` can carry a **domain
+//! rebuild closure** via [`HtnConfig::with_rebuild`]. The baked domain is
+//! *data* — compiled precondition/effect closures — so patching a task
+//! function's body does not retroactively change it. Instead, the driver
+//! watches [`bevy_ecs::HotPatchChanges`]; when a hot patch lands it
+//! **re-records and re-bakes the domain** through the rebuild closure (fresh
+//! closures resolve through the patched jump table), swaps it into the
+//! config, and drops every agent's plan so the next tick replans against the
+//! new behavior:
+//!
+//! ```ignore
+//! # use bevy_bhtn::prelude::*;
+//! # use bevy_ecs::prelude::*;
+//! # #[derive(Component, Clone, Default, Debug)] struct Ammo(u32);
+//! # fn engage(task: &mut TaskBuilder) { task.branch(); }
+//! let domain = HtnDomain::from_root(engage).build().unwrap();
+//! let config = HtnConfig::with_rebuild(domain, || {
+//!     // Re-run the recording. For best results wrap the body in
+//!     // `subsecond::call` (add `subsecond = "0.7"` to your deps) so the
+//!     // fresh recording resolves task functions through the latest patch:
+//!     HtnDomain::from_root(engage).build()
+//! });
+//! ```
+//!
+//! Run the game with the Dioxus CLI (`dx serve --hotpatch`) and edit task
+//! functions in the binary crate — the new closure bodies land in the baked
+//! domain on the next driver tick, with no restart and no lost world state.
+//!
+//! Limitations (mirroring Subsecond's): only the *tip* crate is tracked (task
+//! functions defined in a dependency crate are not observed); a rebuild that
+//! fails keeps the old domain; graph-shape changes are fine (plans are
+//! dropped wholesale and the scratchpad layout is rebuilt), but task
+//! *signature* changes (different component parameters) change the registry —
+//! supported, since the scratchpad is rebuilt from the new domain's registry.
+//!
 //! ```
 //! use bevy_bhtn::prelude::*;
 //! use bevy_ecs::prelude::*;
@@ -88,6 +127,7 @@ use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
 
 use crate::domain::HtnDomain;
+use crate::error::HtnResult;
 use crate::planner::{HtnPlanner, Plan};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, SearchOverride};
 use crate::state::PlanState;
@@ -123,6 +163,11 @@ pub struct HtnConfig {
     /// Whether the driver forwards [`DecompositionTrace`] events to
     /// `Messages<DecompositionTrace>` after each plan (default `false`).
     pub debug_trace: bool,
+    /// Domain rebuild closure for Subsecond hot-reloading (see the module
+    /// docs). Set via [`HtnConfig::with_rebuild`]; the driver re-records and
+    /// re-bakes the domain through it whenever a hot patch lands.
+    #[cfg(feature = "hotpatching")]
+    pub rebuild: Option<Box<dyn Fn() -> HtnResult<HtnDomain> + Send + Sync>>,
 }
 
 impl HtnConfig {
@@ -134,6 +179,24 @@ impl HtnConfig {
             lookahead: true,
             sanity_limit: 100,
             debug_trace: false,
+            #[cfg(feature = "hotpatching")]
+            rebuild: None,
+        }
+    }
+
+    /// Config with a **domain rebuild closure** for Subsecond hot-reloading
+    /// (requires the `hotpatching` feature). Whenever a hot patch lands, the
+    /// driver calls `rebuild` to re-record and re-bake the domain, swaps it
+    /// in, and drops every agent's plan so agents replan against the new
+    /// behavior. A rebuild that returns `Err` keeps the current domain.
+    #[cfg(feature = "hotpatching")]
+    pub fn with_rebuild(
+        domain: HtnDomain,
+        rebuild: impl Fn() -> HtnResult<HtnDomain> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            rebuild: Some(Box::new(rebuild)),
+            ..Self::new(domain)
         }
     }
 
@@ -171,6 +234,10 @@ impl HtnConfig {
 struct DriverScratch {
     entities: Vec<Entity>,
     state: Option<PlanState>,
+    /// The `HotPatchChanges` tick observed on the previous run (hot-reload
+    /// support): a different value means a patch landed between ticks.
+    #[cfg(feature = "hotpatching")]
+    hotpatch_tick: Option<u32>,
 }
 
 /// The AI driver: one exclusive-system tick for every [`HtnAgent`].
@@ -211,6 +278,49 @@ pub fn htn_ai_system(world: &mut World) {
         .remove_resource::<DriverScratch>()
         .expect("just inserted");
     scratch.entities.clear();
+
+    // Hot-reload pass (Subsecond): if a patch landed since the previous run
+    // and the config carries a rebuild closure, re-record + re-bake the
+    // domain, swap it in, and drop every agent's plan so the next tick
+    // replans against the new behavior. A failing rebuild keeps the old
+    // domain (the patch is still recorded as seen, so it is not retried).
+    #[cfg(feature = "hotpatching")]
+    {
+        use bevy_ecs::change_detection::DetectChanges as _;
+        let current = world
+            .get_resource_ref::<bevy_ecs::HotPatchChanges>()
+            .map(|r| r.last_changed().get())
+            .unwrap_or(0);
+        match scratch.hotpatch_tick {
+            // First observation: record the baseline, no rebuild.
+            None => scratch.hotpatch_tick = Some(current),
+            Some(seen) if seen != current => {
+                scratch.hotpatch_tick = Some(current);
+                world.resource_scope(|world, mut config: bevy_ecs::prelude::Mut<HtnConfig>| {
+                    if let Some(rebuild) = config.rebuild.as_deref() {
+                        if let Ok(new_domain) = rebuild() {
+                            config.domain = new_domain;
+                            // The new domain owns a fresh registry: the
+                            // parked scratchpad's layout is stale.
+                            scratch.state = None;
+                            // Every agent replans against the new domain.
+                            let mut agents =
+                                world.query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>();
+                            let patched: Vec<Entity> = agents.iter(world).collect();
+                            for entity in patched {
+                                if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
+                                    agent.plan = None;
+                                    agent.cursor = 0;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
     {
         let mut agents = world.query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>();
         scratch.entities.extend(agents.iter(world));

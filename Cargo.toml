@@ -10,8 +10,28 @@ smallvec = "1"
 thiserror = "2"
 ustr = "1.1.0"
 
+[features]
+# Hot-reload support via Dioxus Subsecond (the same engine behind Bevy's
+# `hotpatching` feature): when enabled, `HtnConfig` can carry a domain
+# rebuild closure and the driver re-records + re-bakes the domain whenever a
+# hot patch lands. See `src/ecs.rs` module docs.
+hotpatching = ["bevy_ecs/hotpatching"]
+
 [dev-dependencies]
+# Minimal-feature umbrella: bevy_bae's `tasks!` macro expands to
+# `::bevy::prelude::related!`, so the `bevy` crate must be in scope. Default
+# features stay off — only app/ecs (the same bevy_ecs 0.18 we use) compile.
+bevy = { version = "0.18", default-features = false }
+bevy_app = "0.18"
+bevy_bae = "0.1"
 bevy_ecs = { version = "0.18", features = ["multi_threaded"] }
+# Vendored copy of bevy_htnp (upstream's transitive `bevy-trait-query` git
+# dependency points at a repository deleted from GitHub, so upstream is
+# unbuildable; see third_party/bevy_htnp/Cargo.toml for the repairs).
+bevy_htnp = { path = "third_party/bevy_htnp" }
+# Handle on the bevy 0.14 that bevy_htnp pulls (renamed so both engine
+# generations coexist in the comparison bench).
+bevy14 = { package = "bevy", version = "0.14", default-features = false }
 criterion = "0.7"
 
 [[bench]]
@@ -28,4 +48,8 @@ harness = false
 
 [[bench]]
 name = "wide_sets"
+harness = false
+
+[[bench]]
+name = "competitor_comparison"
 harness = false

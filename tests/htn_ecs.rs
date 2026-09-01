@@ -198,3 +198,175 @@ fn goal_domain_reaches_goal_from_real_components() {
     }
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 3);
 }
+
+// ---------------------------------------------------------------------------
+// Subsecond hot-reload support (feature `hotpatching`): the driver detects a
+// patch via `HotPatchChanges`, re-records + re-bakes the domain through the
+// config's rebuild closure, and drops every agent's plan. The actual code
+// patching is the dx CLI's job; these tests pin the swap machinery.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "hotpatching")]
+mod hotpatch {
+    use super::*;
+
+    /// Two domains over the same component with different effect values, so a
+    /// successful rebuild is observable through the committed effect. Task
+    /// functions must be *named* (identity comes from `type_name`), so each
+    /// variant gets its own module.
+    mod writes_one {
+        use super::*;
+        pub fn root(task: &mut TaskBuilder) {
+            task.branch().precondition(|b: &Battery| b.0 >= 3);
+            task.branch().precondition(|b: &Battery| b.0 < 3).then(step);
+        }
+        pub fn step(task: &mut TaskBuilder) {
+            task.effect(|b: &mut Battery| b.0 = 1);
+        }
+    }
+    mod writes_two {
+        use super::*;
+        pub fn root(task: &mut TaskBuilder) {
+            task.branch().precondition(|b: &Battery| b.0 >= 3);
+            task.branch().precondition(|b: &Battery| b.0 < 3).then(step);
+        }
+        pub fn step(task: &mut TaskBuilder) {
+            task.effect(|b: &mut Battery| b.0 = 2);
+        }
+    }
+
+    fn domain_with_value(value: i32) -> HtnDomain {
+        match value {
+            1 => HtnDomain::from_root(writes_one::root).build().unwrap(),
+            2 => HtnDomain::from_root(writes_two::root).build().unwrap(),
+            _ => unreachable!("test domains write 1 or 2"),
+        }
+    }
+
+    /// Simulate a hot patch: insert (if missing) and bump `HotPatchChanges`.
+    fn land_patch(world: &mut World) {
+        if world.get_resource::<bevy_ecs::HotPatchChanges>().is_none() {
+            world.insert_resource(bevy_ecs::HotPatchChanges);
+        }
+        world
+            .resource_mut::<bevy_ecs::HotPatchChanges>()
+            .set_changed();
+    }
+
+    #[test]
+    fn hot_patch_rebuilds_domain_and_drops_plans() {
+        let mut world = World::new();
+        // Initial domain writes 1; the "patched" rebuild returns one that
+        // writes 7 — the observable behavior change.
+        world.insert_resource(HtnConfig::with_rebuild(domain_with_value(1), || {
+            Ok::<_, bevy_bhtn::HtnError>(domain_with_value(2))
+        }));
+        let entity = world.spawn((Battery(0), HtnAgent::default())).id();
+
+        // Tick 1: baseline observation (no rebuild), plan + execute → 1.
+        htn_ai_system(&mut world);
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
+
+        // A patch lands between ticks.
+        land_patch(&mut world);
+
+        // Tick 2: the driver rebuilds the domain (now writes 2), drops the
+        // agent's plan, and the agent replans + executes under the new
+        // domain in the same tick.
+        htn_ai_system(&mut world);
+        assert_eq!(
+            world.get::<Battery>(entity).unwrap().0,
+            2,
+            "the rebuilt domain's effect committed"
+        );
+
+        // No further patch: behavior is stable.
+        htn_ai_system(&mut world);
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 2);
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_the_old_domain() {
+        let mut world = World::new();
+        world.insert_resource(HtnConfig::with_rebuild(domain_with_value(1), || {
+            Err(bevy_bhtn::HtnError::builder("patch does not compile"))
+        }));
+        let entity = world.spawn((Battery(0), HtnAgent::default())).id();
+
+        htn_ai_system(&mut world);
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
+
+        land_patch(&mut world);
+        htn_ai_system(&mut world);
+        // The rebuild failed: the old domain still drives behavior (it
+        // writes 1 again), and the agent keeps planning normally.
+        assert_eq!(
+            world.get::<Battery>(entity).unwrap().0,
+            1,
+            "failed rebuild keeps the old domain"
+        );
+    }
+
+    #[test]
+    fn patch_without_rebuild_closure_is_a_noop() {
+        let mut world = World::new();
+        world.insert_resource(HtnConfig::new(domain_with_value(1)));
+        let entity = world.spawn((Battery(0), HtnAgent::default())).id();
+
+        htn_ai_system(&mut world);
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
+
+        land_patch(&mut world);
+        htn_ai_system(&mut world);
+        // No rebuild closure: the domain is untouched (still writes 1).
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
+    }
+
+    /// A rebuild that changes the registry (a new component enters the
+    /// domain) is supported: the parked scratchpad is dropped and rebuilt
+    /// from the new registry, and agents replan cleanly.
+    #[test]
+    fn rebuild_with_new_component_resets_the_scratchpad() {
+        use bevy_bhtn::state::PlanComponent;
+
+        #[derive(Component, Clone, Default, Debug, PartialEq)]
+        struct Extra(i32);
+
+        fn domain_with_extra() -> HtnDomain {
+            fn root(task: &mut TaskBuilder) {
+                task.branch().precondition(|b: &Battery| b.0 >= 3);
+                task.branch().precondition(|b: &Battery| b.0 < 3).then(step);
+            }
+            fn step(task: &mut TaskBuilder) {
+                task.precondition(|e: &Extra| e.0 == 0)
+                    .effect(|b: &mut Battery| b.0 = 7)
+                    .effect(|e: &mut Extra| e.0 = 9);
+            }
+            HtnDomain::from_root(root).build().unwrap()
+        }
+        fn plain_domain() -> HtnDomain {
+            domain_with_value(1)
+        }
+
+        let mut world = World::new();
+        world.insert_resource(HtnConfig::with_rebuild(plain_domain(), || {
+            Ok::<HtnDomain, bevy_bhtn::HtnError>(domain_with_extra())
+        }));
+        let entity = world
+            .spawn((Battery(0), Extra(0), HtnAgent::default()))
+            .id();
+
+        htn_ai_system(&mut world);
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
+
+        land_patch(&mut world);
+        htn_ai_system(&mut world);
+        // The rebuilt domain's step wrote both components: the scratchpad was
+        // rebuilt against the new registry and the agent replanned.
+        assert_eq!(world.get::<Battery>(entity).unwrap().0, 7);
+        assert_eq!(world.get::<Extra>(entity).unwrap().0, 9);
+
+        fn _assert_component<T: PlanComponent>() {}
+        _assert_component::<Extra>();
+    }
+}

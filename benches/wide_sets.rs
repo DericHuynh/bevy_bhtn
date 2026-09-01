@@ -2,7 +2,7 @@
 //! (`any_order`) versus the two alternatives a CDDA-style game would choose
 //! between, plus the wide-set cap behavior.
 //!
-//! All groups run the **plan → execute-one-step → replan cycle** per measured
+//! All groups run one **plan → execute-the-full-plan** episode per measured
 //! iteration (state reset per iteration) and call the planner directly,
 //! isolating scheduling cost from ECS overhead.
 //!
@@ -42,6 +42,8 @@ use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
+
+use common::execute_plan;
 
 #[derive(Component, Clone, Default, Debug, PartialEq)]
 struct Key(bool);
@@ -92,24 +94,13 @@ fn fetch_one(task: &mut TaskBuilder) {
         .effect(|t: &mut Touched| t.0 += 1);
 }
 
-/// Plan + execute one step + replan `REPLAN_CYCLES` times per iteration.
+/// Plan, then execute the full plan, once per iteration.
 fn plan_cycle(domain: &HtnDomain, root: &str, state: &PlanState, planner: &mut HtnPlanner) {
     let mut state = state.clone();
-    for _ in 0..REPLAN_CYCLES {
-        let plan = planner.plan(root, black_box(&state));
-        // Execute one step against the scratchpad (the shared helper needs a
-        // World; for direct-planner measurement committing the step's effects
-        // to the scratchpad is the equivalent work).
-        if let Some(idx) = plan.step_task(0) {
-            if let bevy_bhtn::tasks::Task::Primitive(p) = &domain.tasks[idx] {
-                p.apply_effects(&mut state);
-            }
-        }
-        black_box(plan.task_names().len());
-    }
+    let plan = planner.plan(root, black_box(&state));
+    execute_plan(domain, &mut state, &plan);
+    black_box(plan.task_names().len());
 }
-
-const REPLAN_CYCLES: usize = 1;
 
 fn bench_wide_sets(c: &mut Criterion) {
     // --- set_vs_chain_8 -----------------------------------------------------
@@ -130,7 +121,7 @@ fn bench_wide_sets(c: &mut Criterion) {
         let s_set = PlanState::build(&d_set.components).finish();
 
         let mut group = c.benchmark_group("set_vs_chain_8");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, domain, state, root) in [
             ("chain", &d_chain, &s_chain, "chain8"),
             ("any_order", &d_set, &s_set, "set8"),
@@ -159,7 +150,7 @@ fn bench_wide_sets(c: &mut Criterion) {
         let s_set = PlanState::build(&d_set.components).finish();
 
         let mut group = c.benchmark_group("set_retry_vs_chain_2");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, domain, state, root) in [
             ("chain", &d_chain, &s_chain, "chain2"),
             ("one_retry", &d_set, &s_set, "set2"),
@@ -189,7 +180,7 @@ fn bench_wide_sets(c: &mut Criterion) {
         let s_set = PlanState::build(&d_set.components).finish();
 
         let mut group = c.benchmark_group("recursion_vs_set_fetch");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, domain, state, root) in [
             ("recursive_16_items", &d_rec, &s_rec, "fetch_all"),
             ("set_8_members", &d_set, &s_set, "set8"),
@@ -220,7 +211,7 @@ fn bench_wide_sets(c: &mut Criterion) {
         let s4 = PlanState::build(&d4.components).finish();
 
         let mut group = c.benchmark_group("wide_set_buried_dependency");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, domain, state, root) in [
             ("members_8_beyond_cap", &d8, &s8, "wide8"),
             ("members_4_within_cap", &d4, &s4, "wide4"),

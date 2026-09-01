@@ -151,7 +151,7 @@ only the slots each effect writes (plain-data slots clone as a `memcpy`).
 Task names are interned [`Ustr`]s; the driver reuses one scratchpad and
 zero steady-state allocations.
 
-Benchmarks (Criterion, plan → execute-one-step → replan ×10 per iteration):
+Benchmarks (Criterion, one plan-and-execute episode per measured iteration):
 
 ```
 cargo bench -p bevy_bhtn
@@ -161,6 +161,7 @@ cargo bench -p bevy_bhtn
 - `deep_ai` — deep outpost domain with relationship reads
 - `lookahead` — look-ahead on/off A/B (exponential-backtrack and doomed-recursion wins)
 - `wide_sets` — unordered-set scheduling cost vs. chains and recursion
+- `competitor_comparison` — like-for-like against `bevy_bae` and `bevy_htnp` on a shared fetch-item domain (one episode per actor + population planning frames)
 
 ## Testing
 

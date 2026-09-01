@@ -11,10 +11,11 @@
 //!
 //! Like the miner bench, this runs through a real Bevy `Schedule` with
 //! `Query::par_iter_mut` over the multi-threaded executor at 10k / 50k / 200k
-//! entities, plus single-actor latency cases — and per actor it runs a
-//! **plan → execute → replan cycle 10 times** against the cache-seeded working
-//! scratchpad (rebuilt from the colonist's immutable seed every run, so every
-//! measured iteration starts from identical states without a reset pass).
+//! entities, plus single-actor overhead cases — and per actor it runs one
+//! **complete AI episode**: plan against the cache-seeded working scratchpad,
+//! then execute **every step** of the plan (the scratchpad is rebuilt from
+//! the colonist's immutable seed every run, so every measured iteration
+//! starts from identical states without a reset pass).
 
 mod common;
 
@@ -30,12 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ustr::Ustr;
 
 use common::{
-    execute_plan_step, outpost_domain, outpost_scratch, Ammo, Food, Fuel, Health, Morale, Zone,
+    execute_plan, outpost_domain, outpost_scratch, Ammo, Food, Fuel, Health, Morale, Zone,
 };
-
-/// How many plan → execute → replan cycles each actor runs per measured
-/// iteration.
-const REPLAN_CYCLES: usize = 1;
 
 /// The root task of the outpost domain (the task function's name).
 const ROOT: &str = "secure_outpost";
@@ -115,9 +112,9 @@ fn apply_cache(domain: &HtnDomain, state: &mut PlanState, cache: &CacheResources
 
 /// The AI system: for each colonist, use its `ServesCache` relationship to find
 /// its supply cache, seed a working scratchpad from its immutable seed plus the
-/// cache share, then run the 10-cycle plan → execute → replan loop and write
-/// the final plan. The seed stays immutable (the cache-seeded scratchpad is
-/// ephemeral), so measured iterations need no reset pass.
+/// cache share, then plan and execute the full plan. The seed stays immutable
+/// (the cache-seeded scratchpad is ephemeral), so measured iterations need no
+/// reset pass.
 fn run_ai(
     resources: Res<HtnResources>,
     caches: Res<CacheStore>,
@@ -137,11 +134,8 @@ fn run_ai(
             scratch.0 = seed.0.clone();
             apply_cache(domain, &mut scratch.0, &cache);
             let mut planner = HtnPlanner::new(domain);
-            let mut planned = planner.plan(ROOT, &scratch.0);
-            for _ in 0..REPLAN_CYCLES {
-                execute_plan_step(domain, &mut scratch.0, &planned);
-                planned = planner.plan(ROOT, &scratch.0);
-            }
+            let planned = planner.plan(ROOT, &scratch.0);
+            execute_plan(domain, &mut scratch.0, &planned);
             output.0 = planned.task_names().to_vec();
             processed.0.fetch_add(1, Ordering::Relaxed);
         });
@@ -215,17 +209,18 @@ pub fn deep_planner(c: &mut Criterion) {
         });
     }
 
-    // Single-actor deep latency: the same 10-cycle replan loop, working state
-    // reset per iteration.
-    group.bench_function("deep_plan_one_actor_latency", |b| {
+    // Single-actor deep latency: the same work shape as `run_ai` — one plan,
+    // then execute the full plan — with the working state reset per iteration.
+    // Throughput pinned to 1 element (the group-wide setting still holds 200k
+    // from the frame loop above).
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("deep_plan_one_actor_overhead", |b| {
         b.iter(|| {
             let mut state = single_state.clone();
             let mut planner = HtnPlanner::new(&domain);
-            for _ in 0..REPLAN_CYCLES {
-                let plan = planner.plan(ROOT, &state);
-                execute_plan_step(&domain, &mut state, &plan);
-                black_box(&plan);
-            }
+            let plan = planner.plan(ROOT, &state);
+            execute_plan(&domain, &mut state, &plan);
+            black_box(&plan);
         });
     });
     // Also a seed with relation resources to keep the deep benchmark honest.
@@ -246,11 +241,9 @@ pub fn deep_planner(c: &mut Criterion) {
         b.iter(|| {
             let mut state = seeded_state.clone();
             let mut planner = HtnPlanner::new(&domain);
-            for _ in 0..REPLAN_CYCLES {
-                let plan = planner.plan(ROOT, &state);
-                execute_plan_step(&domain, &mut state, &plan);
-                black_box(&plan);
-            }
+            let plan = planner.plan(ROOT, &state);
+            execute_plan(&domain, &mut state, &plan);
+            black_box(&plan);
         });
     });
 

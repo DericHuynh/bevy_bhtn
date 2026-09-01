@@ -4,13 +4,12 @@
 //! actors living as **real Bevy entities**, each carrying the shared miner
 //! domain (the canonical HTN miner example) as a dense [`PlanState`]
 //! scratchpad component. A Bevy system iterates the entity query every "tick"
-//! and, per entity, runs a **plan → execute → replan cycle 10 times**: the
-//! plan's effects are applied to the actor's scratchpad (via
-//! [`common::execute_plan_step`], the same execution semantics the integration
-//! tests pin), the mutated state is re-planned, and the final plan is written
-//! back into the actor's `PlanOutput` component. States are reset to their
-//! spawn-time seed at the start of every measured iteration, so each
-//! iteration does identical, deterministic work.
+//! and, per entity, runs one **complete AI episode**: plan from the actor's
+//! scratchpad, then execute **every step** of the plan against it (via
+//! [`common::execute_plan`], the same execution semantics the integration
+//! tests pin), writing the plan into the actor's `PlanOutput` component.
+//! States are reset to their spawn-time seed at the start of every measured
+//! iteration, so each iteration does identical, deterministic work.
 //!
 //! This is upstream of the reference examples, which drive only a handful of
 //! actors; here we scale to **200k** simultaneous entities.
@@ -27,13 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ustr::Ustr;
 
 use common::{
-    execute_plan_step, miner_domain, miner_scratch, Energy, Gold, HasMetal, HasOre, Hunger,
-    Location,
+    execute_plan, miner_domain, miner_scratch, Energy, Gold, HasMetal, HasOre, Hunger, Location,
 };
-
-/// How many plan → execute → replan cycles each actor runs per measured
-/// iteration (the mid-execution replanning loop a real AI tick performs).
-const REPLAN_CYCLES: usize = 1;
 
 /// The root task of the miner domain (the task function's name).
 const ROOT: &str = "earn_gold";
@@ -65,8 +59,9 @@ struct HtnResources {
     domain: HtnDomain,
 }
 
-/// The AI system: for every miner entity, run the replan cycle over its
-/// scratchpad and write the final plan into its `PlanOutput` component.
+/// The AI system: for every miner entity, plan over its scratchpad, execute
+/// the full plan against it, and write the plan into its `PlanOutput`
+/// component.
 ///
 /// Runs the query in **parallel** via [`Query::par_iter_mut`], the per-frame AI
 /// cost. Each closure builds its own [`HtnPlanner`] (an immutable `domain`
@@ -82,11 +77,8 @@ fn run_ai(
     q.par_iter_mut().for_each(|(mut scratch, mut output)| {
         let domain = &resources.domain;
         let mut planner = HtnPlanner::new(domain);
-        let mut planned = planner.plan(ROOT, &scratch.0);
-        for _ in 0..REPLAN_CYCLES {
-            execute_plan_step(domain, &mut scratch.0, &planned);
-            planned = planner.plan(ROOT, &scratch.0);
-        }
+        let planned = planner.plan(ROOT, &scratch.0);
+        execute_plan(domain, &mut scratch.0, &planned);
         output.0 = planned.task_names().to_vec();
         processed.0.fetch_add(1, Ordering::Relaxed);
     });
@@ -177,17 +169,20 @@ pub fn miner_planner(c: &mut Criterion) {
         });
     }
 
-    // Single-actor latency done straight through the planner (no ECS
-    // overhead): the same 10-cycle replan loop, state reset per iteration.
-    group.bench_function("plan_one_actor_latency", |b| {
+    // Single-actor overhead done straight through the planner (no ECS
+    // overhead): the same work shape as `run_ai` — one plan, then execute the
+    // full plan — with state reset per iteration. Throughput is pinned to 1
+    // element so Criterion's (stateful, group-wide) thrpt column doesn't
+    // inherit the 200k from the frame loop above and print nonsense Gelem/s
+    // for a latency number.
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("plan_one_actor_overhead", |b| {
         b.iter(|| {
             let mut state = single_state.clone();
             let mut planner = HtnPlanner::new(&domain);
-            for _ in 0..REPLAN_CYCLES {
-                let plan = planner.plan(ROOT, &state);
-                execute_plan_step(&domain, &mut state, &plan);
-                black_box(&plan);
-            }
+            let plan = planner.plan(ROOT, &state);
+            execute_plan(&domain, &mut state, &plan);
+            black_box(&plan);
         });
     });
 

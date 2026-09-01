@@ -3,7 +3,7 @@
 //! Measures what the look-ahead sweep (`src/lookahead.rs`, Olz & Bercher SoCS
 //! 2023) buys — and what it costs — by planning the **same domains** (the
 //! shared function-defined fixtures) with [`HtnPlanner::set_lookahead`] on vs
-//! off, each running the same **plan → execute → replan cycle 10 times** per
+//! off, each running the same **plan → execute-the-full-plan** episode per
 //! measured iteration (state reset per iteration, so every iteration does
 //! identical work):
 //!
@@ -37,13 +37,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
 use common::{
-    doomed_recursion_domain, execute_plan_step, fresh_outpost, gate_domain, outpost_domain,
+    doomed_recursion_domain, execute_plan, fresh_outpost, gate_domain, outpost_domain,
     outpost_scratch,
 };
-
-/// How many plan → execute → replan cycles each case runs per measured
-/// iteration.
-const REPLAN_CYCLES: usize = 1;
 
 fn bench_lookahead(c: &mut Criterion) {
     // --- exponential_backtrack: 2^12 leaf failures vs one sweep ------------
@@ -52,7 +48,7 @@ fn bench_lookahead(c: &mut Criterion) {
         let initial = PlanState::build(&domain.components).finish();
 
         let mut group = c.benchmark_group("exponential_backtrack");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, on) in [("off", false), ("on", true)] {
             let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
@@ -62,11 +58,9 @@ fn bench_lookahead(c: &mut Criterion) {
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("gate_root", black_box(&state));
-                        execute_plan_step(&domain, &mut state, &plan);
-                        black_box(plan.task_names().len());
-                    }
+                    let plan = planner.plan("gate_root", black_box(&state));
+                    execute_plan(&domain, &mut state, &plan);
+                    black_box(plan.task_names().len());
                 })
             });
         }
@@ -79,18 +73,16 @@ fn bench_lookahead(c: &mut Criterion) {
         let initial = PlanState::build(&domain.components).finish();
 
         let mut group = c.benchmark_group("doomed_recursion");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, on) in [("off", false), ("on", true)] {
             let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("act", black_box(&state));
-                        execute_plan_step(&domain, &mut state, &plan);
-                        black_box(plan.task_names().len());
-                    }
+                    let plan = planner.plan("act", black_box(&state));
+                    execute_plan(&domain, &mut state, &plan);
+                    black_box(plan.task_names().len());
                 })
             });
         }
@@ -103,18 +95,16 @@ fn bench_lookahead(c: &mut Criterion) {
         let initial = outpost_scratch(&domain, fresh_outpost());
 
         let mut group = c.benchmark_group("outpost_deep");
-        group.throughput(criterion::Throughput::Elements(REPLAN_CYCLES as u64));
+        group.throughput(criterion::Throughput::Elements(1));
         for (label, on) in [("off", false), ("on", true)] {
             let mut planner = HtnPlanner::new(&domain);
             planner.set_lookahead(on);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    for _ in 0..REPLAN_CYCLES {
-                        let plan = planner.plan("secure_outpost", black_box(&state));
-                        execute_plan_step(&domain, &mut state, &plan);
-                        black_box(plan.task_names().len());
-                    }
+                    let plan = planner.plan("secure_outpost", black_box(&state));
+                    execute_plan(&domain, &mut state, &plan);
+                    black_box(plan.task_names().len());
                 })
             });
         }
