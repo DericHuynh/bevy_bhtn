@@ -131,7 +131,7 @@ use crate::error::HtnResult;
 use crate::planner::{HtnPlanner, Plan};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, SearchOverride};
 use crate::state::PlanState;
-use crate::tasks::Task;
+use crate::domain::Task;
 
 /// The per-entity AI component: current plan and cursor.
 ///

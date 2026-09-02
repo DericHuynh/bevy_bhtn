@@ -20,9 +20,10 @@
 //! - **Inert without annotations**: primitives without `cost`/`cost_fn`
 //!   count 0, so CostBounded degenerates to exactly DepthFirst's choice.
 
+use bevy_bhtn::domain::SelectionPolicy;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_bhtn::selection::{HtnSearchStrategy, SearchOverride, SelectionPolicy};
+use bevy_bhtn::selection::{HtnSearchStrategy, SearchOverride};
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::HtnDomain;

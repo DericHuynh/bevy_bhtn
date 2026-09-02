@@ -11,7 +11,7 @@
 mod common;
 
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_bhtn::tasks::Task;
+use bevy_bhtn::Task;
 use ustr::Ustr;
 
 use common::{

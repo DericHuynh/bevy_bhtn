@@ -33,7 +33,7 @@ use crate::domain::HtnDomain;
 use crate::error::{HtnError, HtnResult};
 use crate::planner::Plan;
 use crate::state::PlanState;
-use crate::tasks::Task;
+use crate::domain::Task;
 
 /// One candidate commitment: a primitive task, or a compound task via one of
 /// its methods (whose whole subtask sequence would be committed).

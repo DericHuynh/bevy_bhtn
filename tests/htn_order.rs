@@ -19,12 +19,13 @@
 //! - **Builder validation**: cyclic `before` constraints and >64-member sets
 //!   are build errors.
 
+use bevy_bhtn::domain::Task;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::order::SubtaskOrder;
 use bevy_bhtn::planner::HtnPlanner;
-use bevy_bhtn::selection::SelectionPolicy;
+use bevy_bhtn::domain::SelectionPolicy;
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::{Task, TaskBuilder};
+use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 

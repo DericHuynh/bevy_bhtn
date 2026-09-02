@@ -61,6 +61,7 @@ pub mod ecs;
 pub mod error;
 pub mod gtn;
 pub mod lookahead;
+pub mod mcts;
 pub mod order;
 pub mod planner;
 pub mod selection;
@@ -72,7 +73,8 @@ pub use back_planner::*;
 pub use domain::*;
 pub use error::*;
 pub use order::*;
-pub use summaries::{FieldSet, TaskSummary};
+pub use state::{FieldSet, PlanComponent, PlanState};
+pub use summaries::TaskSummary;
 pub use tasks::*;
 
 /// Convenience re-exports for crate-wide use.
@@ -82,10 +84,11 @@ pub mod prelude {
     pub use crate::ecs::*;
     pub use crate::error::*;
     pub use crate::gtn::*;
+    pub use crate::mcts::*;
     pub use crate::order::*;
     pub use crate::planner::*;
     pub use crate::selection::*;
     pub use crate::state::*;
-    pub use crate::summaries::{FieldSet, TaskSummary};
+    pub use crate::summaries::TaskSummary;
     pub use crate::tasks::*;
 }

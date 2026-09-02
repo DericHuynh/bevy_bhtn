@@ -31,13 +31,14 @@ use std::ptr::NonNull;
 use smallvec::SmallVec;
 use ustr::Ustr;
 
-use crate::selection::{DecompositionTrace, SelectionPolicy, TraceOutcome};
+use crate::domain::SelectionPolicy;
+use crate::selection::{DecompositionTrace, TraceOutcome};
 
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
 use crate::order::{linearize, SubtaskOrder};
 use crate::state::{PlanState, Slot};
-use crate::tasks::Task;
+use crate::domain::Task;
 
 /// The method traversal record of a completed plan: the index of the chosen
 /// method at each decomposition level. Used to compare plans by priority
@@ -519,7 +520,7 @@ impl<'a> HtnPlanner<'a> {
         let mut plan: Vec<usize> = Vec::with_capacity(8);
         // Reusable look-ahead scratch: the sweep's "unknown components" overlay
         // and its inevitable-refinement output, cleared per sweep.
-        let mut sweep_unknown = crate::summaries::FieldSet::new(self.domain.components.len());
+        let mut sweep_unknown = crate::state::FieldSet::new(self.domain.components.len());
         let mut sweep_pins: Vec<(usize, usize)> = Vec::with_capacity(4);
         // Reusable survivor buffer for the sweep's single-pass compound check.
         let mut sweep_surviving: Vec<usize> = Vec::with_capacity(8);

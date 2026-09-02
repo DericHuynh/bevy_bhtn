@@ -39,8 +39,9 @@
 
 use crate::domain::HtnDomain;
 use crate::state::PlanState;
-use crate::summaries::FieldSet;
-use crate::tasks::{Precondition, Task};
+use crate::state::FieldSet;
+use crate::domain::Task;
+use crate::tasks::Precondition;
 
 /// The verdict of one look-ahead sweep.
 ///

@@ -296,6 +296,107 @@ impl ComponentRegistry {
     }
 }
 
+/// A compact bitset over the domain's component-slot indices (the registry's
+/// dense slot table above).
+///
+/// All operations assume both sets share the same universe (the same domain's
+/// component table). Slot indices are dense and domains touch only a handful
+/// of components, so a `Vec<u64>` bitset keeps set operations to a few word
+/// ops in the planner's hot path. This is the vocabulary of the bake-time
+/// analysis ([`TaskSummary`](crate::summaries::TaskSummary) read/write sets,
+/// the look-ahead sweep's "unknown components" overlay, the backward
+/// planner's coverage scoring) — it lives here because the universe it
+/// indexes is the registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldSet {
+    bits: Vec<u64>,
+}
+
+impl FieldSet {
+    /// An empty set over a universe of `universe` slots.
+    pub fn new(universe: usize) -> Self {
+        let words = universe.div_ceil(64);
+        Self {
+            bits: vec![0; words],
+        }
+    }
+
+    /// Add slot `idx` to the set.
+    pub fn insert(&mut self, idx: usize) {
+        let (word, bit) = (idx / 64, idx % 64);
+        if word < self.bits.len() {
+            self.bits[word] |= 1 << bit;
+        }
+    }
+
+    /// Whether slot `idx` is in the set.
+    pub fn contains(&self, idx: usize) -> bool {
+        let (word, bit) = (idx / 64, idx % 64);
+        word < self.bits.len() && self.bits[word] & (1 << bit) != 0
+    }
+
+    /// Remove slot `idx` from the set.
+    pub fn remove(&mut self, idx: usize) {
+        let (word, bit) = (idx / 64, idx % 64);
+        if word < self.bits.len() {
+            self.bits[word] &= !(1 << bit);
+        }
+    }
+
+    /// Remove every slot from the set.
+    pub fn clear(&mut self) {
+        self.bits.fill(0);
+    }
+
+    /// Add every slot of `other` to this set.
+    pub fn union_with(&mut self, other: &Self) {
+        for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *w |= o;
+        }
+    }
+
+    /// Keep only slots present in both sets.
+    pub fn intersect_with(&mut self, other: &Self) {
+        for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *w &= o;
+        }
+    }
+
+    /// Remove every slot of `other` from this set.
+    pub fn subtract(&mut self, other: &Self) {
+        for (w, o) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *w &= !o;
+        }
+    }
+
+    /// Whether every slot of this set is also in `other`.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.bits
+            .iter()
+            .zip(other.bits.iter())
+            .all(|(a, b)| a & !b == 0)
+    }
+
+    /// Whether the set contains no slots.
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|w| *w == 0)
+    }
+
+    /// The number of slots in the set.
+    pub fn count(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Iterate the slot indices in the set, in ascending order.
+    pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(w, bits)| {
+            (0..64)
+                .filter(move |bit| bits & (1 << bit) != 0)
+                .map(move |bit| w * 64 + bit)
+        })
+    }
+}
+
 impl std::fmt::Debug for ComponentRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComponentRegistry")

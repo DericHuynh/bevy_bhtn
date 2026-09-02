@@ -1,15 +1,14 @@
-//! Branch-selection policies, search strategies, and the trace contract.
+//! Search strategies and the decomposition-trace contract.
 //!
-//! Two orthogonal axes live here:
-//!
-//! - **Selection policies** ([`SelectionPolicy`]) are baked into compound
-//!   tasks and govern the *order in which valid branches are offered* to the
-//!   search. They never override preconditions — only valid branches are
-//!   ranked.
 //! - **Search strategies** ([`HtnSearchStrategy`]) govern *how the task
 //!   network is expanded* (the planner's algorithm). They live on
 //!   [`HtnConfig`](crate::ecs::HtnConfig) and can be overridden per agent via
 //!   the [`SearchOverride`] component.
+//! - **Tracing** ([`DecompositionTrace`]) is the driver bridge: one event per
+//!   branch commitment when tracing is enabled.
+//!
+//! (Branch-*selection* policies — the baked per-task branch ranking — live
+//! with the baked network in [`crate::domain`].)
 
 use std::sync::Arc;
 
@@ -19,66 +18,6 @@ use bevy_ecs::prelude::Component;
 use crate::domain::HtnDomain;
 use crate::planner::Plan;
 use crate::state::PlanState;
-
-// ---------------------------------------------------------------------------
-// Selection policies
-// ---------------------------------------------------------------------------
-
-/// How a compound task's *valid* branches are ranked before the planner
-/// descends. Applied after precondition evaluation — only valid branches are
-/// ranked, and a look-ahead pin (unique surviving method) overrides ranking
-/// entirely.
-#[derive(Clone, Default)]
-pub enum SelectionPolicy {
-    /// Branches are tried in declaration order (the default; what the
-    /// planner has always done).
-    #[default]
-    FirstMatch,
-
-    /// All valid branches are scored by their `utility` closure (branches
-    /// without one score 0); the highest wins. Ties break by declaration
-    /// order. Deterministic: backtracking re-derives the same order.
-    HighestUtility,
-
-    /// Valid branches are sampled without replacement, proportional to their
-    /// utility scores (branches without one weigh 1.0). The sampled order is
-    /// snapshotted into the decomposition frame, so backtracking exhausts the
-    /// sampled order instead of re-sampling — completeness is preserved.
-    ///
-    /// Sampling is stateless and deterministic: the permutation is derived
-    /// from `seed` and the choice point's position in the plan, so the same
-    /// state always yields the same order (stable replans).
-    WeightedRandom {
-        /// Seed for the deterministic weighted sampler.
-        seed: u64,
-    },
-
-    /// The caller supplies the comparator at domain-build time. The ranker
-    /// must be deterministic for a given `(candidates, state)` pair, and its
-    /// output must be a permutation of the candidate indices (missing
-    /// candidates are appended in declaration order so no branch is lost).
-    Custom(Arc<dyn BranchRanker>),
-}
-
-/// One valid branch offered to a [`BranchRanker`].
-pub struct BranchCandidate<'a> {
-    /// The branch's declaration index (its MTR identity).
-    pub index: u32,
-    /// The branch's declared name, if any.
-    pub name: Option<&'static str>,
-    /// The branch's declared static utility, if any.
-    pub utility: Option<f32>,
-    /// The branch's subtask list (task indices, for structural heuristics).
-    pub subtasks: &'a [u32],
-}
-
-/// Ranks *valid* branch candidates. Implementations must be deterministic
-/// for a given `(candidates, state)` pair.
-pub trait BranchRanker: Send + Sync {
-    /// Appends the candidate indices to `out` in preferred order. Scratch-
-    /// buffer signature: no per-node allocation inside the planner.
-    fn rank(&self, candidates: &[BranchCandidate<'_>], state: &PlanState, out: &mut Vec<u32>);
-}
 
 // ---------------------------------------------------------------------------
 // Search strategies

@@ -208,7 +208,7 @@ pub(crate) fn apply_sharing(
         };
         let comp = TaskProto::Compound {
             methods: vec![mom, moa],
-            policy: crate::selection::SelectionPolicy::default(),
+            policy: crate::domain::SelectionPolicy::default(),
         };
 
         rec.tasks.push((comp_ref, comp_name, comp));
@@ -293,7 +293,7 @@ pub(crate) fn apply_insertion(
     }
     let insert = TaskProto::Compound {
         methods,
-        policy: crate::selection::SelectionPolicy::default(),
+        policy: crate::domain::SelectionPolicy::default(),
     };
 
     // Splice gaps into every non-synthetic *total-order* body. Partially

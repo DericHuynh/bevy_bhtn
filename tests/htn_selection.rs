@@ -6,11 +6,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use bevy_bhtn::domain::{BranchCandidate, BranchRanker, SelectionPolicy};
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::selection::{
-    BranchCandidate, BranchRanker, DecompositionTrace, HtnSearchStrategy, SearchOverride, Searcher,
-    SelectionPolicy, TraceOutcome,
+    DecompositionTrace, HtnSearchStrategy, SearchOverride, Searcher, TraceOutcome,
 };
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
@@ -43,7 +43,7 @@ fn named_branches_are_recorded() {
 
     let domain = HtnDomain::from_root(root).build().unwrap();
     let methods = match domain.get_task("root").unwrap() {
-        bevy_bhtn::tasks::Task::Compound(c) => &c.methods,
+        bevy_bhtn::Task::Compound(c) => &c.methods,
         _ => panic!("root is compound"),
     };
     assert_eq!(methods[0].name, Some("snipe"));
@@ -306,7 +306,7 @@ fn cost_is_recorded_on_primitives() {
     }
 
     let domain = HtnDomain::from_root(root).build().unwrap();
-    let bevy_bhtn::tasks::Task::Primitive(p) = domain.get_task("cheap").unwrap() else {
+    let bevy_bhtn::Task::Primitive(p) = domain.get_task("cheap").unwrap() else {
         panic!("cheap is primitive");
     };
     assert!(p.cost.is_some());

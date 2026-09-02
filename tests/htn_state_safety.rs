@@ -759,4 +759,4 @@ fn backward_plan_is_a_compiled_program() {
     assert_eq!(p.name, "earn");
 }
 
-use bevy_bhtn::tasks::Task;
+use bevy_bhtn::Task;
