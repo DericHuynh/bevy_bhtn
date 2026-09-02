@@ -8,7 +8,7 @@
 mod common;
 
 use bevy_bhtn::back_planner::BackPlanner;
-use bevy_bhtn::planner::{HtnPlanner, Mtr, Plan};
+use bevy_bhtn::planner::{HtnPlanner, Mtr, Plan, PlanStatus};
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::{GoalBuilder, HtnDomain, HtnError, Task};
@@ -777,11 +777,13 @@ fn plan_mtr_ordering() {
         steps: vec![0],
         names: vec!["A".into()],
         mtr: Mtr(vec![0]),
+        status: PlanStatus::Complete,
     };
     let high = Plan {
         steps: vec![1],
         names: vec!["B".into()],
         mtr: Mtr(vec![1]),
+        status: PlanStatus::Complete,
     };
     assert!(low.is_preferred_over(&high));
     assert!(!high.is_preferred_over(&low));

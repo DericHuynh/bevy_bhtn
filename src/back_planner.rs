@@ -101,6 +101,9 @@ impl<'a> BackPlanner<'a> {
                     .collect(),
                 steps,
                 mtr: crate::planner::Mtr::default(),
+                // Reverse chaining runs to completion or errors — never a
+                // truncated prefix.
+                status: crate::planner::PlanStatus::Complete,
             })
         } else {
             Err(HtnError::NoPlan)

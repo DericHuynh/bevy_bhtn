@@ -432,6 +432,7 @@ impl Searcher for FixedSearcher {
             steps: vec![idx as u32],
             names: vec!["works".into()],
             mtr: bevy_bhtn::planner::Mtr(vec![1]),
+            status: bevy_bhtn::planner::PlanStatus::Complete,
         })
     }
 }

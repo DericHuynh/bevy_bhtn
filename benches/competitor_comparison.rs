@@ -385,6 +385,10 @@ mod bhtn_side {
         let plan = planner.plan("deep_root", &state);
         // The plan must be the full corridor — a partial plan here means the
         // sanity limit bit and the bench is comparing less work (pinned).
+        assert!(
+            plan.is_complete(),
+            "deep plan was truncated by the sanity limit"
+        );
         assert_eq!(plan.steps.len(), DEPTH as usize + 1, "deep plan truncated");
         let steps = plan.task_names().len();
         crate::common::execute_plan(domain, &mut state, &plan);

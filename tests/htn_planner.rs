@@ -656,6 +656,10 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(1000);
     let plan = planner.plan("wide_root", &state);
+    assert!(
+        plan.is_complete(),
+        "the raised budget fully refutes the doomed branch"
+    );
     assert_eq!(plan.task_names(), ["strike", "leaf_check"]);
 
     // And the look-ahead agrees (same plan, found without the doomed branch's
@@ -666,4 +670,60 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
         la.plan("wide_root", &state).task_names(),
         ["strike", "leaf_check"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan status — Complete vs Partial (sanity budget / fail-fast)
+// ---------------------------------------------------------------------------
+
+/// `Plan::status` tells a finished decomposition from one the search cut
+/// short: terminating domains plan `Complete`; a decomposition that exceeds
+/// the sanity budget returns the best `Partial` prefix; a search that
+/// exhausts every method is `Complete` (and empty).
+#[test]
+fn plan_status_reports_complete_vs_partial() {
+    // Terminating domain: the plan is final.
+    let miner = common::miner_domain();
+    let state = PlanState::build(&miner.components).finish();
+    let mut planner = HtnPlanner::new(&miner);
+    assert!(planner.plan("earn_gold", &state).is_complete());
+
+    // Budget-truncated: with the look-ahead off, the gate domain's doomed
+    // method must enumerate 2^12 gate combinations — the default sanity
+    // limit (100) cuts the search short and returns the prefix found so far.
+    let gate = common::gate_domain();
+    let state = PlanState::build(&gate.components).finish();
+    let mut planner = HtnPlanner::new(&gate);
+    planner.set_lookahead(false);
+    let partial = planner.plan("gate_root", &state);
+    assert!(partial.is_partial());
+    assert!(
+        !partial.is_empty(),
+        "a partial plan is the prefix found so far"
+    );
+
+    // Same domain, look-ahead on (the default): the doomed method is refuted
+    // in one sweep pass and the direct method plans — final, no budget raise
+    // needed (full enumeration would cost ~2^12 gate combinations).
+    let mut planner = HtnPlanner::new(&gate);
+    let done = planner.plan("gate_root", &state);
+    assert!(done.is_complete());
+    assert_eq!(done.task_names(), ["strike", "gate_final"]);
+
+    // Exhausted search: no method can ever apply — the empty result is
+    // final, not truncated.
+    #[derive(Component, Clone, Default, Debug)]
+    struct Wall(bool);
+    fn impossible(task: &mut TaskBuilder) {
+        task.branch().then(no_way);
+    }
+    fn no_way(task: &mut TaskBuilder) {
+        task.precondition(|w: &Wall| w.0);
+    }
+    let dead = HtnDomain::from_root(impossible).build().unwrap();
+    let state = PlanState::build(&dead.components).finish();
+    let mut planner = HtnPlanner::new(&dead);
+    let plan = planner.plan("impossible", &state);
+    assert!(plan.is_complete());
+    assert!(plan.is_empty());
 }

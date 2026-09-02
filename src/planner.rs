@@ -61,6 +61,24 @@ impl std::fmt::Display for Mtr {
 
 /// A completed forward plan: a **compiled step program** plus the MTR.
 ///
+/// Whether a compiled [`Plan`] is the finished product of a completed
+/// decomposition, or the best prefix cut out of a search that stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanStatus {
+    /// The search ran to completion: the plan is final — it either reaches a
+    /// terminal state or no decomposition exists (possibly empty).
+    #[default]
+    Complete,
+    /// The search stopped early (sanity budget exhausted or fail-fast): this
+    /// is the best partial plan found so far and may not reach the goal.
+    /// Raise the budget (`HtnPlanner::set_sanity_limit`) or check the domain
+    /// for unbounded recursion (the `terminating` summary flags it).
+    Partial,
+}
+
+/// The compiled plan a planner returns: a flat step program over the domain's
+/// task indices.
+///
 /// `steps` holds task indices into [`HtnDomain::tasks`](crate::domain::HtnDomain)
 /// in execution order, so executing a plan is a flat array walk — the driver
 /// indexes the baked task array directly, with no name lookups and no string
@@ -75,12 +93,26 @@ pub struct Plan {
     pub names: Vec<Ustr>,
     /// Method indices chosen at each decomposition level.
     pub mtr: Mtr,
+    /// Whether the search finished (`Complete`) or was cut short (`Partial`).
+    pub status: PlanStatus,
 }
 
 impl Plan {
     /// The ordered primitive task names (interned handles; deref to `&str`).
     pub fn task_names(&self) -> &[Ustr] {
         &self.names
+    }
+
+    /// Whether the search ran to completion — the plan is final. `false`
+    /// means the sanity budget or fail-fast cut the search short and this is
+    /// the best partial plan found (it may not reach the goal).
+    pub fn is_complete(&self) -> bool {
+        self.status == PlanStatus::Complete
+    }
+
+    /// Whether the search was cut short (see [`Self::is_complete`]).
+    pub fn is_partial(&self) -> bool {
+        !self.is_complete()
     }
 
     /// The domain task index of the step at `cursor` (the compiled program
@@ -415,9 +447,11 @@ impl<'a> HtnPlanner<'a> {
         self
     }
 
-    /// Decompose `root` into a [`Plan`]. Even if no task satisfies, the search
-    /// terminates after exhausting backtracking and returns the best partial
-    /// plan found (with an empty task list if nothing was decomposable).
+    /// Decompose `root` into a [`Plan`]. Never errors: on failure it returns
+    /// the best partial plan found (with an empty task list if nothing was
+    /// decomposable). Check [`Plan::status`] to tell a finished decomposition
+    /// ([`PlanStatus::Complete`]) from one the sanity budget or fail-fast cut
+    /// short ([`PlanStatus::Partial`]) — a partial plan may not reach the goal.
     ///
     /// `state` is only read: the planner works on its own clone of the
     /// scratchpad.
@@ -476,6 +510,9 @@ impl<'a> HtnPlanner<'a> {
     ) -> Plan {
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
+        // `Complete` unless the search stops early (fail-fast or a defensive
+        // exit); the sanity-limit return sets its own status.
+        let mut status = PlanStatus::Complete;
         let mut stack: VecDeque<Step> = VecDeque::with_capacity(16);
         let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
@@ -527,7 +564,7 @@ impl<'a> HtnPlanner<'a> {
                 // strictly beats the best so far and keep searching; the
                 // first complete plan is the answer otherwise.
                 if cost_bounded && g < best_cost {
-                    best = Some(materialize(tasks, &plan, mtr.clone()));
+                    best = Some(materialize(tasks, &plan, mtr.clone(), PlanStatus::Complete));
                     best_cost = g;
                     if backtrack(
                         &mut decomp_stack,
@@ -550,9 +587,11 @@ impl<'a> HtnPlanner<'a> {
             };
             count += 1;
             if count > sanity_limit {
+                // Budget exhausted: the recorded best (a complete plan, if any)
+                // or the current prefix — the search was cut short.
                 return match best {
                     Some(b) => b,
-                    None => materialize(tasks, &plan, mtr.clone()),
+                    None => materialize(tasks, &plan, mtr.clone(), PlanStatus::Partial),
                 };
             }
 
@@ -567,11 +606,16 @@ impl<'a> HtnPlanner<'a> {
                     let compound = match &tasks[task as usize] {
                         Task::Compound(c) => c,
                         // Defensive: only compound commitments queue retries.
-                        _ => break 'search,
+                        // The current prefix is not a finished decomposition.
+                        _ => {
+                            status = PlanStatus::Partial;
+                            break 'search;
+                        }
                     };
                     let m = &compound.methods[method as usize];
                     let SubtaskOrder::Partial { preds, .. } = &m.order else {
                         // Defensive: total methods never queue retries.
+                        status = PlanStatus::Partial;
                         break 'search;
                     };
                     let Some(order) = linearize(preds, lin as usize) else {
@@ -683,6 +727,7 @@ impl<'a> HtnPlanner<'a> {
                             // No eligible method: unwind to the most recent
                             // decomposition and try its next choice.
                             if self.fail_fast {
+                                status = PlanStatus::Partial;
                                 break 'search;
                             }
                             if !backtrack(
@@ -868,6 +913,7 @@ impl<'a> HtnPlanner<'a> {
                         };
                         if cost_bounded && best.is_some() && g + step_cost >= best_cost {
                             if self.fail_fast {
+                                status = PlanStatus::Partial;
                                 break 'search;
                             }
                             if !backtrack(
@@ -906,6 +952,7 @@ impl<'a> HtnPlanner<'a> {
                         continue;
                     }
                     if self.fail_fast {
+                        status = PlanStatus::Partial;
                         break 'search;
                     }
                     if !backtrack(
@@ -934,7 +981,7 @@ impl<'a> HtnPlanner<'a> {
 
         match best {
             Some(b) => b,
-            None => materialize(tasks, &plan, mtr),
+            None => materialize(tasks, &plan, mtr, status),
         }
     }
 }
@@ -1052,10 +1099,11 @@ fn backtrack(
 
 /// Convert a plan of (narrow) task indices into the compiled step program:
 /// contiguous `u32` task indices plus the parallel interned-name list.
-fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>) -> Plan {
+fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>, status: PlanStatus) -> Plan {
     Plan {
         steps: plan.iter().map(|&i| i as u32).collect(),
         names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
         mtr: Mtr(mtr),
+        status,
     }
 }
