@@ -20,21 +20,28 @@
 //!
 //! # What is measured
 //!
-//! - **`fetch_item_single_actor`** — one complete AI episode per iteration:
-//!   plan from the initial state and carry the plan through to the goal, via
-//!   each library's native planning/execution machinery (bevy_bhtn: one plan +
-//!   full scratchpad execution; BAE/htnp: their driver schedules run until the
-//!   goal prop flips).
-//! - **`fetch_item_planning_frame_{n}`** — the frame in which a population of
-//!   `n` agents plans, through each library's native driver. bevy_bhtn plans
-//!   on an immutable scratchpad (no reset needed); BAE/htnp require their plan
-//!   state to be cleared first (component resets, included in the measurement
-//!   — clearing plan state is part of their replan cost). BAE's frame also
-//!   dispatches each agent's first operator (its planner and executor share
-//!   one system pair); htnp's frame is pure planning.
+//! - **`fetch_item_single_actor` / `deep_chain_single_actor`** — one complete
+//!   AI episode per iteration: plan from the initial state and carry the plan
+//!   through to the goal, via each library's native planning/execution
+//!   machinery (bevy_bhtn: one plan + full scratchpad execution; BAE/htnp:
+//!   their driver schedules run until the goal prop flips). The end-to-end
+//!   comparison.
+//! - **`fetch_item_frame_{n}` / `deep_chain_frame_{n}`** — one frame of a
+//!   **continuing episode** for a population of `n` agents, through each
+//!   library's native per-frame cadence, single-threaded: agents mid-episode
+//!   execute/validate their next step (bevy_bhtn: compiled plan cursor, the
+//!   `htn_ai_system` shape; BAE: next operator dispatch; htnp: its chained
+//!   planning/execution systems), planless agents replan, and agents that
+//!   just finished reset immediately (the reset amortizes over the episode —
+//!   3 frames shallow, ~102 deep). This is the per-frame AI budget of a
+//!   running game — the CDDA-relevant number (per-actor per-tick).
 //!
-//! Populations are capped at 50k because BAE's per-agent entity-tree domains
-//! multiply entity count ~10x.
+//!   (An earlier revision measured a "planning frame" — every agent replans
+//!   from scratch in one frame. It was structurally unfair: bevy_bhtn and
+//!   htnp materialize the full plan, while BAE — whose plan is the entity
+//!   tree, executed incrementally — only dispatched the first operator, i.e.
+//!   1/N of its episode work per frame. The single-actor episodes are the
+//!   end-to-end check; these frames are the steady-state check.)
 //!
 //! # The deep case (`deep_chain_*`)
 //!
@@ -46,7 +53,10 @@
 //! progress counter + a boolean goal flag). Frame populations are 100 / 1k:
 //! htnp's tree generator explores one node per plan step with a cloned
 //! `HashMap` world per node, which makes deeper frames at 10k+ agents
-//! impractical to sample.
+//! impractical to sample. bevy_bhtn raises its sanity limit for this domain
+//! (`DEEP_SANITY_LIMIT`): 101 primitives cost ~300 decomposition steps, past
+//! the default budget of 100, under which the planner returns a ~33-step
+//! partial plan — pinned by the completion assertion in the episode bench.
 
 mod common;
 
@@ -61,10 +71,9 @@ mod bhtn_side {
     use bevy_bhtn::planner::HtnPlanner;
     use bevy_bhtn::state::PlanState;
     use bevy_bhtn::tasks::TaskBuilder;
-    use bevy_bhtn::HtnDomain;
+    use bevy_bhtn::{HtnDomain, Task};
     use bevy_ecs::prelude::*;
     use bevy_ecs::schedule::Schedule;
-    use std::hint::black_box;
 
     #[derive(Component, Clone, Default, Debug, PartialEq)]
     pub struct InRoomB(pub bool);
@@ -140,34 +149,74 @@ mod bhtn_side {
         steps
     }
 
+    /// Decomposition budget for the deep chain: 101 primitives cost ~300
+    /// decomposition steps (root + selector + primitive per step), past the
+    /// default sanity limit of 100 — without this the planner returns a
+    /// ~33-step *partial* plan and the bench silently measures less work.
+    pub const DEEP_SANITY_LIMIT: usize = 1000;
+
     /// The per-agent scratchpad component for the frame benchmark.
     #[derive(Component, Default)]
     pub struct Scratch(pub PlanState);
 
-    /// Planning-only AI frame: every agent plans from its scratchpad. The
-    /// planner works on a clone, so no reset pass is needed between frames.
-    pub fn run_ai(domain: Res<HtnRes>, mut q: Query<&mut Scratch>) {
-        let root = domain.0.root;
-        q.par_iter_mut().for_each(|scratch| {
+    /// Per-agent steady-state bookkeeping: the compiled plan + cursor (the
+    /// `HtnAgent` shape, minus World interaction — this bench has no drift).
+    #[derive(Component, Default)]
+    pub struct AgentState {
+        pub plan: Vec<u32>,
+        pub cursor: usize,
+    }
+
+    /// One frame of a continuing episode — the `htn_ai_system` cadence minus
+    /// World interaction (this bench has no drift): agents mid-plan
+    /// re-validate and execute their next step; planless agents replan; an
+    /// agent that just finished resets to the initial scratchpad so the
+    /// population stays mid-episode (the reset amortizes over the episode
+    /// length). Single-threaded on purpose — BAE and htnp run single-threaded
+    /// headless `App`s.
+    pub fn run_ai_steady(domain: Res<HtnRes>, mut q: Query<(&mut Scratch, &mut AgentState)>) {
+        q.iter_mut().for_each(|(mut scratch, mut agent)| {
+            if agent.cursor < agent.plan.len() {
+                let step = agent.plan[agent.cursor] as usize;
+                if let Task::Primitive(p) = &domain.0.tasks[step] {
+                    if p.preconditions_met(&scratch.0) {
+                        for e in &p.effects {
+                            e.apply(&mut scratch.0);
+                        }
+                        agent.cursor += 1;
+                        if agent.cursor == agent.plan.len() {
+                            // Episode complete: reset; the next frame replans.
+                            scratch.0.copy_from(&domain.1);
+                            agent.plan.clear();
+                            agent.cursor = 0;
+                        }
+                        return;
+                    }
+                }
+                // Drifted/invalid plan: fall through to replan (never fires
+                // in this bench — there is no world drift).
+            }
             let mut planner = HtnPlanner::new(&domain.0);
-            let plan = planner.plan_index(root, &scratch.0);
-            black_box(plan.task_names().len());
+            planner.set_sanity_limit(DEEP_SANITY_LIMIT);
+            let plan = planner.plan_index(domain.0.root, &scratch.0);
+            agent.plan = plan.steps;
+            agent.cursor = 0;
         });
     }
 
     #[derive(Resource)]
-    pub struct HtnRes(pub HtnDomain);
+    pub struct HtnRes(pub HtnDomain, pub PlanState);
 
     pub fn frame_world(n: usize) -> (World, Schedule) {
         let domain = domain();
         let state = initial_state(&domain);
         let mut world = World::new();
         world
-            .spawn_batch((0..n).map(|_| Scratch(PlanState::clone(&state))))
+            .spawn_batch((0..n).map(|_| (Scratch(PlanState::clone(&state)), AgentState::default())))
             .count();
-        world.insert_resource(HtnRes(domain));
+        world.insert_resource(HtnRes(domain, state));
         let mut schedule = Schedule::default();
-        schedule.add_systems(run_ai);
+        schedule.add_systems(run_ai_steady);
         (world, schedule)
     }
 
@@ -332,9 +381,18 @@ mod bhtn_side {
     pub fn deep_single_actor_episode(domain: &HtnDomain, state: &PlanState) -> usize {
         let mut state = state.clone();
         let mut planner = HtnPlanner::new(domain);
+        planner.set_sanity_limit(DEEP_SANITY_LIMIT);
         let plan = planner.plan("deep_root", &state);
+        // The plan must be the full corridor — a partial plan here means the
+        // sanity limit bit and the bench is comparing less work (pinned).
+        assert_eq!(plan.steps.len(), DEPTH as usize + 1, "deep plan truncated");
         let steps = plan.task_names().len();
         crate::common::execute_plan(domain, &mut state, &plan);
+        // And it must reach the goal.
+        let progress = domain.components.get::<Progress>().unwrap();
+        let picked = domain.components.get::<ItemPickedUp>().unwrap();
+        assert_eq!(state.get::<Progress>(progress).0, DEPTH, "goal not reached");
+        assert!(state.get::<ItemPickedUp>(picked).0, "item not picked up");
         steps
     }
 
@@ -343,11 +401,11 @@ mod bhtn_side {
         let state = deep_initial_state(&domain);
         let mut world = World::new();
         world
-            .spawn_batch((0..n).map(|_| Scratch(PlanState::clone(&state))))
+            .spawn_batch((0..n).map(|_| (Scratch(PlanState::clone(&state)), AgentState::default())))
             .count();
-        world.insert_resource(HtnRes(domain));
+        world.insert_resource(HtnRes(domain, state));
         let mut schedule = Schedule::default();
-        schedule.add_systems(run_ai);
+        schedule.add_systems(run_ai_steady);
         (world, schedule)
     }
 }
@@ -949,39 +1007,48 @@ fn competitor_comparison(c: &mut Criterion) {
         group.finish();
     }
 
-    // --- Planning frame: a population plans in one frame --------------------
+    // --- Steady-state frame: one frame of a continuing episode -------------
+    // Every library runs its native per-frame cadence on a population that
+    // stays mid-episode: agents execute/validate their next step (bhtn:
+    // compiled plan cursor; BAE: next operator dispatch; htnp: its chained
+    // planning/execution systems), planless agents replan, and agents that
+    // just finished reset immediately (amortized over the episode — 3 frames
+    // shallow, ~102 deep). htnp is skipped at 50k: its per-node
+    // cloned-HashMap tree generator makes that one case take minutes.
     for n in POPULATIONS {
+        let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::frame_world(n);
         let mut bae = bae_side::app_with_agents(n);
         let bae_agents = bae.agents.clone();
         let mut htnp = htnp_side::app_with_agents(n);
         let htnp_agents = htnp.agents.clone();
-        let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::frame_world(n);
 
-        let mut group = c.benchmark_group(format!("fetch_item_planning_frame_{n}"));
+        let mut group = c.benchmark_group(format!("fetch_item_frame_{n}"));
         group.throughput(criterion::Throughput::Elements(n as u64));
         group.bench_function("bevy_bhtn", |b| {
             b.iter(|| bhtn_schedule.run(&mut bhtn_world))
         });
         group.bench_function("bevy_bae", |b| {
             b.iter(|| {
-                // Clear plan state (part of BAE's replan cost), then one
-                // update: replan + first operator for every agent.
-                for &agent in &bae_agents {
-                    bae_side::reset_agent(&mut bae.app, agent);
-                }
                 bae.app.update();
-            })
-        });
-        group.bench_function("bevy_htnp", |b| {
-            b.iter(|| {
-                // Fresh plan-tree generators (part of htnp's replan cost),
-                // then one update: the chained systems plan every agent.
-                for &agent in &htnp_agents {
-                    htnp_side::reset_agent(&mut htnp, agent);
+                for &agent in &bae_agents {
+                    if bae_side::picked_up(bae.app.world_mut(), agent) {
+                        bae_side::reset_agent(&mut bae.app, agent);
+                    }
                 }
-                htnp.app.update();
             })
         });
+        if n < 50_000 {
+            group.bench_function("bevy_htnp", |b| {
+                b.iter(|| {
+                    htnp.app.update();
+                    for &agent in &htnp_agents {
+                        if htnp_side::picked_up(&mut htnp.app, agent) {
+                            htnp_side::reset_agent(&mut htnp, agent);
+                        }
+                    }
+                })
+            });
+        }
         group.finish();
     }
 
@@ -1032,7 +1099,7 @@ fn competitor_comparison(c: &mut Criterion) {
         group.finish();
     }
 
-    // --- Deep-chain planning frames (100 / 1k agents — see module docs) -----
+    // --- Deep chain, steady-state frame: 101-step plans in flight ----------
     for n in [100usize, 1_000] {
         let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::deep_frame_world(n);
         let mut bae = bae_side::deep_app_with_agents(n);
@@ -1040,25 +1107,29 @@ fn competitor_comparison(c: &mut Criterion) {
         let mut htnp = htnp_side::deep_app_with_agents(n);
         let htnp_agents = htnp.agents.clone();
 
-        let mut group = c.benchmark_group(format!("deep_chain_planning_frame_{n}"));
+        let mut group = c.benchmark_group(format!("deep_chain_frame_{n}"));
         group.throughput(criterion::Throughput::Elements(n as u64));
         group.bench_function("bevy_bhtn", |b| {
             b.iter(|| bhtn_schedule.run(&mut bhtn_world))
         });
         group.bench_function("bevy_bae", |b| {
             b.iter(|| {
-                for &agent in &bae_agents {
-                    bae_side::deep_reset_agent(&mut bae.app, agent);
-                }
                 bae.app.update();
+                for &agent in &bae_agents {
+                    if bae_side::picked_up(bae.app.world_mut(), agent) {
+                        bae_side::deep_reset_agent(&mut bae.app, agent);
+                    }
+                }
             })
         });
         group.bench_function("bevy_htnp", |b| {
             b.iter(|| {
-                for &agent in &htnp_agents {
-                    htnp_side::deep_reset_agent(&mut htnp, agent);
-                }
                 htnp.app.update();
+                for &agent in &htnp_agents {
+                    if htnp_side::deep_picked_up(&mut htnp.app, agent) {
+                        htnp_side::deep_reset_agent(&mut htnp, agent);
+                    }
+                }
             })
         });
         group.finish();

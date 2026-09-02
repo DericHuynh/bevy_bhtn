@@ -95,6 +95,14 @@ pub type CloneFn = unsafe fn(*const u8, *mut u8);
 /// must not be used afterwards.
 pub type DropFn = unsafe fn(*mut u8);
 
+/// A type-erased per-component default writer: writes `T::default()` into the
+/// (uninitialized) slot.
+///
+/// # Safety
+/// `slot` must be uninitialized memory of at least the slot's size and
+/// alignment.
+pub type DefaultFn = fn(*mut u8);
+
 /// Monomorphized fetcher for one component type (value or `Default`).
 fn fetch_fn<T: PlanComponent>() -> FetchFn {
     |world, entity, slot| {
@@ -126,19 +134,34 @@ fn drop_fn<T: PlanComponent>() -> DropFn {
     |slot| unsafe { std::ptr::drop_in_place::<T>(slot as *mut T) }
 }
 
-/// The frozen slot layout of a baked domain: one entry per registered
-/// component type, with its byte offset in the [`PlanState`] pool and its
-/// monomorphized access fns.
+/// Monomorphized default writer for one component type.
+fn default_fn<T: PlanComponent>() -> DefaultFn {
+    |slot| unsafe { std::ptr::write(slot as *mut T, T::default()) }
+}
+
+/// One registered component slot: its identity, byte region in the
+/// [`PlanState`] pool, and its monomorphized access fns. One contiguous
+/// `Vec<Slot>` (instead of parallel per-kind arrays) keeps every per-slot
+/// loop — extract/refresh/clone/`copy_from`/drop — on a single cache-friendly
+/// array.
+pub(crate) struct Slot {
+    pub(crate) tid: TypeId,
+    name: &'static str,
+    pub(crate) offset: usize,
+    pub(crate) size: usize,
+    pub(crate) align: usize,
+    pub(crate) fetch_fn: FetchFn,
+    pub(crate) write_fn: WriteFn,
+    pub(crate) clone_fn: CloneFn,
+    pub(crate) drop_fn: DropFn,
+    pub(crate) default_fn: DefaultFn,
+}
+
+/// The frozen slot layout of a baked domain: one [`Slot`] per registered
+/// component type, plus the pool's total size and maximum alignment.
 #[derive(Default)]
 pub struct RegistryLayout {
-    types: Vec<(TypeId, &'static str)>,
-    offsets: Vec<usize>,
-    sizes: Vec<usize>,
-    aligns: Vec<usize>,
-    fetchers: Vec<FetchFn>,
-    writers: Vec<WriteFn>,
-    cloners: Vec<CloneFn>,
-    droppers: Vec<DropFn>,
+    slots: Vec<Slot>,
     total: usize,
     /// Maximum slot alignment — the pool allocation's alignment.
     align: usize,
@@ -150,24 +173,28 @@ impl RegistryLayout {
         let align = std::mem::align_of::<T>();
         let size = std::mem::size_of::<T>();
         let offset = self.total.next_multiple_of(align);
-        self.types.push((TypeId::of::<T>(), name));
-        self.offsets.push(offset);
-        self.sizes.push(size);
-        self.aligns.push(align);
-        self.fetchers.push(fetch_fn::<T>());
-        self.writers.push(write_fn::<T>());
-        self.cloners.push(clone_fn::<T>());
-        self.droppers.push(drop_fn::<T>());
+        self.slots.push(Slot {
+            tid: TypeId::of::<T>(),
+            name,
+            offset,
+            size,
+            align,
+            fetch_fn: fetch_fn::<T>(),
+            write_fn: write_fn::<T>(),
+            clone_fn: clone_fn::<T>(),
+            drop_fn: drop_fn::<T>(),
+            default_fn: default_fn::<T>(),
+        });
         self.total = offset + size;
         self.align = self.align.max(align);
-        self.types.len() - 1
+        self.slots.len() - 1
     }
 }
 
 impl std::fmt::Debug for RegistryLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryLayout")
-            .field("slots", &self.types.len())
+            .field("slots", &self.slots.len())
             .field("total_bytes", &self.total)
             .field("align", &self.align)
             .finish()
@@ -210,12 +237,12 @@ impl RegistryBuilder {
 
     /// The number of registered components.
     pub fn len(&self) -> usize {
-        self.layout.types.len()
+        self.layout.slots.len()
     }
 
     /// Whether no components are registered.
     pub fn is_empty(&self) -> bool {
-        self.layout.types.is_empty()
+        self.layout.slots.is_empty()
     }
 }
 
@@ -237,23 +264,23 @@ impl ComponentRegistry {
     /// The slot index of component `T`, if registered.
     pub fn get<T: 'static>(&self) -> Option<usize> {
         let tid = TypeId::of::<T>();
-        self.layout.types.iter().position(|(t, _)| *t == tid)
+        self.layout.slots.iter().position(|s| s.tid == tid)
     }
 
     /// The number of registered components (the
     /// [`FieldSet`](crate::summaries::FieldSet) universe size).
     pub fn len(&self) -> usize {
-        self.layout.types.len()
+        self.layout.slots.len()
     }
 
     /// Whether no components are registered.
     pub fn is_empty(&self) -> bool {
-        self.layout.types.is_empty()
+        self.layout.slots.is_empty()
     }
 
     /// The registered component's short type name, by slot index.
     pub fn name_of(&self, idx: usize) -> &'static str {
-        let full = self.layout.types[idx].1;
+        let full = self.layout.slots[idx].name;
         full.rsplit("::").next().unwrap_or(full)
     }
 
@@ -262,17 +289,17 @@ impl ComponentRegistry {
         self.layout.align
     }
 
-    /// The per-slot droppers (the planner's rollback journal releases
-    /// unrestored copies with them on drop).
-    pub(crate) fn droppers(&self) -> &[DropFn] {
-        &self.layout.droppers
+    /// The per-slot table (the planner's rollback journal releases unrestored
+    /// copies through each slot's dropper on drop).
+    pub(crate) fn slots(&self) -> &[Slot] {
+        &self.layout.slots
     }
 }
 
 impl std::fmt::Debug for ComponentRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComponentRegistry")
-            .field("slots", &self.layout.types.len())
+            .field("slots", &self.layout.slots.len())
             .field("total_bytes", &self.layout.total)
             .finish()
     }
@@ -281,7 +308,7 @@ impl std::fmt::Debug for ComponentRegistry {
 impl std::fmt::Debug for RegistryBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryBuilder")
-            .field("slots", &self.layout.types.len())
+            .field("slots", &self.layout.slots.len())
             .field("total_bytes", &self.layout.total)
             .finish()
     }
@@ -354,9 +381,9 @@ impl PlanState {
     pub fn extract(world: &World, entity: Entity, registry: &ComponentRegistry) -> Self {
         let layout = Arc::clone(&registry.layout);
         let mut pool = Pool::new(layout.total, layout.align);
-        for (i, fetch) in layout.fetchers.iter().enumerate() {
+        for slot in &layout.slots {
             // Slots are freshly allocated (uninitialized): `write`, no drop.
-            unsafe { fetch(world, entity, pool.as_mut_ptr().add(layout.offsets[i])) };
+            unsafe { (slot.fetch_fn)(world, entity, pool.as_mut_ptr().add(slot.offset)) };
         }
         Self { layout, pool }
     }
@@ -366,16 +393,11 @@ impl PlanState {
     /// slot region. No allocation — the driver's hot path reuses one
     /// scratchpad across agents and across its plan/validate/re-extract
     /// phases (same discipline as the look-ahead sweep's `copy_from`).
-    ///
-    /// # Panics (debug)
-    /// If `registry` is not this scratchpad's registry.
-    pub fn refresh(&mut self, world: &World, entity: Entity, registry: &ComponentRegistry) {
-        debug_assert!(Arc::ptr_eq(&self.layout, &registry.layout));
-        for i in 0..self.layout.types.len() {
-            let off = self.layout.offsets[i];
+    pub fn refresh(&mut self, world: &World, entity: Entity) {
+        for slot in &self.layout.slots {
             unsafe {
-                (self.layout.droppers[i])(self.pool.as_mut_ptr().add(off));
-                (self.layout.fetchers[i])(world, entity, self.pool.as_mut_ptr().add(off));
+                (slot.drop_fn)(self.pool.as_mut_ptr().add(slot.offset));
+                (slot.fetch_fn)(world, entity, self.pool.as_mut_ptr().add(slot.offset));
             }
         }
     }
@@ -387,7 +409,7 @@ impl PlanState {
         PlanStateBuilder {
             layout: Arc::clone(&registry.layout),
             pool: Pool::new(registry.layout.total, registry.layout.align),
-            initialized: vec![false; registry.layout.types.len()],
+            initialized: vec![false; registry.layout.slots.len()],
         }
     }
 
@@ -395,21 +417,11 @@ impl PlanState {
     /// registry's monomorphized writers. Only the listed slots are committed;
     /// call this after mutating the scratchpad to apply simulated effects to
     /// the world.
-    pub fn write_back_with(
-        &self,
-        world: &mut World,
-        entity: Entity,
-        registry: &ComponentRegistry,
-        indices: &[usize],
-    ) {
-        debug_assert!(Arc::ptr_eq(&self.layout, &registry.layout));
+    pub fn write_back_with(&self, world: &mut World, entity: Entity, indices: &[usize]) {
         for &i in indices {
+            let slot = &self.layout.slots[i];
             unsafe {
-                (self.layout.writers[i])(
-                    world,
-                    entity,
-                    self.pool.as_ptr().add(self.layout.offsets[i]),
-                );
+                (slot.write_fn)(world, entity, self.pool.as_ptr().add(slot.offset));
             }
         }
     }
@@ -420,13 +432,13 @@ impl PlanState {
     /// offsets from the same registry that sized the scratchpad, so this can
     /// only fail on a caller bug.
     pub fn get<T: PlanComponent>(&self, idx: usize) -> &T {
-        debug_assert_eq!(self.layout.sizes[idx], std::mem::size_of::<T>());
+        debug_assert_eq!(self.layout.slots[idx].size, std::mem::size_of::<T>());
         unsafe { &*self.slot_ptr::<T>(idx) }
     }
 
     /// Mutably read component `T` at slot `idx` (same contract as [`Self::get`]).
     pub fn get_mut<T: PlanComponent>(&mut self, idx: usize) -> &mut T {
-        debug_assert_eq!(self.layout.sizes[idx], std::mem::size_of::<T>());
+        debug_assert_eq!(self.layout.slots[idx].size, std::mem::size_of::<T>());
         unsafe { &mut *self.slot_ptr::<T>(idx) }
     }
 
@@ -452,7 +464,7 @@ impl PlanState {
         let base = self.pool.as_mut_ptr();
         let mut out = [std::ptr::null_mut::<u8>(); N];
         for (out_slot, &idx) in out.iter_mut().zip(idxs.iter()) {
-            *out_slot = unsafe { base.add(self.layout.offsets[idx]) };
+            *out_slot = unsafe { base.add(self.layout.slots[idx].offset) };
         }
         // Distinct offsets => distinct memory regions => no aliasing.
         out
@@ -463,7 +475,7 @@ impl PlanState {
     /// # Safety contract (enforced by callers)
     /// `idx` must be `T`'s registered slot and initialized.
     unsafe fn slot_ptr<T>(&self, idx: usize) -> *mut T {
-        self.pool.as_ptr().add(self.layout.offsets[idx]) as *mut T
+        self.pool.as_ptr().add(self.layout.slots[idx].offset) as *mut T
     }
 
     /// Snapshot one slot's value for rollback by **deep-cloning it into the
@@ -477,9 +489,9 @@ impl PlanState {
     /// `dst` must be aligned for the slot's type and hold `size_of::<T>()`
     /// bytes of uninitialized memory.
     pub(crate) fn snapshot_slot(&self, idx: usize, dst: *mut u8) {
-        let off = self.layout.offsets[idx];
+        let slot = &self.layout.slots[idx];
         unsafe {
-            (self.layout.cloners[idx])(self.pool.as_ptr().add(off), dst);
+            (slot.clone_fn)(self.pool.as_ptr().add(slot.offset), dst);
         }
     }
 
@@ -492,8 +504,10 @@ impl PlanState {
     /// `bytes` must hold exactly `size_of::<T>()` bytes of a live, initialized
     /// value cloned from this slot.
     pub(crate) unsafe fn restore_slot(&mut self, idx: usize, bytes: *const u8) {
-        (self.layout.droppers[idx])(self.pool.as_mut_ptr().add(self.layout.offsets[idx]));
-        (self.layout.cloners[idx])(bytes, self.pool.as_mut_ptr().add(self.layout.offsets[idx]));
+        let slot = &self.layout.slots[idx];
+        let ptr = self.pool.as_mut_ptr().add(slot.offset);
+        (slot.drop_fn)(ptr);
+        (slot.clone_fn)(bytes, ptr);
     }
 
     /// Drop a journal-held value after it has been cloned back into its slot.
@@ -503,16 +517,16 @@ impl PlanState {
     /// `bytes` must point at a live value cloned from slot `idx` that has
     /// already been restored (or will never be restored).
     pub(crate) unsafe fn drop_journaled_slot(&self, idx: usize, bytes: *mut u8) {
-        (self.layout.droppers[idx])(bytes);
+        (self.layout.slots[idx].drop_fn)(bytes);
     }
 
     pub(crate) fn slot_size(&self, idx: usize) -> usize {
-        self.layout.sizes[idx]
+        self.layout.slots[idx].size
     }
 
     /// The alignment of slot `idx` (the journal aligns each cloned value).
     pub(crate) fn slot_align(&self, idx: usize) -> usize {
-        self.layout.aligns[idx]
+        self.layout.slots[idx].align
     }
 
     /// Deep-copy `src`'s slots into this scratchpad (same layout): drops each
@@ -523,13 +537,12 @@ impl PlanState {
     /// If the two scratchpads do not share the same registry layout.
     pub fn copy_from(&mut self, src: &PlanState) {
         debug_assert!(Arc::ptr_eq(&self.layout, &src.layout));
-        for i in 0..self.layout.types.len() {
-            let off = self.layout.offsets[i];
+        for slot in &self.layout.slots {
             unsafe {
-                (self.layout.droppers[i])(self.pool.as_mut_ptr().add(off));
-                (self.layout.cloners[i])(
-                    src.pool.as_ptr().add(off),
-                    self.pool.as_mut_ptr().add(off),
+                (slot.drop_fn)(self.pool.as_mut_ptr().add(slot.offset));
+                (slot.clone_fn)(
+                    src.pool.as_ptr().add(slot.offset),
+                    self.pool.as_mut_ptr().add(slot.offset),
                 );
             }
         }
@@ -537,12 +550,12 @@ impl PlanState {
 
     /// The number of slots (registry size at extraction time).
     pub fn len(&self) -> usize {
-        self.layout.types.len()
+        self.layout.slots.len()
     }
 
     /// Whether the scratchpad has no slots.
     pub fn is_empty(&self) -> bool {
-        self.layout.types.is_empty()
+        self.layout.slots.is_empty()
     }
 }
 
@@ -559,10 +572,8 @@ impl Default for PlanState {
 
 impl Drop for PlanState {
     fn drop(&mut self) {
-        for i in 0..self.layout.types.len() {
-            unsafe {
-                (self.layout.droppers[i])(self.pool.as_mut_ptr().add(self.layout.offsets[i]));
-            }
+        for slot in &self.layout.slots {
+            unsafe { (slot.drop_fn)(self.pool.as_mut_ptr().add(slot.offset)) };
         }
     }
 }
@@ -570,11 +581,11 @@ impl Drop for PlanState {
 impl Clone for PlanState {
     fn clone(&self) -> Self {
         let mut pool = Pool::new(self.layout.total, self.layout.align);
-        for i in 0..self.layout.types.len() {
+        for slot in &self.layout.slots {
             unsafe {
-                (self.layout.cloners[i])(
-                    self.pool.as_ptr().add(self.layout.offsets[i]),
-                    pool.as_mut_ptr().add(self.layout.offsets[i]),
+                (slot.clone_fn)(
+                    self.pool.as_ptr().add(slot.offset),
+                    pool.as_mut_ptr().add(slot.offset),
                 );
             }
         }
@@ -588,7 +599,7 @@ impl Clone for PlanState {
 impl std::fmt::Debug for PlanState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlanState")
-            .field("slots", &self.layout.types.len())
+            .field("slots", &self.layout.slots.len())
             .field("pool_bytes", &self.pool.size)
             .finish()
     }
@@ -607,12 +618,12 @@ impl PlanStateBuilder {
     pub fn set<T: PlanComponent>(mut self, value: T) -> Self {
         if let Some(i) = self
             .layout
-            .types
+            .slots
             .iter()
-            .position(|(tid, _)| *tid == TypeId::of::<T>())
+            .position(|s| s.tid == TypeId::of::<T>())
         {
             unsafe {
-                let slot = self.pool.as_mut_ptr().add(self.layout.offsets[i]) as *mut T;
+                let slot = self.pool.as_mut_ptr().add(self.layout.slots[i].offset) as *mut T;
                 if self.initialized[i] {
                     std::ptr::drop_in_place(slot);
                 }
@@ -626,16 +637,10 @@ impl PlanStateBuilder {
     /// Materialize every unset slot as `Default` and freeze the scratchpad.
     #[must_use]
     pub fn finish(mut self) -> PlanState {
-        let scratch_world = World::new();
         for (i, init) in self.initialized.iter_mut().enumerate() {
             if !*init {
-                unsafe {
-                    (self.layout.fetchers[i])(
-                        &scratch_world,
-                        Entity::PLACEHOLDER,
-                        self.pool.as_mut_ptr().add(self.layout.offsets[i]),
-                    );
-                }
+                let slot = &self.layout.slots[i];
+                unsafe { (slot.default_fn)(self.pool.as_mut_ptr().add(slot.offset)) };
                 *init = true;
             }
         }
@@ -662,9 +667,8 @@ impl Drop for PlanStateBuilder {
         // `set` (and only those — unset slots are raw bytes, never written).
         for (i, init) in self.initialized.iter().enumerate() {
             if *init {
-                unsafe {
-                    (self.layout.droppers[i])(self.pool.as_mut_ptr().add(self.layout.offsets[i]));
-                }
+                let slot = &self.layout.slots[i];
+                unsafe { (slot.drop_fn)(self.pool.as_mut_ptr().add(slot.offset)) };
             }
         }
     }

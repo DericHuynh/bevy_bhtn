@@ -344,7 +344,7 @@ pub fn htn_ai_system(world: &mut World) {
                 let state = scratch
                     .state
                     .get_or_insert_with(|| PlanState::build(registry).finish());
-                state.refresh(world, entity, registry);
+                state.refresh(world, entity);
                 let (strategy, sanity) = world
                     .get::<SearchOverride>(entity)
                     .map(|o| {
@@ -425,7 +425,7 @@ pub fn htn_ai_system(world: &mut World) {
             let state = scratch
                 .state
                 .get_or_insert_with(|| PlanState::build(registry).finish());
-            state.refresh(world, entity, registry);
+            state.refresh(world, entity);
             if !primitive.preconditions_met(state) {
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.plan = None;
@@ -446,14 +446,14 @@ pub fn htn_ai_system(world: &mut World) {
                 world.flush();
                 // The action may have mutated planning components: re-extract
                 // so effects apply on top of the post-action state.
-                state.refresh(world, entity, registry);
+                state.refresh(world, entity);
             }
             // Commit only the baked write slots (read-only effect parameters
             // are never committed to the real entity).
             let writes = primitive.write_slot_slice();
             if !writes.is_empty() {
                 primitive.apply_effects(state);
-                state.write_back_with(world, entity, registry, writes);
+                state.write_back_with(world, entity, writes);
             }
 
             // 5. Advance the cursor (a finished plan is dropped for replan).

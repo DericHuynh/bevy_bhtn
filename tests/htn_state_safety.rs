@@ -184,7 +184,7 @@ fn write_back_clones_out_and_pool_still_owns() {
 
     let mut world = World::new();
     let entity = world.spawn(Gold(0)).id();
-    state.write_back_with(&mut world, entity, &registry, &[0, 1]);
+    state.write_back_with(&mut world, entity, &[0, 1]);
 
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 7);
     assert_eq!(world.get::<Name>(entity).unwrap().1, "committed");

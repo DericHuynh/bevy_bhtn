@@ -36,7 +36,7 @@ use crate::selection::{DecompositionTrace, SelectionPolicy, TraceOutcome};
 use crate::domain::HtnDomain;
 use crate::lookahead::{self, Lookahead};
 use crate::order::{linearize, SubtaskOrder};
-use crate::state::{DropFn, PlanState};
+use crate::state::{PlanState, Slot};
 use crate::tasks::Task;
 
 /// The method traversal record of a completed plan: the index of the chosen
@@ -224,18 +224,18 @@ struct Rollback<'a> {
     /// alignment padding between entries makes offsets not derivable from
     /// the current length.
     ops: Vec<(usize, usize)>,
-    /// The baked per-slot droppers: releases journal copies the search never
+    /// The baked slot table: releases journal copies the search never
     /// restored (a successful plan or a sanity-limit exit leaves snapshots on
     /// the journal — the arena's `Drop` only deallocates bytes).
-    droppers: &'a [DropFn],
+    slots: &'a [Slot],
 }
 
 impl<'a> Rollback<'a> {
-    fn new(max_align: usize, droppers: &'a [DropFn]) -> Self {
+    fn new(max_align: usize, slots: &'a [Slot]) -> Self {
         Self {
             values: Journal::new(max_align),
             ops: Vec::with_capacity(16),
-            droppers,
+            slots,
         }
     }
 
@@ -273,7 +273,7 @@ impl Drop for Rollback<'_> {
         // through its slot's baked dropper before the arena deallocates.
         // Fully-restored searches leave `ops` empty, so this is a no-op there.
         for &(idx, start) in &self.ops {
-            unsafe { (self.droppers[idx])(self.values.ptr_at(start)) };
+            unsafe { (self.slots[idx].drop_fn)(self.values.ptr_at(start)) };
         }
     }
 }
@@ -494,7 +494,7 @@ impl<'a> HtnPlanner<'a> {
         // restored on backtrack down to the frame's length.
         let mut rollback = Rollback::new(
             self.domain.components.max_align(),
-            self.domain.components.droppers(),
+            self.domain.components.slots(),
         );
         // Reusable look-ahead state clone: the sweep's lazily-created private
         // copy, reused across sweeps (`copy_from`, no re-allocation).
