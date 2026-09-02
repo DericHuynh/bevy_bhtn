@@ -70,10 +70,25 @@ use crate::summaries::FieldSet;
 
 /// A compiled precondition: a type-erased checker over the [`PlanState`]
 /// scratchpad plus the slot indices it reads (for summary inference and
-/// look-ahead "unknown component" tracking).
+/// look-ahead "unknown component" tracking). `Clone` (Arc'd checker) so the
+/// GTN compilation can re-capture a task's preconditions inside a synthesized
+/// wrapper method.
+#[derive(Clone)]
 pub struct Precondition {
-    check: Box<dyn Fn(&PlanState) -> bool + Send + Sync>,
+    check: Arc<dyn Fn(&PlanState) -> bool + Send + Sync>,
     pub(crate) reads: SmallVec<[usize; 4]>,
+}
+
+impl Precondition {
+    /// Build a precondition directly from a slot-read list and a checker.
+    /// `pub(crate)` because the GTN compilation synthesizes preconditions for
+    /// its marker components; user code goes through [`IntoPrecondition`].
+    pub(crate) fn new(
+        reads: SmallVec<[usize; 4]>,
+        check: Arc<dyn Fn(&PlanState) -> bool + Send + Sync>,
+    ) -> Self {
+        Self { check, reads }
+    }
 }
 
 impl Precondition {
@@ -104,6 +119,16 @@ impl Effect {
     /// The slot indices this effect writes.
     pub fn writes(&self) -> &[usize] {
         &self.writes
+    }
+
+    /// Build an effect directly from a write list and an apply closure.
+    /// `pub(crate)` — the GTN compilation synthesizes marker effects; user
+    /// code goes through [`IntoEffect`].
+    pub(crate) fn new(
+        writes: SmallVec<[usize; 4]>,
+        apply: Box<dyn Fn(&mut PlanState) + Send + Sync>,
+    ) -> Self {
+        Self { apply, writes }
     }
 }
 
@@ -159,7 +184,7 @@ macro_rules! impl_precondition {
                 let reads: SmallVec<[usize; 4]> = smallvec![$($name,)*];
                 Precondition {
                     reads,
-                    check: Box::new(move |state| self($(state.get::<$name>($name),)*)),
+                    check: Arc::new(move |state| self($(state.get::<$name>($name),)*)),
                 }
             }
         }
@@ -472,13 +497,23 @@ pub(crate) struct MethodProto {
     /// was appended via [`MethodBuilder::then`] (totally ordered after every
     /// prior member) or [`MethodBuilder::subtask`] (unordered relative to
     /// other unordered members).
-    pub(crate) subtasks: Vec<(TypeId, &'static str, bool)>,
+    pub(crate) subtasks: Vec<(SubtaskRef, &'static str, bool)>,
     /// Whether any [`MethodBuilder::subtask`] was used (the branch is not a
     /// pure `then` chain).
     pub(crate) unordered: bool,
     /// Explicit [`MethodBuilder::before`] constraints as
     /// `(predecessor position, successor position)` pairs.
     pub(crate) edges: Vec<(u32, u32)>,
+}
+
+/// The identity of a referenced task in a recorded method body: a task
+/// function's zero-sized type (the normal case) or a transform-synthesized
+/// task with no function identity (the GTN compilation's wrapper/marker/insert
+/// tasks — keyed by a bake-time-unique synthetic id).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum SubtaskRef {
+    Fn(TypeId),
+    Synthetic(u32),
 }
 
 /// What a task function recorded, prior to baking.
@@ -506,10 +541,19 @@ pub(crate) enum TaskProto {
 /// The recording context threaded through task functions during baking.
 pub(crate) struct Recorder {
     pub(crate) registry: RegistryBuilder,
-    pub(crate) tasks: Vec<(TypeId, &'static str, TaskProto)>,
-    pub(crate) index_of: HashMap<TypeId, usize>,
+    pub(crate) tasks: Vec<(SubtaskRef, &'static str, TaskProto)>,
+    pub(crate) index_of: HashMap<SubtaskRef, usize>,
     pub(crate) queue: VecDeque<Box<dyn TaskFn>>,
     pub(crate) errors: Vec<String>,
+    /// Next id for transform-synthesized tasks (see [`SubtaskRef::Synthetic`]).
+    pub(crate) next_synthetic: u32,
+    /// Deferred GTN compilations: task functions marked for sharing (applied
+    /// at bake time, before insertion).
+    pub(crate) shares: Vec<SubtaskRef>,
+    /// Tasks registered as insertion candidates (see `DomainBuilder::insertable`).
+    pub(crate) insertables: Vec<SubtaskRef>,
+    /// Whether task insertion is compiled in at bake time.
+    pub(crate) insertion: bool,
 }
 
 /// The builder handed to task functions. Its API surface determines the
@@ -713,7 +757,7 @@ impl<'a> MethodBuilder<'a> {
     /// Append a subtask at the end of the current total order: it runs after
     /// every member declared before it.
     pub fn then<F: TaskFn>(&mut self, f: F) -> &mut Self {
-        let tid = TypeId::of::<F>();
+        let tid = SubtaskRef::Fn(TypeId::of::<F>());
         self.proto.subtasks.push((tid, F::task_name(), true));
         self.rec.queue.push_back(Box::new(f));
         self
@@ -727,7 +771,7 @@ impl<'a> MethodBuilder<'a> {
     /// alternatives.
     pub fn subtask<F: TaskFn>(&mut self, f: F) -> SubtaskHandle {
         let pos = self.proto.subtasks.len() as u32;
-        let tid = TypeId::of::<F>();
+        let tid = SubtaskRef::Fn(TypeId::of::<F>());
         self.proto.subtasks.push((tid, F::task_name(), false));
         self.proto.unordered = true;
         self.rec.queue.push_back(Box::new(f));
@@ -865,6 +909,11 @@ pub struct Method {
     /// Fields that *some* refinement of this method's subtasks may write
     /// (bake-time over-approximation; computed with the summaries).
     pub(crate) possible_writes: FieldSet,
+    /// Fields that *every* refinement of this method's subtask sequence
+    /// writes: the union of the subtasks' guaranteed-write summaries (bake
+    /// time). The under-approximation the backward planner uses to let
+    /// compound tasks participate in reverse chaining.
+    pub(crate) guaranteed_writes: FieldSet,
     /// Lower bound on the total primitive cost of executing this method's
     /// subtask sequence (sum of the subtasks' `min_cost` summaries; bake
     /// time). The [`CostBounded`](crate::selection::HtnSearchStrategy::CostBounded)
@@ -878,8 +927,9 @@ pub struct Method {
 pub struct CompoundTask {
     /// The task's clean function name.
     pub name: &'static str,
-    /// The task function's `TypeId` (graph identity for introspection).
-    pub type_id: TypeId,
+    /// The task function's `TypeId` (graph identity for introspection);
+    /// `None` for transform-synthesized tasks (the GTN compilation).
+    pub type_id: Option<TypeId>,
     /// How this task's valid branches are ranked.
     pub policy: SelectionPolicy,
     /// Ordered decomposition alternatives.
@@ -1052,8 +1102,8 @@ fn sample_weighted_order(weights: &[f32], rng: &mut u64, out: &mut SmallVec<[u32
 pub struct PrimitiveTask {
     /// The task's clean function name.
     pub name: &'static str,
-    /// The task function's `TypeId`.
-    pub type_id: TypeId,
+    /// The task function's `TypeId`; `None` for transform-synthesized tasks.
+    pub type_id: Option<TypeId>,
     /// Conditions that must all hold for this task to be pickable.
     pub preconditions: Vec<Precondition>,
     /// Effects applied to the scratchpad during search and to the real

@@ -1027,7 +1027,7 @@ mod tiebreak_tasks {
 }
 
 #[test]
-fn backward_plan_prefers_multi_field_leaf() {
+fn backward_plan_commits_full_coverage_compound() {
     use tiebreak_tasks::*;
     let domain = HtnDomain::from_root(tie_root)
         .goal(both_goal)
@@ -1035,13 +1035,26 @@ fn backward_plan_prefers_multi_field_leaf() {
         .expect("tiebreak domain is well-formed");
     let state = PlanState::build(&domain.components).finish();
     let mut planner = BackPlanner::new(&domain);
-    // Greedy heuristic: double_shot covers 2 of 2 needed slots (Flag + Count),
-    // single_shot only 1 -> double_shot is selected first (and satisfies the
-    // whole goal).
+    // Compound candidates participate: `tie_root`'s method guarantees both
+    // needed slots, so it is committed (earlier task index wins the coverage
+    // tie with `double_shot`), and its mandatory sequence brings the
+    // redundant `single_shot` along. The plan still reaches the goal's
+    // values — which the old primitive-only greedy also did here, but not in
+    // value-recursive domains (see the htn_builder end-to-end pin).
     let plan = planner.plan("both_goal", &state).expect("back plan");
     let names = plan.task_names();
     assert!(!names.is_empty());
-    assert_eq!(names[0].to_string(), "double_shot");
+    assert_eq!(names, ["single_shot", "double_shot"]);
+    let mut executed = state.clone();
+    for &s in &plan.steps {
+        if let Task::Primitive(p) = &domain.tasks[s as usize] {
+            p.apply_effects(&mut executed);
+        }
+    }
+    let flag = domain.components.get::<Flag>().unwrap();
+    let count = domain.components.get::<Count>().unwrap();
+    assert!(executed.get::<Flag>(flag).0);
+    assert_eq!(executed.get::<Count>(count).0, 7);
 }
 
 mod combine_tasks {

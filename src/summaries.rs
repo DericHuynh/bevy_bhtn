@@ -156,6 +156,12 @@ impl FieldSet {
 pub struct TaskSummary {
     /// Components every refinement reads before any refinement writes them
     /// (executability-relaxed preconditions; under-approximation).
+    ///
+    /// Introspection only — it cannot refute anything at search time. In
+    /// classical HTN a required fact that is false refutes the task; here
+    /// slots are always initialized and the reads are opaque closures, so
+    /// there is no stored value predicate to check against the state, and an
+    /// unknown slot is "maybe", never "no" (the sweep's own convention).
     pub required_fields: FieldSet,
     /// Components some refinement writes (over-approximation).
     pub possible_writes: FieldSet,
@@ -175,14 +181,22 @@ pub struct TaskSummary {
     /// time and conservatively count 0 — so this is a sound lower bound.
     pub min_cost: f32,
     /// Whether the task can (transitively) decompose into itself.
+    ///
+    /// Structure metadata (Toad-style analysis): introspection and docs —
+    /// the search handles non-termination directly via `terminating` /
+    /// `min_yield` budget refutation. Note acyclicity does NOT bound the
+    /// search space (an acyclic domain can still enumerate exponentially —
+    /// see the gate fixture), so these flags are no substitute for the
+    /// sanity limit.
     pub recursive: bool,
     /// Whether the task can appear at a **non-last** position of its own
     /// refinement (right-generating, in Toad's terms). Non-tail recursion.
+    /// Structure metadata — see [`Self::recursive`].
     pub self_embedding: bool,
     /// Whether the task can appear with material on **both** sides of itself
     /// in its own refinement (left- and right-generating). Such tasks are the
     /// context-free (non-regular) core of a domain — Toad's exact-translation
-    /// criterion.
+    /// criterion. Structure metadata — see [`Self::recursive`].
     pub tail_recursive: bool,
 }
 
@@ -327,6 +341,21 @@ pub(crate) fn compute_summaries(domain: &mut HtnDomain) {
         }
         if !changed {
             break;
+        }
+    }
+
+    // ---- 4b. Per-method guaranteed writes ---------------------------------
+    // The seq_gw computed inside the fixpoint above, stored on each baked
+    // method: the backward planner uses it as the under-approximation that
+    // lets compound methods participate in reverse chaining.
+    for task in domain.tasks.iter_mut() {
+        let Task::Compound(c) = task else { continue };
+        for m in &mut c.methods {
+            let mut seq = FieldSet::new(nf);
+            for &sub in &m.subtasks {
+                seq.union_with(&gw[sub as usize]);
+            }
+            m.guaranteed_writes = seq;
         }
     }
 

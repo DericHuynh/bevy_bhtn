@@ -241,7 +241,19 @@ fn baked_domain_plans_forward_and_backward() {
 
     let mut back = BackPlanner::new(&domain);
     let back_plan = back.plan("three_gold", &state).expect("reachable");
-    assert_eq!(back_plan.task_names(), ["work"]);
+    // Compound participation: the greedy chains through `wealthy`'s recursive
+    // method until its own `gold >= 3` gate closes — the plan really reaches
+    // the goal's value (the old primitive-only greedy stopped after one `work`,
+    // leaving gold at 1).
+    assert_eq!(back_plan.task_names(), ["work", "work", "work"]);
+    let mut executed = state.clone();
+    for &s in &back_plan.steps {
+        if let Task::Primitive(p) = &domain.tasks[s as usize] {
+            p.apply_effects(&mut executed);
+        }
+    }
+    let gold = domain.components.get::<Gold>().unwrap();
+    assert_eq!(executed.get::<Gold>(gold).0, 3);
 }
 
 /// The full pipeline through the shared bed helper: plan, execute on the

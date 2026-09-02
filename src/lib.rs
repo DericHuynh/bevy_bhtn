@@ -59,6 +59,7 @@ pub mod back_planner;
 pub mod domain;
 pub mod ecs;
 pub mod error;
+pub mod gtn;
 pub mod lookahead;
 pub mod order;
 pub mod planner;
@@ -80,6 +81,7 @@ pub mod prelude {
     pub use crate::domain::*;
     pub use crate::ecs::*;
     pub use crate::error::*;
+    pub use crate::gtn::*;
     pub use crate::order::*;
     pub use crate::planner::*;
     pub use crate::selection::*;

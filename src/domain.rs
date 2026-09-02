@@ -18,8 +18,8 @@ use crate::selection::SelectionPolicy;
 use crate::state::{ComponentRegistry, RegistryBuilder};
 use crate::summaries::{compute_summaries, TaskSummary};
 use crate::tasks::{
-    CompoundTask, GoalBuilder, GoalFn, GoalTask, Method, PrimitiveTask, Recorder, Task, TaskFn,
-    TaskProto,
+    CompoundTask, GoalBuilder, GoalFn, GoalTask, Method, PrimitiveTask, Recorder, SubtaskRef, Task,
+    TaskFn, TaskProto,
 };
 
 /// A baked and validated HTN domain. Immutable after bake; both planners read
@@ -52,12 +52,16 @@ impl HtnDomain {
             index_of: HashMap::new(),
             queue: VecDeque::new(),
             errors: Vec::new(),
+            next_synthetic: 0,
+            shares: Vec::new(),
+            insertables: Vec::new(),
+            insertion: false,
         };
 
         // Register the root placeholder, then record it. Recursive and
         // repeated `.then` references resolve against `index_of`, so each
         // task function is expanded exactly once and cycles become edges.
-        let root_tid = TypeId::of::<F>();
+        let root_tid = SubtaskRef::Fn(TypeId::of::<F>());
         let root_name = F::task_name();
         rec.index_of.insert(root_tid, 0);
         rec.tasks.push((
@@ -77,7 +81,7 @@ impl HtnDomain {
         // Expand every referenced task function (LIFO order; each function
         // is recorded exactly once — cycles become plain graph edges).
         while let Some(f) = rec.queue.pop_front() {
-            let tid = f.task_type_id();
+            let tid = SubtaskRef::Fn(f.task_type_id());
             if rec.index_of.contains_key(&tid) {
                 continue; // already recorded — the edge was recorded at `then`
             }
@@ -179,6 +183,78 @@ pub struct DomainBuilder {
 }
 
 impl DomainBuilder {
+    /// Mark a recorded primitive task as **shared** (GTN Theorem 4.8's
+    /// `fin_o` construction, compiled at bake time): every method body that
+    /// references it is rewritten to a wrapper compound whose plan contains
+    /// the primitive at most once. See [`gtn`](crate::gtn) for the compiled
+    /// shape and its execution contract.
+    #[must_use]
+    pub fn share_task<F: TaskFn>(mut self, _f: F) -> Self {
+        self.rec.shares.push(SubtaskRef::Fn(TypeId::of::<F>()));
+        self
+    }
+
+    /// Compile **task insertion** (GTN plan repair): a synthetic
+    /// `gtn/insert` compound is spliced between the members of every
+    /// total-order method body, letting any applicable primitive run in the
+    /// gaps — but only on backtrack, so plain plans are found first. See
+    /// [`gtn`](crate::gtn).
+    #[must_use]
+    pub fn with_insertion(mut self) -> Self {
+        self.rec.insertion = true;
+        self
+    }
+
+    /// Record a task that no method body references and mark it as an
+    /// **insertion candidate**: with [`Self::with_insertion`] compiled in,
+    /// the search may weave it into plan gaps (plan repair). Unreferenced
+    /// task functions are otherwise dropped by the recording, and only
+    /// explicitly registered tasks become candidates — an ungated primitive
+    /// in the candidate set is an unbounded insertion well (the search can
+    /// re-insert it forever), so curation is deliberate. Candidates are
+    /// routed through shared wrappers when the task is also shared.
+    #[must_use]
+    pub fn insertable<F: TaskFn>(mut self, f: F) -> Self {
+        let tid = SubtaskRef::Fn(TypeId::of::<F>());
+        self.rec.insertables.push(tid);
+        if self.rec.index_of.contains_key(&tid) {
+            return self; // already recorded (also referenced somewhere)
+        }
+        self.rec.index_of.insert(tid, self.rec.tasks.len());
+        self.rec.tasks.push((
+            tid,
+            F::task_name(),
+            TaskProto::Compound {
+                methods: Vec::new(),
+                policy: SelectionPolicy::default(),
+            },
+        ));
+        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec);
+        f.record(&mut builder);
+        builder.finish();
+        // Drain queued (`.then`-referenced) tasks, same discipline as the
+        // root expansion loop.
+        while let Some(g) = self.rec.queue.pop_front() {
+            let gid = SubtaskRef::Fn(g.task_type_id());
+            if self.rec.index_of.contains_key(&gid) {
+                continue;
+            }
+            self.rec.index_of.insert(gid, self.rec.tasks.len());
+            self.rec.tasks.push((
+                gid,
+                g.task_name_erased(),
+                TaskProto::Compound {
+                    methods: Vec::new(),
+                    policy: SelectionPolicy::default(),
+                },
+            ));
+            let mut b2 = crate::tasks::TaskBuilder::new(&mut self.rec);
+            g.record(&mut b2);
+            b2.finish();
+        }
+        self
+    }
+
     /// Register a goal task (a named set of desired effects) for
     /// back-planning. The goal function's name becomes the goal's lookup key.
     #[must_use]
@@ -195,7 +271,13 @@ impl DomainBuilder {
     /// primitive declarations, methodless compounds, and a non-compound root
     /// are errors; the index maps and the inferred task summaries are
     /// computed here.
-    pub fn build(self) -> HtnResult<HtnDomain> {
+    pub fn build(mut self) -> HtnResult<HtnDomain> {
+        // GTN compilations run before validation so the synthesized tasks are
+        // validated, baked, and summarized like hand-written ones. Sharing
+        // first: insertion routes its candidates through the wrappers.
+        let wrapped = crate::gtn::apply_sharing(&mut self.rec)?;
+        crate::gtn::apply_insertion(&mut self.rec, &wrapped)?;
+
         if let Some(err) = self.rec.errors.first() {
             return Err(HtnError::builder(err.clone()));
         }
@@ -209,7 +291,11 @@ impl DomainBuilder {
             if index_of.insert(key, i).is_some() {
                 return Err(HtnError::builder(format!("duplicate task name `{name}`")));
             }
-            type_index.insert(tid, i);
+            // Only task functions participate in the TypeId graph index —
+            // transform-synthesized tasks (GTN compilation) have no identity.
+            if let SubtaskRef::Fn(tid) = tid {
+                type_index.insert(tid, i);
+            }
             tasks.push(match proto {
                 TaskProto::Compound { methods, policy } => {
                     if methods.is_empty() {
@@ -239,13 +325,17 @@ impl DomainBuilder {
                                     .collect(),
                                 order,
                                 possible_writes: Default::default(),
+                                guaranteed_writes: Default::default(),
                                 min_cost: 0.0,
                             })
                         })
                         .collect();
                     Task::Compound(CompoundTask {
                         name,
-                        type_id: tid,
+                        type_id: match tid {
+                            SubtaskRef::Fn(t) => Some(t),
+                            SubtaskRef::Synthetic(_) => None,
+                        },
                         policy,
                         methods: baked_methods?,
                     })
@@ -276,7 +366,10 @@ impl DomainBuilder {
                     }
                     Task::Primitive(PrimitiveTask {
                         name,
-                        type_id: tid,
+                        type_id: match tid {
+                            SubtaskRef::Fn(t) => Some(t),
+                            SubtaskRef::Synthetic(_) => None,
+                        },
                         preconditions,
                         effects,
                         expected_effects,
