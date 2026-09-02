@@ -551,6 +551,9 @@ pub(crate) struct Recorder {
     pub(crate) insertables: Vec<SubtaskRef>,
     /// Whether task insertion is compiled in at bake time.
     pub(crate) insertion: bool,
+    /// Additional root tasks (see `DomainBuilder::root`) — e.g. an opponent's
+    /// plan for adversarial planning. Validated compound at bake.
+    pub(crate) extra_roots: Vec<SubtaskRef>,
 }
 
 /// The builder handed to task functions. Its API surface determines the
@@ -883,4 +886,3 @@ impl<'a> GoalBuilder<'a> {
         self.effects
     }
 }
-

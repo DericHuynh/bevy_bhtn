@@ -55,6 +55,7 @@
 
 #![deny(missing_docs)]
 
+pub mod ahtn;
 pub mod back_planner;
 pub mod domain;
 pub mod ecs;
@@ -79,6 +80,7 @@ pub use tasks::*;
 
 /// Convenience re-exports for crate-wide use.
 pub mod prelude {
+    pub use crate::ahtn::*;
     pub use crate::back_planner::*;
     pub use crate::domain::*;
     pub use crate::ecs::*;

@@ -58,6 +58,7 @@ impl HtnDomain {
             shares: Vec::new(),
             insertables: Vec::new(),
             insertion: false,
+            extra_roots: Vec::new(),
         };
 
         // Register the root placeholder, then record it. Recursive and
@@ -207,6 +208,59 @@ impl DomainBuilder {
         self
     }
 
+    /// Register an **additional root task** — a second compound entry point
+    /// into the same baked network, alongside the forward planner's root.
+    /// The motivating use is adversarial planning
+    /// ([`Ahtn`](crate::ahtn)): player max plans from the main root, player
+    /// min from an extra root, both against the same world state. Extra
+    /// roots must be compound tasks (validated at bake) and are unreachable
+    /// from the forward root unless referenced — forward planning is
+    /// unaffected.
+    #[must_use]
+    pub fn root<F: TaskFn>(mut self, f: F) -> Self {
+        let tid = SubtaskRef::Fn(TypeId::of::<F>());
+        if self.rec.index_of.contains_key(&tid) {
+            // Already recorded (e.g. also referenced as a subtask): just mark
+            // it as an extra root — bake validates its kind.
+            self.rec.extra_roots.push(tid);
+            return self;
+        }
+        self.rec.index_of.insert(tid, self.rec.tasks.len());
+        self.rec.tasks.push((
+            tid,
+            F::task_name(),
+            TaskProto::Compound {
+                methods: Vec::new(),
+                policy: SelectionPolicy::default(),
+            },
+        ));
+        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec);
+        f.record(&mut builder);
+        builder.finish();
+        // Drain queued (`.then`-referenced) tasks, same discipline as the
+        // root expansion loop.
+        while let Some(g) = self.rec.queue.pop_front() {
+            let gid = SubtaskRef::Fn(g.task_type_id());
+            if self.rec.index_of.contains_key(&gid) {
+                continue;
+            }
+            self.rec.index_of.insert(gid, self.rec.tasks.len());
+            self.rec.tasks.push((
+                gid,
+                g.task_name_erased(),
+                TaskProto::Compound {
+                    methods: Vec::new(),
+                    policy: SelectionPolicy::default(),
+                },
+            ));
+            let mut b2 = crate::tasks::TaskBuilder::new(&mut self.rec);
+            g.record(&mut b2);
+            b2.finish();
+        }
+        self.rec.extra_roots.push(tid);
+        self
+    }
+
     /// Record a task that no method body references and mark it as an
     /// **insertion candidate**: with [`Self::with_insertion`] compiled in,
     /// the search may weave it into plan gaps (plan repair). Unreferenced
@@ -282,6 +336,19 @@ impl DomainBuilder {
 
         if let Some(err) = self.rec.errors.first() {
             return Err(HtnError::builder(err.clone()));
+        }
+
+        // Extra roots (adversarial planning) must be compound tasks.
+        for rref in &self.rec.extra_roots {
+            let Some(&idx) = self.rec.index_of.get(rref) else {
+                continue;
+            };
+            let (name, proto) = (&self.rec.tasks[idx].1, &self.rec.tasks[idx].2);
+            if !matches!(proto, TaskProto::Compound { .. }) {
+                return Err(HtnError::builder(format!(
+                    "extra root `{name}` must be a compound task"
+                )));
+            }
         }
 
         let mut tasks: Vec<Task> = Vec::with_capacity(self.rec.tasks.len() + self.goals.len());
