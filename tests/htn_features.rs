@@ -8,7 +8,7 @@
 mod common;
 
 use bevy_bhtn::back_planner::BackPlanner;
-use bevy_bhtn::planner::{HtnPlanner, Mtr, Plan, PlanStatus};
+use bevy_bhtn::planner::{HtnPlanner, Plan, PlanStatus};
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::{GoalBuilder, HtnDomain, HtnError, Task};
@@ -934,19 +934,19 @@ fn plan_mtr_ordering() {
     let low = Plan {
         steps: vec![0],
         names: vec!["A".into()],
-        mtr: Mtr(vec![0]),
+        mtr: vec![0],
         status: PlanStatus::Complete,
     };
     let high = Plan {
         steps: vec![1],
         names: vec!["B".into()],
-        mtr: Mtr(vec![1]),
+        mtr: vec![1],
         status: PlanStatus::Complete,
     };
     assert!(low.is_preferred_over(&high));
     assert!(!high.is_preferred_over(&low));
-    assert_eq!(low.mtr().to_string(), "0");
-    assert_eq!(high.mtr().to_string(), "1");
+    assert_eq!(format!("{:?}", low.mtr()), "[0]");
+    assert_eq!(format!("{:?}", high.mtr()), "[1]");
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1134,7 @@ fn unknown_goal_yields_unknown_task_error() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = BackPlanner::new(&domain);
     let err = planner.plan(missing_goal, &state).unwrap_err();
-    assert!(matches!(err, HtnError::UnknownTask { .. }));
+    assert!(matches!(err, HtnError::UnregisteredTask { .. }));
 }
 
 #[test]

@@ -774,3 +774,51 @@ fn backward_plan_is_a_compiled_program() {
 }
 
 use bevy_bhtn::Task;
+
+// ---------------------------------------------------------------------------
+// Type-addressed registry/scratchpad access (post-freeze `TypeId` map)
+// ---------------------------------------------------------------------------
+
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Energy2(pub u32);
+
+/// The frozen registry carries the builder's `TypeId -> slot` map: every
+/// component resolves to the exact slot index the builder assigned, and
+/// unregistered types resolve to `None` — with no linear scan over the slot
+/// table (correctness pinned here; the map is the point of the change).
+#[test]
+fn frozen_registry_resolves_the_builder_slot_map() {
+    let mut reg = RegistryBuilder::default();
+    let gold_idx = reg.index::<Gold>();
+    let name_idx = reg.index::<Name>();
+    let energy_idx = reg.index::<Energy2>();
+    let frozen = reg.freeze();
+
+    assert_eq!(frozen.get::<Gold>(), Some(gold_idx));
+    assert_eq!(frozen.get::<Name>(), Some(name_idx));
+    assert_eq!(frozen.get::<Energy2>(), Some(energy_idx));
+    struct NeverRegistered;
+    assert!(!frozen.contains::<NeverRegistered>(), "unregistered types miss");
+}
+
+/// `PlanState::get_by_type`/`get_mut_by_type` resolve through the same map:
+/// values written via the builder are visible by type, mutation through
+/// `get_mut_by_type` lands in the slot (observable both ways), and a
+/// component the registry never saw reads as `None` instead of panicking.
+#[test]
+fn plan_state_type_addressed_reads_roundtrip() {
+    let mut reg = RegistryBuilder::default();
+    let _ = reg.index::<Gold>();
+    let _ = reg.index::<Energy2>();
+    let frozen = reg.freeze();
+
+    let mut state = PlanState::build(&frozen).set(Gold(7)).finish();
+    assert_eq!(state.get_by_type::<Gold>(), Some(&Gold(7)));
+    assert!(state.get_by_type::<Name>().is_none(), "never registered");
+
+    *state.get_mut_by_type::<Energy2>().unwrap() = Energy2(9);
+    // The raw slot-index path sees the type-addressed write (one pool, one slot).
+    let energy_slot = frozen.get::<Energy2>().unwrap();
+    assert_eq!(state.get::<Energy2>(energy_slot), &Energy2(9));
+    assert_eq!(state.get_by_type::<Gold>(), Some(&Gold(7)), "adjacent slot untouched");
+}

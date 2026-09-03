@@ -158,23 +158,23 @@ impl<'a> Ahtn<'a> {
         eval: impl Fn(&PlanState) -> f32,
         depth: usize,
     ) -> HtnResult<Option<AhtnOutcome>> {
-        let resolve = |name: &str, idx: Option<usize>| -> HtnResult<usize> {
-            let idx = idx.ok_or_else(|| HtnError::UnknownTask {
-                name: name.to_string(),
+        let resolve = |type_path: &str, idx: Option<usize>| -> HtnResult<usize> {
+            let idx = idx.ok_or_else(|| HtnError::UnregisteredTask {
+                type_name: type_path.to_string(),
             })?;
             if !self.domain.tasks[idx].is_compound() {
                 return Err(HtnError::builder(format!(
-                    "adversarial root `{name}` must be a compound task"
+                    "adversarial root `{type_path}` must be a compound task"
                 )));
             }
             Ok(idx)
         };
         let max_idx = resolve(
-            MaxRoot::task_name(),
+            std::any::type_name::<MaxRoot>(),
             self.domain.task_index_by_type(max_root.task_type_id()),
         )?;
         let min_idx = resolve(
-            MinRoot::task_name(),
+            std::any::type_name::<MinRoot>(),
             self.domain.task_index_by_type(min_root.task_type_id()),
         )?;
 

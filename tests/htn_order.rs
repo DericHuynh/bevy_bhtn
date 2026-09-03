@@ -27,6 +27,7 @@ use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
 use bevy_bhtn::{HtnDomain, TaskSummary};
+use bevy_bhtn::selection::HtnSearchStrategy;
 use bevy_ecs::prelude::*;
 
 /// A task fn's item type cannot be named directly, so the lookup-by-type API
@@ -115,7 +116,7 @@ fn unordered_set_backtracks_to_a_valid_linearization() {
         "the reversed linearization was found by backtracking"
     );
     assert_eq!(
-        plan.mtr().0,
+        plan.mtr(),
         [0],
         "the MTR records the method index only — no permutation entry"
     );
@@ -345,10 +346,10 @@ fn cost_bounded_prunes_partial_methods_by_their_member_sum() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_cost_bounded(true);
+    planner.set_strategy(HtnSearchStrategy::CostBounded);
     let plan = plan_of(&mut planner, root, &state);
     assert_eq!(plan.task_names(), ["cheap"]);
-    assert_eq!(plan.mtr().0, [1]);
+    assert_eq!(plan.mtr(), [1]);
 }
 
 // ---------------------------------------------------------------------------

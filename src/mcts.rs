@@ -68,7 +68,7 @@
 use std::collections::VecDeque;
 
 use crate::domain::{HtnDomain, Task};
-use crate::planner::{Mtr, Plan, PlanStatus};
+use crate::planner::{Plan, PlanStatus};
 use crate::state::PlanState;
 
 /// One search-tree node: a choice point (or terminal) with its simulated
@@ -351,7 +351,7 @@ impl crate::selection::Searcher for MctsSearcher {
                         .map(|&i| domain.tasks[i as usize].name().into())
                         .collect(),
                     steps: plan,
-                    mtr: Mtr::default(),
+                    mtr: Vec::new(),
                     status: PlanStatus::Complete,
                 });
             }
@@ -557,7 +557,7 @@ impl crate::selection::Searcher for MctsSearcher {
                 .map(|&i| domain.tasks[i as usize].name().into())
                 .collect(),
             steps: plan,
-            mtr: Mtr::default(),
+            mtr: Vec::new(),
             status: PlanStatus::Complete,
         })
     }

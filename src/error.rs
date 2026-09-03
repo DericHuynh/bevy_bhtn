@@ -14,11 +14,14 @@ pub enum HtnError {
         details: String,
     },
 
-    /// A referenced task name was not defined in the domain.
-    #[error("Task `{name}` was not found in the HTN domain")]
-    UnknownTask {
-        /// The missing task name.
-        name: String,
+    /// A task or goal function that was never recorded in the domain (e.g. a
+    /// back-planning goal or an adversarial root not registered via
+    /// `from_root`/`root`). Resolution is by the function's `TypeId`; the
+    /// string is its `type_name` for diagnosis.
+    #[error("Task function `{type_name}` was never recorded in this domain")]
+    UnregisteredTask {
+        /// The `type_name` of the unregistered function.
+        type_name: String,
     },
 
     /// A back-plan could not reach the goal state.
@@ -39,11 +42,6 @@ impl HtnError {
         HtnError::Builder {
             details: details.into(),
         }
-    }
-
-    /// Create a [`HtnError::UnknownTask`].
-    pub fn unknown_task(name: impl Into<String>) -> Self {
-        HtnError::UnknownTask { name: name.into() }
     }
 }
 

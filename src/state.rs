@@ -145,7 +145,6 @@ fn default_fn<T: PlanComponent>() -> DefaultFn {
 /// loop — extract/refresh/clone/`copy_from`/drop — on a single cache-friendly
 /// array.
 pub(crate) struct Slot {
-    pub(crate) tid: TypeId,
     name: &'static str,
     pub(crate) offset: usize,
     pub(crate) size: usize,
@@ -165,6 +164,10 @@ pub struct RegistryLayout {
     total: usize,
     /// Maximum slot alignment — the pool allocation's alignment.
     align: usize,
+    /// `TypeId -> slot index`, carried from the builder so the frozen
+    /// registry resolves components in O(1) (the slot table alone would
+    /// force a linear scan per lookup).
+    by_type: HashMap<TypeId, usize>,
 }
 
 impl RegistryLayout {
@@ -174,7 +177,6 @@ impl RegistryLayout {
         let size = std::mem::size_of::<T>();
         let offset = self.total.next_multiple_of(align);
         self.slots.push(Slot {
-            tid: TypeId::of::<T>(),
             name,
             offset,
             size,
@@ -187,6 +189,7 @@ impl RegistryLayout {
         });
         self.total = offset + size;
         self.align = self.align.max(align);
+        self.by_type.insert(TypeId::of::<T>(), self.slots.len() - 1);
         self.slots.len() - 1
     }
 }
@@ -261,10 +264,10 @@ impl ComponentRegistry {
         self.get::<T>().is_some()
     }
 
-    /// The slot index of component `T`, if registered.
+    /// The slot index of component `T`, if registered (O(1) via the frozen
+    /// `TypeId` map).
     pub fn get<T: 'static>(&self) -> Option<usize> {
-        let tid = TypeId::of::<T>();
-        self.layout.slots.iter().position(|s| s.tid == tid)
+        self.layout.by_type.get(&TypeId::of::<T>()).copied()
     }
 
     /// The number of registered components (the
@@ -543,6 +546,21 @@ impl PlanState {
         unsafe { &mut *self.slot_ptr::<T>(idx) }
     }
 
+    /// Read component `T` by type, resolving its slot through the frozen
+    /// registry's `TypeId` map. `None` if `T` was never registered — the
+    /// ergonomic counterpart to the raw slot-index [`Self::get`] the hot
+    /// loop uses.
+    pub fn get_by_type<T: PlanComponent>(&self) -> Option<&T> {
+        let idx = *self.layout.by_type.get(&TypeId::of::<T>())?;
+        Some(self.get::<T>(idx))
+    }
+
+    /// Mutably read component `T` by type (see [`Self::get_by_type`]).
+    pub fn get_mut_by_type<T: PlanComponent>(&mut self) -> Option<&mut T> {
+        let idx = *self.layout.by_type.get(&TypeId::of::<T>())?;
+        Some(self.get_mut::<T>(idx))
+    }
+
     /// Raw pointers to the given slots, proven disjoint by their distinct
     /// registered offsets. Used by the compiled multi-argument effect
     /// closures.
@@ -717,12 +735,7 @@ impl PlanStateBuilder {
     /// Set component `T`'s slot to `value` (a no-op if `T` is not registered).
     #[must_use]
     pub fn set<T: PlanComponent>(mut self, value: T) -> Self {
-        if let Some(i) = self
-            .layout
-            .slots
-            .iter()
-            .position(|s| s.tid == TypeId::of::<T>())
-        {
+        if let Some(i) = self.layout.by_type.get(&TypeId::of::<T>()).copied() {
             unsafe {
                 let slot = self.pool.as_mut_ptr().add(self.layout.slots[i].offset) as *mut T;
                 if self.initialized[i] {

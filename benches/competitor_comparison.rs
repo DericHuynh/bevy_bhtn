@@ -204,7 +204,7 @@ mod bhtn_side {
             }
             let mut planner = HtnPlanner::new(&domain.0);
             planner.set_sanity_limit(DEEP_SANITY_LIMIT);
-            let plan = planner.plan_index(domain.0.root, &scratch.0);
+            let plan = planner.plan(domain.0.root, &scratch.0);
             agent.plan = plan.steps;
             agent.cursor = 0;
         });

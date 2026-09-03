@@ -29,10 +29,12 @@ use std::collections::VecDeque;
 use std::ptr::NonNull;
 
 use smallvec::SmallVec;
+use std::any::TypeId;
+
 use ustr::Ustr;
 
 use crate::domain::SelectionPolicy;
-use crate::selection::{DecompositionTrace, TraceOutcome};
+use crate::selection::{DecompositionTrace, HtnSearchStrategy, TraceOutcome};
 use crate::tasks::TaskFn;
 
 use crate::domain::HtnDomain;
@@ -40,26 +42,6 @@ use crate::domain::Task;
 use crate::lookahead::{self, Lookahead};
 use crate::order::{linearize, SubtaskOrder};
 use crate::state::{PlanState, Slot};
-
-/// The method traversal record of a completed plan: the index of the chosen
-/// method at each decomposition level. Used to compare plans by priority
-/// (lower index = higher priority) and for debugging.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Mtr(pub Vec<usize>);
-
-impl std::fmt::Display for Mtr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.0
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
-        )
-    }
-}
 
 /// A completed forward plan: a **compiled step program** plus the MTR.
 ///
@@ -78,6 +60,34 @@ pub enum PlanStatus {
     Partial,
 }
 
+/// What a planning call starts from: a task function (its `TypeId` resolves
+/// through the baked type index) or a task index into
+/// [`HtnDomain::tasks`](crate::domain::HtnDomain). Constructed implicitly —
+/// pass either the fn item or the `usize` wherever a root is expected
+/// ([`HtnPlanner::plan`]/[`HtnPlanner::plan_traced`]). The index form exists
+/// for callers holding a baked domain without its function types (the ECS
+/// driver, test beds) and is the only way to address GTN-synthesized tasks,
+/// which have no function type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRoot {
+    /// Start from this task function (resolved by `TypeId`).
+    Fn(TypeId),
+    /// Start from this task index directly.
+    Index(usize),
+}
+
+impl<F: TaskFn> From<F> for PlanRoot {
+    fn from(f: F) -> Self {
+        Self::Fn(f.task_type_id())
+    }
+}
+
+impl From<usize> for PlanRoot {
+    fn from(idx: usize) -> Self {
+        Self::Index(idx)
+    }
+}
+
 /// The compiled plan a planner returns: a flat step program over the domain's
 /// task indices.
 ///
@@ -93,8 +103,11 @@ pub struct Plan {
     /// Interned task names, parallel to [`Self::steps`] (display/introspection;
     /// execution reads [`Self::steps`] only).
     pub names: Vec<Ustr>,
-    /// Method indices chosen at each decomposition level.
-    pub mtr: Mtr,
+    /// The MTR (Method Traversal Record): the index of the chosen method at
+    /// each decomposition level. Used to compare plans by priority (lower
+    /// index = higher priority) and for debugging; exposed as a slice by
+    /// [`Self::mtr`].
+    pub mtr: Vec<usize>,
     /// Whether the search finished (`Complete`) or was cut short (`Partial`).
     pub status: PlanStatus,
 }
@@ -133,21 +146,23 @@ impl Plan {
         self.steps.is_empty()
     }
 
-    /// The MTR for this plan.
-    pub fn mtr(&self) -> &Mtr {
+    /// The MTR: the index of the chosen method at each decomposition level
+    /// (lower = higher priority). Forward-only — backward plans and
+    /// custom-searcher plans have an empty MTR.
+    pub fn mtr(&self) -> &[usize] {
         &self.mtr
     }
 
     /// Order two plans by MTR priority (lower first).
     pub fn is_preferred_over(&self, other: &Self) -> bool {
-        for (a, b) in self.mtr.0.iter().zip(other.mtr.0.iter()) {
+        for (a, b) in self.mtr.iter().zip(other.mtr.iter()) {
             match a.cmp(b) {
                 std::cmp::Ordering::Equal => continue,
                 ord => return ord == std::cmp::Ordering::Less,
             }
         }
         // Prefer the shorter MTR when they share a prefix.
-        self.mtr.0.len() < other.mtr.0.len()
+        self.mtr.len() < other.mtr.len()
     }
 }
 
@@ -385,11 +400,11 @@ pub struct HtnPlanner<'a> {
     /// Decomposition-step budget before the best partial plan is returned
     /// (default: 100).
     sanity_limit: usize,
-    /// Fail-fast mode: abandon the branch on first downstream failure and
-    /// return the partial plan immediately (no backtracking).
-    fail_fast: bool,
-    /// Cost-bounded branch-and-bound mode (see [`Self::set_cost_bounded`]).
-    cost_bounded: bool,
+    /// The active search strategy (default: [`DepthFirst`](HtnSearchStrategy::DepthFirst)).
+    /// Encodes the mode as one value — the old independent `fail_fast`/
+    /// `cost_bounded` bools could represent combinations (both on) whose
+    /// behavior was undefined.
+    strategy: HtnSearchStrategy,
 }
 
 impl<'a> HtnPlanner<'a> {
@@ -399,8 +414,7 @@ impl<'a> HtnPlanner<'a> {
             domain,
             lookahead: true,
             sanity_limit: 100,
-            fail_fast: false,
-            cost_bounded: false,
+            strategy: HtnSearchStrategy::default(),
         }
     }
 
@@ -427,38 +441,36 @@ impl<'a> HtnPlanner<'a> {
         self
     }
 
-    /// Enable fail-fast mode: abandon the branch on first downstream failure
-    /// and return the partial plan immediately (no backtracking). Used by the
-    /// [`DepthFirstFailFast`](crate::selection::HtnSearchStrategy::DepthFirstFailFast)
-    /// strategy.
-    pub fn set_fail_fast(&mut self, enabled: bool) -> &mut Self {
-        self.fail_fast = enabled;
+    /// Set the search strategy — the single knob for the planner's mode:
+    /// [`DepthFirst`](HtnSearchStrategy::DepthFirst) (default, full MTR
+    /// backtracking), [`DepthFirstFailFast`](HtnSearchStrategy::DepthFirstFailFast)
+    /// (abandon on first downstream failure),
+    /// [`CostBounded`](HtnSearchStrategy::CostBounded) (branch-and-bound over
+    /// accumulated primitive cost), or [`Custom`](HtnSearchStrategy::Custom)
+    /// (a caller-supplied [`Searcher`] that bypasses the built-in machinery —
+    /// its statistics live in the strategy object, and lookahead/sanity do
+    /// not apply to it). Replacing a strategy replaces it entirely: the old
+    /// independent bools could describe combinations (fail-fast **and**
+    /// cost-bounded) whose behavior was undefined.
+    pub fn set_strategy(&mut self, strategy: HtnSearchStrategy) -> &mut Self {
+        self.strategy = strategy;
         self
     }
 
-    /// Enable cost-bounded branch-and-bound: keep the cheapest *complete*
-    /// plan found within the sanity budget and prune any branch whose
-    /// accumulated primitive cost plus the bake-time `min_cost` lower bound
-    /// of its remaining sequence cannot strictly beat it. Used by the
-    /// [`CostBounded`](crate::selection::HtnSearchStrategy::CostBounded)
-    /// strategy. Primitives without a `cost`/`cost_fn` annotation count 0,
-    /// so with no annotations at all this behaves exactly like plain
-    /// [`DepthFirst`](crate::selection::HtnSearchStrategy::DepthFirst).
-    pub fn set_cost_bounded(&mut self, enabled: bool) -> &mut Self {
-        self.cost_bounded = enabled;
-        self
-    }
-
-    /// Decompose the task function `root` into a [`Plan`]. Never errors: on
-    /// failure it returns the best partial plan found (with an empty task list
-    /// if nothing was decomposable). Check [`Plan::status`] to tell a finished
+    /// Decompose `root` into a [`Plan`]. Never errors: on failure it returns
+    /// the best partial plan found (with an empty task list if nothing was
+    /// decomposable — including an unregistered root function or an
+    /// out-of-bounds index). Check [`Plan::status`] to tell a finished
     /// decomposition ([`PlanStatus::Complete`]) from one the sanity budget or
     /// fail-fast cut short ([`PlanStatus::Partial`]) — a partial plan may not
     /// reach the goal.
     ///
-    /// `root` is the task function itself, passed by value (fn items are
-    /// zero-sized): its `TypeId` is resolved through the baked type index —
-    /// names are display-only. An unregistered function yields an empty plan.
+    /// `root` is a task function (passed by value — fn items are zero-sized,
+    /// so turbofish is impossible; its `TypeId` resolves through the baked
+    /// type index; names are display-only) or a task index into
+    /// [`HtnDomain::tasks`](crate::domain::HtnDomain) — the form callers
+    /// holding a baked domain without its function types use (the driver,
+    /// test beds, and the only way to address GTN-synthesized tasks).
     ///
     /// `state` is only read: the planner works on its own clone of the
     /// scratchpad.
@@ -467,47 +479,39 @@ impl<'a> HtnPlanner<'a> {
     /// ([`lookahead`]) proves the remaining sequence can possibly succeed;
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
-    pub fn plan<F: TaskFn>(&mut self, root: F, state: &PlanState) -> Plan {
-        match self.domain.task_index_by_type(root.task_type_id()) {
+    pub fn plan(&mut self, root: impl Into<PlanRoot>, state: &PlanState) -> Plan {
+        match self.resolve_root(root) {
             Some(idx) => self.plan_inner(idx, state, None),
             None => Plan::default(),
         }
     }
 
-    /// [`Self::plan`] by task index — no name lookup, no allocation. The
-    /// driver's hot path (the domain root is a known index).
-    pub fn plan_index(&mut self, root: usize, state: &PlanState) -> Plan {
-        self.plan_inner(root, state, None)
-    }
-
-    /// Decompose the task function `root` into a [`Plan`], appending one
-    /// [`DecompositionTrace`] per branch-selection decision to `trace`.
-    ///
-    /// `root` is the task function itself, passed by value (see [`Self::plan`]).
+    /// Decompose `root` into a [`Plan`], appending one [`DecompositionTrace`]
+    /// per branch-selection decision to `trace` (see [`Self::plan`]).
     ///
     /// Tracing is per *commitment* — one event per branch that was selected,
     /// failed its preconditions, or was backtracked past — never per
-    /// precondition attempt inside the look-ahead sweep.
-    pub fn plan_traced<F: TaskFn>(
+    /// precondition attempt inside the look-ahead sweep. `Custom` strategies
+    /// emit nothing: they own their search.
+    pub fn plan_traced(
         &mut self,
-        root: F,
+        root: impl Into<PlanRoot>,
         state: &PlanState,
         trace: &mut Vec<DecompositionTrace>,
     ) -> Plan {
-        match self.domain.task_index_by_type(root.task_type_id()) {
+        match self.resolve_root(root) {
             Some(idx) => self.plan_inner(idx, state, Some(trace)),
             None => Plan::default(),
         }
     }
 
-    /// [`Self::plan_traced`] by task index (see [`Self::plan_index`]).
-    pub fn plan_traced_index(
-        &mut self,
-        root: usize,
-        state: &PlanState,
-        trace: &mut Vec<DecompositionTrace>,
-    ) -> Plan {
-        self.plan_inner(root, state, Some(trace))
+    /// Resolve a plan root to a task index (`None` = unregistered function or
+    /// out-of-bounds index — both yield the empty plan, never a panic).
+    fn resolve_root(&self, root: impl Into<PlanRoot>) -> Option<usize> {
+        match root.into() {
+            PlanRoot::Fn(tid) => self.domain.task_index_by_type(tid),
+            PlanRoot::Index(idx) => (idx < self.domain.tasks.len()).then_some(idx),
+        }
     }
 
     /// The search itself.
@@ -517,6 +521,18 @@ impl<'a> HtnPlanner<'a> {
         state: &PlanState,
         mut trace: Option<&mut Vec<DecompositionTrace>>,
     ) -> Plan {
+        // Custom searchers bypass the built-in machinery entirely: they own
+        // their search (and their statistics); lookahead/sanity do not apply.
+        if let HtnSearchStrategy::Custom(searcher) = &self.strategy {
+            return searcher.search(self.domain, state).unwrap_or_default();
+        }
+        // The strategy enum encodes the valid combinations the old independent
+        // bools left undefined (fail-fast + cost-bounded together).
+        let (fail_fast, cost_bounded) = match self.strategy {
+            HtnSearchStrategy::DepthFirstFailFast => (true, false),
+            HtnSearchStrategy::CostBounded => (false, true),
+            _ => (false, false),
+        };
         let sanity_limit = self.sanity_limit;
         let mut count = 0;
         // `Complete` unless the search stops early (fail-fast or a defensive
@@ -548,8 +564,7 @@ impl<'a> HtnPlanner<'a> {
         let mut skip = 0;
         // Cost-bounded branch-and-bound state: the accumulated cost of the
         // committed primitives (`g`), and the best complete plan found so far
-        // with its cost. Both stay inert unless `cost_bounded` is set.
-        let cost_bounded = self.cost_bounded;
+        // with its cost. Both stay inert unless the strategy is CostBounded.
         let mut g = 0.0f32;
         let mut best: Option<Plan> = None;
         let mut best_cost = f32::INFINITY;
@@ -735,7 +750,7 @@ impl<'a> HtnPlanner<'a> {
                         let Some((method, idx)) = eligible else {
                             // No eligible method: unwind to the most recent
                             // decomposition and try its next choice.
-                            if self.fail_fast {
+                            if fail_fast {
                                 status = PlanStatus::Partial;
                                 break 'search;
                             }
@@ -921,7 +936,7 @@ impl<'a> HtnPlanner<'a> {
                             0.0
                         };
                         if cost_bounded && best.is_some() && g + step_cost >= best_cost {
-                            if self.fail_fast {
+                            if fail_fast {
                                 status = PlanStatus::Partial;
                                 break 'search;
                             }
@@ -960,7 +975,7 @@ impl<'a> HtnPlanner<'a> {
                         skip = 0;
                         continue;
                     }
-                    if self.fail_fast {
+                    if fail_fast {
                         status = PlanStatus::Partial;
                         break 'search;
                     }
@@ -1112,7 +1127,7 @@ fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>, status: PlanStat
     Plan {
         steps: plan.iter().map(|&i| i as u32).collect(),
         names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
-        mtr: Mtr(mtr),
+        mtr,
         status,
     }
 }

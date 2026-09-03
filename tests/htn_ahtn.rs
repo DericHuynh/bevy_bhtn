@@ -488,7 +488,7 @@ fn ahtn_rejects_bad_roots() {
     let eval = invasion_eval(gold, bribed);
 
     let err = search(&domain, None, never_registered, defend, &state, &eval, 10).unwrap_err();
-    assert!(matches!(err, HtnError::UnknownTask { .. }));
+    assert!(matches!(err, HtnError::UnregisteredTask { .. }));
 
     // `ram` is a primitive, not a compound root.
     let err = search(&domain, None, ram, defend, &state, &eval, 10).unwrap_err();

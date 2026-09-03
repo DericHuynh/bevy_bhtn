@@ -68,8 +68,8 @@ impl<'a> BackPlanner<'a> {
     /// order. The plan's MTR is empty (MTR is a forward-only concept).
     pub fn plan<F: GoalFn>(&mut self, goal: F, initial_state: &PlanState) -> HtnResult<Plan> {
         let Some(goal_task) = self.domain.goal(goal) else {
-            return Err(HtnError::UnknownTask {
-                name: F::goal_name().to_string(),
+            return Err(HtnError::UnregisteredTask {
+                type_name: std::any::type_name::<F>().to_string(),
             });
         };
         if goal_task.effects.is_empty() {
@@ -116,7 +116,7 @@ impl<'a> BackPlanner<'a> {
                 .map(|&s| self.domain.tasks[s as usize].name().into())
                 .collect(),
             steps,
-            mtr: crate::planner::Mtr::default(),
+            mtr: Vec::new(),
             // Reverse chaining runs to completion or errors — never a
             // truncated prefix.
             status: crate::planner::PlanStatus::Complete,

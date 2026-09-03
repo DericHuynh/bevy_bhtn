@@ -587,6 +587,10 @@ pub(crate) struct Recorder {
 /// build-time error.
 pub struct TaskBuilder<'a> {
     rec: &'a mut Recorder,
+    /// The index into `rec.tasks` of the placeholder this builder fills in
+    /// (structural, not conventional: `finish` writes the recorded proto
+    /// there, so it cannot clobber a neighboring task).
+    task_index: usize,
     preconditions: Vec<Precondition>,
     effects: Vec<Effect>,
     expected_effects: Vec<Effect>,
@@ -598,9 +602,10 @@ pub struct TaskBuilder<'a> {
 }
 
 impl<'a> TaskBuilder<'a> {
-    pub(crate) fn new(rec: &'a mut Recorder) -> Self {
+    pub(crate) fn new(rec: &'a mut Recorder, task_index: usize) -> Self {
         Self {
             rec,
+            task_index,
             preconditions: Vec::new(),
             effects: Vec::new(),
             expected_effects: Vec::new(),
@@ -707,15 +712,10 @@ impl<'a> TaskBuilder<'a> {
                 self.rec.errors.push(
                     "task mixes compound (`branch`) and primitive (`precondition`/`effect`/`action`) declarations".into(),
                 );
-                TaskProto::Compound {
-                    methods: self.methods,
-                    policy: self.selection.unwrap_or_default(),
-                }
-            } else {
-                TaskProto::Compound {
-                    methods: self.methods,
-                    policy: self.selection.unwrap_or_default(),
-                }
+            }
+            TaskProto::Compound {
+                methods: self.methods,
+                policy: self.selection.unwrap_or_default(),
             }
         } else {
             TaskProto::Primitive {
@@ -727,14 +727,15 @@ impl<'a> TaskBuilder<'a> {
                 static_cost: self.static_cost,
             }
         };
-        // The task's own TypeId was registered by the expansion loop before
-        // this builder was created; replace its placeholder proto.
-        let last = self.rec.tasks.last_mut().expect("placeholder registered");
-        last.2 = kind;
+        // Replace the placeholder proto registered for exactly this task.
+        self.rec.tasks[self.task_index].2 = kind;
     }
 }
 
-/// Configure one branch inside [`TaskBuilder::branch`]. Committed on drop.
+/// Configure one branch inside [`TaskBuilder::branch`]. Edits apply
+/// immediately to the branch under construction — call the methods in order,
+/// then move on to the next `branch()` (methods are tried in declaration
+/// order).
 pub struct MethodBuilder<'a> {
     rec: &'a mut Recorder,
     proto: &'a mut MethodProto,

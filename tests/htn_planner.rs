@@ -737,3 +737,30 @@ fn plan_status_reports_complete_vs_partial() {
     assert!(plan.is_complete());
     assert!(plan.is_empty());
 }
+
+/// The plan entrypoints are consolidated: one `plan`/`plan_traced` pair that
+/// accepts either a task function or a task index (the `Into<PlanRoot>`
+/// conversion). The index form addresses the same task as the function form,
+/// and an out-of-bounds index degrades to the empty plan — never a panic
+/// (the "never errors" contract covers both root forms).
+#[test]
+fn plan_roots_accept_functions_and_indices_alike() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(leaf);
+    }
+    fn leaf(task: &mut TaskBuilder) {
+        task.effect(|cash: &mut Cash| cash.0 = 1);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+
+    // Function form and index form address the same task.
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["leaf"]);
+    assert_eq!(planner.plan(domain.root, &state).task_names(), ["leaf"]);
+
+    // An out-of-bounds index yields the empty plan instead of panicking.
+    assert!(planner.plan(999, &state).is_empty());
+    assert!(planner.plan(usize::MAX, &state).is_empty());
+}

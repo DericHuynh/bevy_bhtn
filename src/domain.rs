@@ -43,6 +43,33 @@ pub struct HtnDomain {
     pub(crate) summaries: Vec<TaskSummary>,
 }
 
+/// Expand queued task functions until the queue drains: each function is
+/// recorded exactly once — under the display name captured at its FIRST
+/// reference site — as a compound placeholder that the recorded body fills
+/// in; repeated/recursive references were already turned into plain edges at
+/// their `then` sites. Shared by `from_root`, `DomainBuilder::root`, and
+/// `DomainBuilder::insertable` (the discipline must not drift between them).
+fn expand_queue(rec: &mut crate::tasks::Recorder) {
+    while let Some((f, name)) = rec.queue.pop_front() {
+        let tid = SubtaskRef::Fn(f.task_type_id());
+        if rec.index_of.contains_key(&tid) {
+            continue; // already recorded — the edge was recorded at `then`
+        }
+        rec.index_of.insert(tid, rec.tasks.len());
+        rec.tasks.push((
+            tid,
+            name,
+            TaskProto::Compound {
+                methods: Vec::new(),
+                policy: SelectionPolicy::default(),
+            },
+        ));
+        let mut builder = crate::tasks::TaskBuilder::new(rec, rec.tasks.len() - 1);
+        f.record(&mut builder);
+        builder.finish();
+    }
+}
+
 impl HtnDomain {
     /// Begin building a domain from a root task function. The function (and
     /// everything it references via `.then`) is recorded immediately; add
@@ -78,32 +105,15 @@ impl HtnDomain {
             },
         ));
         {
-            let mut builder = crate::tasks::TaskBuilder::new(&mut rec);
+            let task_index = rec.tasks.len() - 1;
+            let mut builder = crate::tasks::TaskBuilder::new(&mut rec, task_index);
             root.record(&mut builder);
             builder.finish();
         }
 
-        // Expand every referenced task function (LIFO order; each function
-        // is recorded exactly once — cycles become plain graph edges). The
-        // display name is the one captured at the FIRST reference site.
-        while let Some((f, name)) = rec.queue.pop_front() {
-            let tid = SubtaskRef::Fn(f.task_type_id());
-            if rec.index_of.contains_key(&tid) {
-                continue; // already recorded — the edge was recorded at `then`
-            }
-            rec.index_of.insert(tid, rec.tasks.len());
-            rec.tasks.push((
-                tid,
-                name,
-                TaskProto::Compound {
-                    methods: Vec::new(),
-                    policy: SelectionPolicy::default(),
-                },
-            ));
-            let mut builder = crate::tasks::TaskBuilder::new(&mut rec);
-            f.record(&mut builder);
-            builder.finish();
-        }
+        // Expand every referenced task function: each is recorded exactly once
+        // (cycles become plain graph edges).
+        expand_queue(&mut rec);
 
         DomainBuilder {
             rec,
@@ -233,29 +243,13 @@ impl DomainBuilder {
                 policy: SelectionPolicy::default(),
             },
         ));
-        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec);
+        let task_index = self.rec.tasks.len() - 1;
+        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec, task_index);
         f.record(&mut builder);
         builder.finish();
         // Drain queued (`.then`-referenced) tasks, same discipline as the
         // root expansion loop.
-        while let Some((g, name)) = self.rec.queue.pop_front() {
-            let gid = SubtaskRef::Fn(g.task_type_id());
-            if self.rec.index_of.contains_key(&gid) {
-                continue;
-            }
-            self.rec.index_of.insert(gid, self.rec.tasks.len());
-            self.rec.tasks.push((
-                gid,
-                name,
-                TaskProto::Compound {
-                    methods: Vec::new(),
-                    policy: SelectionPolicy::default(),
-                },
-            ));
-            let mut b2 = crate::tasks::TaskBuilder::new(&mut self.rec);
-            g.record(&mut b2);
-            b2.finish();
-        }
+        expand_queue(&mut self.rec);
         self.rec.extra_roots.push(tid);
         self
     }
@@ -285,29 +279,13 @@ impl DomainBuilder {
                 policy: SelectionPolicy::default(),
             },
         ));
-        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec);
+        let task_index = self.rec.tasks.len() - 1;
+        let mut builder = crate::tasks::TaskBuilder::new(&mut self.rec, task_index);
         f.record(&mut builder);
         builder.finish();
         // Drain queued (`.then`-referenced) tasks, same discipline as the
         // root expansion loop.
-        while let Some((g, name)) = self.rec.queue.pop_front() {
-            let gid = SubtaskRef::Fn(g.task_type_id());
-            if self.rec.index_of.contains_key(&gid) {
-                continue;
-            }
-            self.rec.index_of.insert(gid, self.rec.tasks.len());
-            self.rec.tasks.push((
-                gid,
-                name,
-                TaskProto::Compound {
-                    methods: Vec::new(),
-                    policy: SelectionPolicy::default(),
-                },
-            ));
-            let mut b2 = crate::tasks::TaskBuilder::new(&mut self.rec);
-            g.record(&mut b2);
-            b2.finish();
-        }
+        expand_queue(&mut self.rec);
         self
     }
 

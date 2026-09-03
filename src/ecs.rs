@@ -127,11 +127,11 @@ use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
 
 use crate::domain::HtnDomain;
+use crate::domain::Task;
 use crate::error::HtnResult;
 use crate::planner::{HtnPlanner, Plan};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, SearchOverride};
 use crate::state::PlanState;
-use crate::domain::Task;
 
 /// The per-entity AI component: current plan and cursor.
 ///
@@ -360,35 +360,13 @@ pub fn htn_ai_system(world: &mut World) {
                 let mut planner = HtnPlanner::new(&config.domain);
                 planner
                     .set_lookahead(config.lookahead)
-                    .set_sanity_limit(sanity);
+                    .set_sanity_limit(sanity)
+                    .set_strategy(strategy.clone());
                 let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
-                let plan = match &strategy {
-                    HtnSearchStrategy::DepthFirst => {
-                        if config.debug_trace {
-                            planner.plan_traced_index(root, state, &mut trace_buf)
-                        } else {
-                            planner.plan_index(root, state)
-                        }
-                    }
-                    HtnSearchStrategy::DepthFirstFailFast => {
-                        planner.set_fail_fast(true);
-                        if config.debug_trace {
-                            planner.plan_traced_index(root, state, &mut trace_buf)
-                        } else {
-                            planner.plan_index(root, state)
-                        }
-                    }
-                    HtnSearchStrategy::CostBounded => {
-                        planner.set_cost_bounded(true);
-                        if config.debug_trace {
-                            planner.plan_traced_index(root, state, &mut trace_buf)
-                        } else {
-                            planner.plan_index(root, state)
-                        }
-                    }
-                    HtnSearchStrategy::Custom(searcher) => {
-                        searcher.search(&config.domain, state).unwrap_or_default()
-                    }
+                let plan = if config.debug_trace {
+                    planner.plan_traced(root, state, &mut trace_buf)
+                } else {
+                    planner.plan(root, state)
                 };
                 if !trace_buf.is_empty() {
                     world

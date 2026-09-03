@@ -47,7 +47,7 @@ impl HtnTestBed {
     pub fn plan_forward(&self, state: &PlanState) -> Vec<Ustr> {
         let mut planner = HtnPlanner::new(&self.domain);
         planner
-            .plan_index(self.domain.root, state)
+            .plan(self.domain.root, state)
             .task_names()
             .to_vec()
     }
@@ -57,7 +57,7 @@ impl HtnTestBed {
         let mut planner = HtnPlanner::new(&self.domain);
         planner.set_lookahead(lookahead);
         planner
-            .plan_index(self.domain.root, state)
+            .plan(self.domain.root, state)
             .task_names()
             .to_vec()
     }

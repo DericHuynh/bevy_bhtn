@@ -104,13 +104,13 @@ fn highest_utility_selects_the_best_valid_branch() {
         ["win"]
     );
     let mtr = plan_of(&mut planner, utility_root, &rich);
-    assert_eq!(mtr.mtr().0, [0], "branch 0 (big) selected");
+    assert_eq!(mtr.mtr(), [0], "branch 0 (big) selected");
 
     // "big" invalid (gold < 5): "small" is the only valid branch.
     let poor = PlanState::build(&domain.components).set(Gold(0)).finish();
     let plan = plan_of(&mut planner, utility_root, &poor);
     assert_eq!(plan.task_names(), ["win"]);
-    assert_eq!(plan.mtr().0, [1], "branch 1 (small) selected");
+    assert_eq!(plan.mtr(), [1], "branch 1 (small) selected");
 }
 
 /// The default FirstMatch policy ignores utility entirely: declaration order
@@ -129,7 +129,7 @@ fn first_match_ignores_utility() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).mtr().0,
+        plan_of(&mut planner, root, &state).mtr(),
         [0],
         "declaration order"
     );
@@ -158,13 +158,13 @@ fn utility_fn_scores_from_components() {
     let near = PlanState::build(&domain.components)
         .set(Distance(2))
         .finish();
-    assert_eq!(plan_of(&mut planner, root, &near).mtr().0, [0]);
+    assert_eq!(plan_of(&mut planner, root, &near).mtr(), [0]);
 
     // Distance 200 → "close" scores 0 < 10.
     let far = PlanState::build(&domain.components)
         .set(Distance(200))
         .finish();
-    assert_eq!(plan_of(&mut planner, root, &far).mtr().0, [1]);
+    assert_eq!(plan_of(&mut planner, root, &far).mtr(), [1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ fn weighted_random_is_deterministic_and_weight_respecting() {
 
     // Weight 100 vs 0.001: the heavy branch wins with overwhelming
     // probability — pin it (the sampler is deterministic, so this is exact).
-    assert_eq!(plan_a.mtr().0, [0]);
+    assert_eq!(plan_a.mtr(), [0]);
 }
 
 /// Backtracking exhausts the *sampled* order instead of re-sampling: a
@@ -270,7 +270,7 @@ fn custom_ranker_orders_branches_and_is_sanitized() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     // The ranker reverses declaration order → branch 1 is tried first.
-    assert_eq!(plan_of(&mut planner, root, &state).mtr().0, [1]);
+    assert_eq!(plan_of(&mut planner, root, &state).mtr(), [1]);
 }
 
 /// A misbehaving ranker (dropping candidates) cannot make branches
@@ -381,11 +381,67 @@ fn fail_fast_returns_partial_plan_on_first_failure() {
     let domain = fail_fast_domain();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_fail_fast(true);
+    planner.set_strategy(HtnSearchStrategy::DepthFirstFailFast);
     assert_eq!(
         plan_of(&mut planner, fail_fast_root, &state).task_names(),
         ["prime"],
         "fail-fast keeps the partial plan instead of backtracking"
+    );
+}
+
+/// Regression pin for the strategy-seam fix: `Custom` is reachable directly
+/// on `HtnPlanner` (previously only through the ECS driver's match arm), and
+/// the searcher fully replaces the built-in machinery — its plan, its MTR,
+/// its status.
+#[test]
+fn planner_level_custom_strategy_bypasses_the_builtin_search() {
+    let domain = fail_fast_domain();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    planner.set_strategy(HtnSearchStrategy::Custom(std::sync::Arc::new(
+        FixedSearcher,
+    )));
+    let plan = plan_of(&mut planner, fail_fast_root, &state);
+    assert_eq!(
+        plan.task_names(),
+        ["works"],
+        "the searcher's plan, verbatim"
+    );
+    assert_eq!(plan.mtr(), [1], "the searcher's MTR, verbatim");
+    assert!(plan.is_complete());
+}
+
+/// The old `set_fail_fast`/`set_cost_bounded` bools could describe undefined
+/// combinations (both on). The enum replaces them: setting a strategy
+/// replaces the previous one entirely — last call wins, and switching back
+/// restores the original behavior exactly.
+#[test]
+fn strategy_replacement_last_call_wins() {
+    let domain = fail_fast_domain();
+    let state = PlanState::build(&domain.components).finish();
+
+    // DepthFirst backtracks past the dead branch 0 → ["works"].
+    let mut planner = HtnPlanner::new(&domain);
+    planner.set_strategy(HtnSearchStrategy::DepthFirst);
+    assert_eq!(
+        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        ["works"]
+    );
+
+    // Switching to FailFast mid-lifetime changes the behavior...
+    planner.set_strategy(HtnSearchStrategy::DepthFirstFailFast);
+    assert_eq!(
+        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        ["prime"],
+        "fail-fast keeps the partial plan"
+    );
+
+    // ...and switching back restores DepthFirst exactly.
+    planner.set_strategy(HtnSearchStrategy::DepthFirst);
+    assert_eq!(
+        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        ["works"],
+        "no stale mode flags survive a strategy replacement"
     );
 }
 
@@ -402,7 +458,7 @@ fn mtr_after_backtrack_records_only_the_chosen_method() {
     let plan = plan_of(&mut planner, fail_fast_root, &state);
     assert_eq!(plan.task_names(), ["works"]);
     assert_eq!(
-        plan.mtr().0,
+        plan.mtr(),
         [1],
         "branch 0 was backtracked past; only the chosen branch 1 remains"
     );
@@ -439,7 +495,7 @@ fn mtr_after_nested_backtrack_records_only_chosen_methods() {
     let plan = plan_of(&mut planner, root, &state);
     assert_eq!(plan.task_names(), ["works"]);
     assert_eq!(
-        plan.mtr().0,
+        plan.mtr(),
         [0, 1],
         "root chose branch 0; mid's failed branch 0 was replaced by branch 1"
     );
@@ -455,7 +511,7 @@ impl Searcher for FixedSearcher {
         Some(Plan {
             steps: vec![idx as u32],
             names: vec!["works".into()],
-            mtr: bevy_bhtn::planner::Mtr(vec![1]),
+            mtr: vec![1],
             status: bevy_bhtn::planner::PlanStatus::Complete,
         })
     }
