@@ -10,11 +10,22 @@ use std::any::TypeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::{PlanState, RegistryBuilder};
-use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
-use bevy_bhtn::{FieldSet, HtnDomain};
+use bevy_bhtn::tasks::{GoalBuilder, GoalFn, TaskBuilder, TaskFn};
+use bevy_bhtn::{BackPlanner, FieldSet, HtnDomain, HtnResult};
 use bevy_ecs::prelude::*;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn plan_goal<F: GoalFn>(back: &mut BackPlanner<'_>, _f: F, state: &PlanState) -> HtnResult<Plan> {
+    back.plan(_f, state)
+}
 
 // ---------------------------------------------------------------------------
 // Instrumented heap-owning component
@@ -329,7 +340,7 @@ fn zst_components_plan_end_to_end() {
     let state = PlanState::build(&domain.components).set(Gold(0)).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["check_flag", "act"]
     );
 }
@@ -400,7 +411,7 @@ fn duplicate_shared_params_are_allowed() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).set(Gold(3)).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["check"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["check"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +455,7 @@ fn same_slot_written_twice_rolls_back_cleanly() {
     // And the search backtracks through the double snapshot without
     // corruption: the doomed branch is abandoned, the safe one plans.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
 }
 
 /// Backtracking moves heap-owning values back by bytes (drop current, restore
@@ -475,7 +486,7 @@ fn rollback_moves_heap_values_without_leaks_or_double_frees() {
         .finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
     drop(state); // the planner's working clone is released inside plan()
 
     counter.assert_balanced();
@@ -505,7 +516,10 @@ fn successful_plan_releases_unrestored_journal_copies() {
         .finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["write_name"]);
+    assert_eq!(
+        plan_of(&mut planner, root, &state).task_names(),
+        ["write_name"]
+    );
     drop(state); // the planner's working clone is released inside plan()
 
     // constructed 1 (the initial value), cloned 2 (the planner's working
@@ -545,7 +559,7 @@ fn lookahead_scratch_reuse_balances_heap_clones() {
     // materializing/reusing the private scratch (clone + copy_from paths).
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(true);
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
     drop(state);
 
     counter.assert_balanced();
@@ -640,7 +654,7 @@ fn rollback_of_a_replaced_heap_value_frees_everything_exactly_once() {
     // Look-ahead off: the sweep would refute the doomed method before any
     // primitive runs, and the rollback journal would never be exercised.
     planner.set_lookahead(false);
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
     drop(state);
 }
 
@@ -676,7 +690,7 @@ fn rollback_of_repeated_unmutated_snapshots_frees_everything_exactly_once() {
 
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
     drop(state);
 }
 
@@ -718,7 +732,7 @@ fn plan_step_task_bounds_checks() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
 
     assert_eq!(plan.len(), 1);
     assert!(plan.step_task(0).is_some());
@@ -749,7 +763,7 @@ fn backward_plan_is_a_compiled_program() {
     let domain = HtnDomain::from_root(root).goal(three_gold).build().unwrap();
     let state = PlanState::build(&domain.components).set(Gold(0)).finish();
     let mut back = bevy_bhtn::BackPlanner::new(&domain);
-    let plan = back.plan("three_gold", &state).unwrap();
+    let plan = plan_goal(&mut back, three_gold, &state).unwrap();
 
     assert_eq!(plan.task_names(), ["earn"]);
     assert_eq!(plan.steps.len(), 1);

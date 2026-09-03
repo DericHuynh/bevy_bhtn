@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::{DomainBuilder, HtnDomain, TaskFn};
@@ -1256,12 +1256,28 @@ fn shared_pack_slings_once_across_two_fetch_trips() {
 /// *without* the compilation: the second trip's `sling_pack` reference hits
 /// the closed gate and the branch fails — the bandage is unplannable. This
 /// is the failure mode the `done` method exists to absorb.
+mod planning {
+    //! Test-local planning helpers (not tests — kept in a module so the
+    //! harness doesn't collect them).
+    use super::*;
+
+    /// Plan from `root` — `F` is inferred from the function item, so the lookup
+    /// uses the same `TypeId` the domain recorded at bake time.
+    pub(super) fn plan_root<F: TaskFn>(
+        planner: &mut HtnPlanner,
+        _root: F,
+        state: &PlanState,
+    ) -> Plan {
+        planner.plan(_root, state)
+    }
+}
+
 #[test]
 fn without_sharing_the_second_trip_reference_fails_the_branch() {
     let domain = HtnDomain::from_root(behave_shared).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("behave_shared", &state);
+    let plan = planning::plan_root(&mut planner, behave_shared, &state);
     assert!(plan.is_complete());
     assert!(
         plan.is_empty(),
@@ -1338,7 +1354,7 @@ fn without_insertion_the_unmodeled_precondition_kills_the_chain() {
     let domain = HtnDomain::from_root(behave_repair).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("behave_repair", &state);
+    let plan = planning::plan_root(&mut planner, behave_repair, &state);
     assert!(plan.is_complete());
     assert!(plan.is_empty(), "nothing frees the hands; nothing plans");
 }

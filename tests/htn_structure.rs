@@ -19,21 +19,35 @@
 mod common;
 use common::{Gold, Noise};
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::{HtnDomain, TaskBuilder};
+use bevy_bhtn::{HtnDomain, TaskBuilder, TaskFn, TaskSummary};
 use bevy_ecs::prelude::*;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {
+    domain.task_summary(_f)
+}
 
 /// A generic work counter (former `count` field).
 #[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
 struct Count(pub i32);
 
 /// One domain exercising every flag: flat work, terminating tail-recursive
-/// and self-embedding recursion, and non-terminating recursion.
-fn structure_domain() -> HtnDomain {
+/// and self-embedding recursion, and non-terminating recursion. The task
+/// functions live in a module so tests can name them for type-based lookup.
+mod structure_tasks {
+    use super::*;
+
     // Synthetic root so every top-level task is baked (from_root records the
-    // transitive .then graph only); tests plan the individual tasks by name.
-    fn root(task: &mut TaskBuilder) {
+    // transitive .then graph only); tests plan the individual tasks by type.
+    pub fn root(task: &mut TaskBuilder) {
         task.branch().then(work);
         task.branch().then(loop_);
         task.branch().then(spiral);
@@ -41,46 +55,49 @@ fn structure_domain() -> HtnDomain {
         task.branch().then(tail);
         task.branch().then(emb);
     }
-    fn work(task: &mut TaskBuilder) {
+    pub fn work(task: &mut TaskBuilder) {
         task.branch().then(dig).then(haul);
         task.branch().then(sell);
     }
-    fn dig(task: &mut TaskBuilder) {
+    pub fn dig(task: &mut TaskBuilder) {
         task.precondition(|gold: &Gold| gold.0 > 0)
             .effect(|count: &mut Count| count.0 += 1);
     }
-    fn haul(task: &mut TaskBuilder) {
+    pub fn haul(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn sell(task: &mut TaskBuilder) {
+    pub fn sell(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn loop_(task: &mut TaskBuilder) {
+    pub fn loop_(task: &mut TaskBuilder) {
         task.branch().then(tick);
         task.branch().then(loop_).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn spiral(task: &mut TaskBuilder) {
+    pub fn spiral(task: &mut TaskBuilder) {
         task.branch().then(spiral).then(tick);
     }
-    fn descend(task: &mut TaskBuilder) {
+    pub fn descend(task: &mut TaskBuilder) {
         task.branch().then(descend).then(eat);
         task.branch().then(eat);
     }
-    fn eat(task: &mut TaskBuilder) {
+    pub fn eat(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn tail(task: &mut TaskBuilder) {
+    pub fn tail(task: &mut TaskBuilder) {
         task.branch().then(tick);
         task.branch().then(tick).then(tail);
     }
-    fn emb(task: &mut TaskBuilder) {
+    pub fn emb(task: &mut TaskBuilder) {
         task.branch().then(tick);
         task.branch().then(emb).then(tick).then(emb);
     }
-    HtnDomain::from_root(root)
+}
+
+fn structure_domain() -> HtnDomain {
+    HtnDomain::from_root(structure_tasks::root)
         .build()
         .expect("structure domain is well-formed")
 }
@@ -88,11 +105,10 @@ fn structure_domain() -> HtnDomain {
 #[test]
 fn structure_analysis_pins_flags_and_min_yield() {
     let domain = structure_domain();
-    let summary = |name: &str| domain.task_summary(name).expect("summary");
 
     // Flat task: cheapest method is `sell` (one primitive); no recursion, so
     // tail-recursive holds vacuously.
-    let work = summary("work");
+    let work = summary_of(&domain, structure_tasks::work).expect("summary");
     assert_eq!(work.min_yield, 1);
     assert!(work.terminating);
     assert!(!work.recursive);
@@ -102,7 +118,7 @@ fn structure_analysis_pins_flags_and_min_yield() {
     // Terminating recursion with the recursive task always non-last
     // (⟨loop_, tick⟩): right-generating → not tail-recursive, but material
     // never precedes it → not self-embedding.
-    let loop_summary = summary("loop_");
+    let loop_summary = summary_of(&domain, structure_tasks::loop_).expect("summary");
     assert!(loop_summary.terminating);
     assert_eq!(loop_summary.min_yield, 1);
     assert!(loop_summary.recursive);
@@ -110,13 +126,13 @@ fn structure_analysis_pins_flags_and_min_yield() {
     assert!(!loop_summary.tail_recursive);
 
     // Non-terminating recursion: no finite refinement at all.
-    let spiral = summary("spiral");
+    let spiral = summary_of(&domain, structure_tasks::spiral).expect("summary");
     assert!(!spiral.terminating);
     assert_eq!(spiral.min_yield, usize::MAX);
     assert!(spiral.recursive);
 
     // Same shape as loop_ via a different method set.
-    let descend = summary("descend");
+    let descend = summary_of(&domain, structure_tasks::descend).expect("summary");
     assert!(descend.terminating);
     assert_eq!(descend.min_yield, 1);
     assert!(descend.recursive);
@@ -125,7 +141,7 @@ fn structure_analysis_pins_flags_and_min_yield() {
 
     // Tail recursion (⟨tick, tail⟩): the recursive task is always last →
     // tail-recursive, left-generating only → not self-embedding.
-    let tail = summary("tail");
+    let tail = summary_of(&domain, structure_tasks::tail).expect("summary");
     assert!(tail.terminating);
     assert_eq!(tail.min_yield, 1);
     assert!(tail.recursive);
@@ -134,7 +150,7 @@ fn structure_analysis_pins_flags_and_min_yield() {
 
     // Self-embedding (⟨emb, tick, emb⟩): material on BOTH sides — the
     // context-free core. This is Toad's exact-translation boundary.
-    let emb = summary("emb");
+    let emb = summary_of(&domain, structure_tasks::emb).expect("summary");
     assert!(emb.terminating);
     assert_eq!(emb.min_yield, 1);
     assert!(emb.recursive);
@@ -258,20 +274,23 @@ fn min_yield_refutes_method_that_cannot_finish_within_budget() {
     let domain = deep_chain_domain(30);
     let state = PlanState::build(&domain.components).finish();
 
-    assert_eq!(domain.task_summary("c0").unwrap().min_yield, 30);
+    assert_eq!(summary_of(&domain, chain30::c0).unwrap().min_yield, 30);
 
     // On: the deep method needs ≥ 30 steps but only ~9 remain — refuted at
     // the frame, and the quick method plans.
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
-    assert_eq!(planner.plan("root", &state).task_names(), ["ok"]);
+    assert_eq!(
+        plan_of(&mut planner, chain30::root, &state).task_names(),
+        ["ok"]
+    );
 
     // Off: plain backtracking enters the chain and burns the budget on its
     // prefix (the documented fallback semantics).
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
     planner.set_lookahead(false);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, chain30::root, &state);
     let names = plan.task_names();
     assert_eq!(names[0], "p0");
     assert!(!names.contains(&"ok".into()));
@@ -285,11 +304,11 @@ fn min_yield_does_not_refute_within_budget() {
     let domain = deep_chain_domain(5);
     let state = PlanState::build(&domain.components).finish();
 
-    assert_eq!(domain.task_summary("c0").unwrap().min_yield, 5);
+    assert_eq!(summary_of(&domain, chain5::c0).unwrap().min_yield, 5);
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, chain5::root, &state).task_names(),
         ["p0", "p1", "p2", "p3", "p4"]
     );
 
@@ -298,5 +317,8 @@ fn min_yield_does_not_refute_within_budget() {
     let domain = structure_domain();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("loop_", &state).task_names(), ["tick"]);
+    assert_eq!(
+        plan_of(&mut planner, structure_tasks::loop_, &state).task_names(),
+        ["tick"]
+    );
 }

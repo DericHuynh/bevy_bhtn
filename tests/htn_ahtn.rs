@@ -4,10 +4,10 @@
 //! semantics, the paper's wait-method completeness pattern, partial-order
 //! scheduling, budget/depth bounds, and API validation.
 
-use bevy_bhtn::ahtn::Ahtn;
+use bevy_bhtn::ahtn::{Ahtn, AhtnOutcome};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::TaskBuilder;
-use bevy_bhtn::{HtnDomain, HtnError};
+use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
+use bevy_bhtn::{HtnDomain, HtnError, HtnResult};
 use bevy_ecs::prelude::Component;
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,25 @@ fn invasion_eval(gold: usize, bribed: usize) -> impl Fn(&PlanState) -> f32 {
     }
 }
 
+/// `Ahtn::search` with the players' root fn-item types inferred from the fn
+/// values (fn-item types cannot be named directly in turbofish).
+fn search<MaxRoot: TaskFn, MinRoot: TaskFn>(
+    domain: &HtnDomain,
+    budget: Option<usize>,
+    _max_root: MaxRoot,
+    _min_root: MinRoot,
+    state: &PlanState,
+    eval: impl Fn(&PlanState) -> f32,
+    depth: usize,
+) -> HtnResult<Option<AhtnOutcome>> {
+    let ahtn = Ahtn::new(domain);
+    let ahtn = match budget {
+        Some(b) => ahtn.with_decomposition_budget(b),
+        None => ahtn,
+    };
+    ahtn.search(_max_root, _min_root, state, eval, depth)
+}
+
 // ---------------------------------------------------------------------------
 // Minimax semantics
 // ---------------------------------------------------------------------------
@@ -79,10 +98,17 @@ fn ahtn_solves_when_opponent_passive() {
     let gold = domain.components.get::<Gold>().unwrap();
     let bribed = domain.components.get::<Bribed>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search("invade", "idle", &state, invasion_eval(gold, bribed), 10)
-        .expect("search ok")
-        .expect("a plan exists");
+    let outcome = search(
+        &domain,
+        None,
+        invade,
+        idle,
+        &state,
+        invasion_eval(gold, bribed),
+        10,
+    )
+    .expect("search ok")
+    .expect("a plan exists");
     assert_eq!(outcome.value, 5.0);
     assert_eq!(outcome.plan.len(), 2);
     assert_eq!(domain.tasks[outcome.plan[0] as usize].name(), "wait");
@@ -99,10 +125,17 @@ fn ahtn_picks_the_branch_that_survives_best_defense() {
     let gold = domain.components.get::<Gold>().unwrap();
     let bribed = domain.components.get::<Bribed>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search("invade", "defend", &state, invasion_eval(gold, bribed), 10)
-        .expect("search ok")
-        .expect("the bribe branch survives");
+    let outcome = search(
+        &domain,
+        None,
+        invade,
+        defend,
+        &state,
+        invasion_eval(gold, bribed),
+        10,
+    )
+    .expect("search ok")
+    .expect("the bribe branch survives");
     // The ram branch is stuck (the wall is up when it fires); the bribe
     // branch pays 10 for the 5 gold.
     assert_eq!(outcome.value, -5.0);
@@ -142,16 +175,17 @@ fn ahtn_interleaves_execution_in_exact_order() {
     let a = domain.components.get::<TicksA>().unwrap();
     let b = domain.components.get::<TicksB>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search(
-            "max_root",
-            "min_root",
-            &state,
-            |s| (s.get::<TicksA>(a).0 * 10 + s.get::<TicksB>(b).0) as f32,
-            10,
-        )
-        .expect("search ok")
-        .expect("max completes");
+    let outcome = search(
+        &domain,
+        None,
+        max_root,
+        min_root,
+        &state,
+        |s| (s.get::<TicksA>(a).0 * 10 + s.get::<TicksB>(b).0) as f32,
+        10,
+    )
+    .expect("search ok")
+    .expect("max completes");
     // Depth 10 covers everything: A ticks 3, B ticks 1.
     assert_eq!(outcome.value, 31.0);
     // Max's plan is exactly its three primitives (min's are not in it).
@@ -177,16 +211,17 @@ fn ahtn_stuck_opponent_loses_the_branch() {
     let gold = domain.components.get::<Gold>().unwrap();
     let bribed = domain.components.get::<Bribed>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search(
-            "invade",
-            "dead_defense",
-            &state,
-            invasion_eval(gold, bribed),
-            10,
-        )
-        .expect("search ok")
-        .expect("max wins");
+    let outcome = search(
+        &domain,
+        None,
+        invade,
+        dead_defense,
+        &state,
+        invasion_eval(gold, bribed),
+        10,
+    )
+    .expect("search ok")
+    .expect("max wins");
     assert_eq!(outcome.value, f32::INFINITY);
     // Max's first action executed; then min folded and the game ended.
     assert_eq!(outcome.plan.len(), 1);
@@ -207,9 +242,11 @@ fn ahtn_no_viable_plan_returns_none() {
 
     // This domain never registers `Bribed` (no closure touches it), so the
     // eval reads only gold.
-    let outcome = Ahtn::new(&domain).search(
-        "doomed",
-        "defend",
+    let outcome = search(
+        &domain,
+        None,
+        doomed,
+        defend,
         &state,
         |s| s.get::<Gold>(gold).0 as f32,
         10,
@@ -248,22 +285,23 @@ fn ahtn_wait_method_fallback_survives_until_the_gate_opens() {
     let state = PlanState::build(&domain.components).finish();
     let won = domain.components.get::<Won>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search(
-            "go",
-            "gatekeeper",
-            &state,
-            |s| {
-                if s.get::<Won>(won).0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            },
-            10,
-        )
-        .expect("search ok")
-        .expect("the fallback keeps max alive");
+    let outcome = search(
+        &domain,
+        None,
+        go,
+        gatekeeper,
+        &state,
+        |s| {
+            if s.get::<Won>(won).0 {
+                1.0
+            } else {
+                0.0
+            }
+        },
+        10,
+    )
+    .expect("search ok")
+    .expect("the fallback keeps max alive");
     assert_eq!(outcome.value, 1.0);
     let names: Vec<&str> = outcome
         .plan
@@ -301,16 +339,17 @@ fn ahtn_depth_caps_the_lookahead() {
     let state = PlanState::build(&domain.components).finish();
     let a = domain.components.get::<TicksA>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search(
-            "max_root",
-            "idle_min",
-            &state,
-            |s| s.get::<TicksA>(a).0 as f32,
-            2,
-        )
-        .expect("search ok")
-        .expect("a plan exists");
+    let outcome = search(
+        &domain,
+        None,
+        max_root,
+        idle_min,
+        &state,
+        |s| s.get::<TicksA>(a).0 as f32,
+        2,
+    )
+    .expect("search ok")
+    .expect("a plan exists");
     // Two actions issued (both max's — min is idle), then evaluation.
     assert_eq!(outcome.plan.len(), 2);
     assert_eq!(outcome.value, 2.0);
@@ -340,16 +379,12 @@ fn ahtn_decomposition_budget_terminates_recursion() {
     // Max spirals: budget exhausted → stuck → no viable plan. (A small
     // explicit budget: the recursion depth is bounded by the budget, and
     // 1000 nested `node` frames overflow a test thread's 2 MB stack.)
-    let outcome = Ahtn::new(&domain)
-        .with_decomposition_budget(50)
-        .search("spiral", "simple_max", &state, |_| 0.0, 100)
-        .expect("search ok");
+    let outcome =
+        search(&domain, Some(50), spiral, simple_max, &state, |_| 0.0, 100).expect("search ok");
     assert!(outcome.is_none());
 
     // Min spirals: max wins the branch.
-    let outcome = Ahtn::new(&domain)
-        .with_decomposition_budget(50)
-        .search("simple_max", "spiral", &state, |_| 0.0, 100)
+    let outcome = search(&domain, Some(50), simple_max, spiral, &state, |_| 0.0, 100)
         .expect("search ok")
         .expect("min folds");
     assert_eq!(outcome.value, f32::INFINITY);
@@ -367,11 +402,17 @@ fn ahtn_decomposition_budget_is_shared_and_enforceable() {
 
     // Budget 1: the first method application (max's invade) consumes it;
     // min's defend then cannot decompose → min stuck → +∞ for max.
-    let outcome = Ahtn::new(&domain)
-        .with_decomposition_budget(1)
-        .search("invade", "defend", &state, invasion_eval(gold, bribed), 10)
-        .expect("search ok")
-        .expect("min cannot decompose");
+    let outcome = search(
+        &domain,
+        Some(1),
+        invade,
+        defend,
+        &state,
+        invasion_eval(gold, bribed),
+        10,
+    )
+    .expect("search ok")
+    .expect("min cannot decompose");
     assert_eq!(outcome.value, f32::INFINITY);
 }
 
@@ -410,8 +451,7 @@ fn ahtn_schedules_the_first_topological_order() {
     let state = PlanState::build(&domain.components).finish();
     let seq_slot = domain.components.get::<Seq>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search("max_root", "idle_min", &state, |_| 0.0, 10)
+    let outcome = search(&domain, None, max_root, idle_min, &state, |_| 0.0, 10)
         .expect("search ok")
         .expect("a plan exists");
     assert_eq!(outcome.plan.len(), 2);
@@ -434,25 +474,24 @@ fn ahtn_schedules_the_first_topological_order() {
     );
 }
 
-/// Unknown root names error; primitive roots error (both players must
-/// decompose).
+/// Unknown roots error; primitive roots error (both players must
+/// decompose). The unknown root is a real fn item that was simply never
+/// registered in the domain.
 #[test]
 fn ahtn_rejects_bad_roots() {
+    fn never_registered(_task: &mut TaskBuilder) {}
+
     let domain = HtnDomain::from_root(invade).root(defend).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let gold = domain.components.get::<Gold>().unwrap();
     let bribed = domain.components.get::<Bribed>().unwrap();
     let eval = invasion_eval(gold, bribed);
 
-    let err = Ahtn::new(&domain)
-        .search("nope", "defend", &state, &eval, 10)
-        .unwrap_err();
+    let err = search(&domain, None, never_registered, defend, &state, &eval, 10).unwrap_err();
     assert!(matches!(err, HtnError::UnknownTask { .. }));
 
     // `ram` is a primitive, not a compound root.
-    let err = Ahtn::new(&domain)
-        .search("ram", "defend", &state, &eval, 10)
-        .unwrap_err();
+    let err = search(&domain, None, ram, defend, &state, &eval, 10).unwrap_err();
     assert!(err.to_string().contains("must be a compound task"));
 }
 
@@ -464,10 +503,17 @@ fn ahtn_zero_depth_evaluates_immediately() {
     let gold = domain.components.get::<Gold>().unwrap();
     let bribed = domain.components.get::<Bribed>().unwrap();
 
-    let outcome = Ahtn::new(&domain)
-        .search("invade", "idle", &state, invasion_eval(gold, bribed), 0)
-        .expect("search ok")
-        .expect("finite eval");
+    let outcome = search(
+        &domain,
+        None,
+        invade,
+        idle,
+        &state,
+        invasion_eval(gold, bribed),
+        0,
+    )
+    .expect("search ok")
+    .expect("finite eval");
     assert_eq!(outcome.value, 0.0);
     assert!(outcome.plan.is_empty());
 }
@@ -713,8 +759,7 @@ fn dungeon_passive_garrison_stealth_wins() {
             .then(dungeon::hold);
     }
     let (domain, state, eval) = dungeon_setup(passive);
-    let outcome = Ahtn::new(&domain)
-        .search("raid", "passive", &state, eval, 40)
+    let outcome = search(&domain, None, dungeon::raid, passive, &state, eval, 40)
         .expect("search ok")
         .expect("the stealth route works");
     assert_eq!(outcome.value, 100.0);
@@ -747,10 +792,17 @@ fn dungeon_gatekeeper_forces_the_smash_route() {
         task.branch().then(dungeon::hold).then(dungeon::hold);
     }
     let (domain, state, eval) = dungeon_setup(gatekeeper_only);
-    let outcome = Ahtn::new(&domain)
-        .search("raid", "gatekeeper_only", &state, eval, 40)
-        .expect("search ok")
-        .expect("the force route works");
+    let outcome = search(
+        &domain,
+        None,
+        dungeon::raid,
+        gatekeeper_only,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("the force route works");
     assert_eq!(outcome.value, 100.0);
     let names: Vec<&str> = outcome
         .plan
@@ -784,10 +836,17 @@ fn dungeon_dragon_keeper_forces_the_sewers() {
             .then(dungeon::hold);
     }
     let (domain, state, eval) = dungeon_setup(dragon_keeper_only);
-    let outcome = Ahtn::new(&domain)
-        .search("raid", "dragon_keeper_only", &state, eval, 40)
-        .expect("search ok")
-        .expect("the sewers remain");
+    let outcome = search(
+        &domain,
+        None,
+        dungeon::raid,
+        dragon_keeper_only,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("the sewers remain");
     assert_eq!(outcome.value, 50.0);
     let names: Vec<&str> = outcome
         .plan
@@ -811,8 +870,7 @@ fn dungeon_warden_forces_the_stealth_route() {
             .then(dungeon::warden_turn);
     }
     let (domain, state, eval) = dungeon_setup(warden_only);
-    let outcome = Ahtn::new(&domain)
-        .search("raid", "warden_only", &state, eval, 40)
+    let outcome = search(&domain, None, dungeon::raid, warden_only, &state, eval, 40)
         .expect("search ok")
         .expect("the stealth route works");
     assert_eq!(outcome.value, 100.0);
@@ -846,10 +904,17 @@ fn dungeon_full_garrison_forces_the_sewers() {
             .then(dungeon::warden_turn);
     }
     let (domain, state, eval) = dungeon_setup(full_garrison);
-    let outcome = Ahtn::new(&domain)
-        .search("raid", "full_garrison", &state, eval, 40)
-        .expect("search ok")
-        .expect("the sewers remain");
+    let outcome = search(
+        &domain,
+        None,
+        dungeon::raid,
+        full_garrison,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("the sewers remain");
     assert_eq!(outcome.value, 50.0);
     let names: Vec<&str> = outcome
         .plan
@@ -891,43 +956,71 @@ fn dungeon_garrison_matrix_is_monotone() {
     }
 
     let (domain, state, eval) = dungeon_setup(garrison_passive);
-    let value = Ahtn::new(&domain)
-        .search("raid", "garrison_passive", &state, eval, 40)
-        .expect("search ok")
-        .expect("a plan exists")
-        .value;
+    let value = search(
+        &domain,
+        None,
+        dungeon::raid,
+        garrison_passive,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("a plan exists")
+    .value;
     assert_eq!(
         value, 100.0,
         "passive: stealth wins (no intrusion, no poison)"
     );
 
     let (domain, state, eval) = dungeon_setup(garrison_pickproof);
-    let value = Ahtn::new(&domain)
-        .search("raid", "garrison_pickproof", &state, eval, 40)
-        .expect("search ok")
-        .expect("a plan exists")
-        .value;
+    let value = search(
+        &domain,
+        None,
+        dungeon::raid,
+        garrison_pickproof,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("a plan exists")
+    .value;
     assert_eq!(
         value, 50.0,
         "gatekeeper + reactive keeper: stealth dies at the gate, force dies at the poisoned drink — sewers"
     );
 
     let (domain, state, eval) = dungeon_setup(garrison_alarm);
-    let value = Ahtn::new(&domain)
-        .search("raid", "garrison_alarm", &state, eval, 40)
-        .expect("search ok")
-        .expect("a plan exists")
-        .value;
+    let value = search(
+        &domain,
+        None,
+        dungeon::raid,
+        garrison_alarm,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("a plan exists")
+    .value;
     assert_eq!(
         value, 50.0,
         "warden + reactive keeper: both gate routes die — sewers"
     );
 
     let (domain, state, eval) = dungeon_setup(garrison_full);
-    let value = Ahtn::new(&domain)
-        .search("raid", "garrison_full", &state, eval, 40)
-        .expect("search ok")
-        .expect("a plan exists")
-        .value;
+    let value = search(
+        &domain,
+        None,
+        dungeon::raid,
+        garrison_full,
+        &state,
+        eval,
+        40,
+    )
+    .expect("search ok")
+    .expect("a plan exists")
+    .value;
     assert_eq!(value, 50.0, "full garrison: only the sewers remain");
 }

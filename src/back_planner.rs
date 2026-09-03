@@ -30,10 +30,11 @@
 use std::collections::HashSet;
 
 use crate::domain::HtnDomain;
+use crate::domain::Task;
 use crate::error::{HtnError, HtnResult};
 use crate::planner::Plan;
 use crate::state::PlanState;
-use crate::domain::Task;
+use crate::tasks::GoalFn;
 
 /// One candidate commitment: a primitive task, or a compound task via one of
 /// its methods (whose whole subtask sequence would be committed).
@@ -58,23 +59,25 @@ impl<'a> BackPlanner<'a> {
         Self { domain }
     }
 
-    /// Plan from `initial_state` toward the effects of the goal task `goal_name`.
+    /// Plan from `initial_state` toward the effects of the goal function
+    /// `goal` (passed by value; resolved by its `TypeId` through the baked
+    /// type index — names are display-only).
     ///
     /// `initial_state` is only read: the planner works on its own clone of the
     /// scratchpad. Returns a [`Plan`] of primitive task names in execution
     /// order. The plan's MTR is empty (MTR is a forward-only concept).
-    pub fn plan(&mut self, goal_name: &str, initial_state: &PlanState) -> HtnResult<Plan> {
-        let Some(goal) = self.domain.goal(goal_name) else {
+    pub fn plan<F: GoalFn>(&mut self, goal: F, initial_state: &PlanState) -> HtnResult<Plan> {
+        let Some(goal_task) = self.domain.goal(goal) else {
             return Err(HtnError::UnknownTask {
-                name: goal_name.to_string(),
+                name: F::goal_name().to_string(),
             });
         };
-        if goal.effects.is_empty() {
+        if goal_task.effects.is_empty() {
             return Err(HtnError::NoPlan);
         }
 
         let mut state = initial_state.clone();
-        let mut needed: HashSet<usize> = goal.write_slots().collect();
+        let mut needed: HashSet<usize> = goal_task.write_slots().collect();
 
         let mut steps: Vec<u32> = Vec::new();
         // Total primitive steps the plan may contain (bounds pathological

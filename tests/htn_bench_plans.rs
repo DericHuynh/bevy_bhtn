@@ -13,14 +13,17 @@ mod bench_common;
 
 use bevy_bhtn::planner::HtnPlanner;
 use bevy_bhtn::state::PlanState;
+use bevy_bhtn::tasks::TaskFn;
 
 use bench_common::*;
 
-/// Helper: plan and render the exact task-name sequence.
-fn plan_of(domain: &bevy_bhtn::HtnDomain, root: &str, state: &PlanState) -> Vec<String> {
+/// Helper: plan and render the exact task-name sequence. The root fn-item
+/// type is inferred from the fn value (fn-item types cannot be named
+/// directly in turbofish).
+fn plan_of<F: TaskFn>(domain: &bevy_bhtn::HtnDomain, _root: F, state: &PlanState) -> Vec<String> {
     let mut planner = HtnPlanner::new(domain);
     planner
-        .plan(root, state)
+        .plan(_root, state)
         .task_names()
         .iter()
         .map(|n| n.to_string())
@@ -28,9 +31,9 @@ fn plan_of(domain: &bevy_bhtn::HtnDomain, root: &str, state: &PlanState) -> Vec<
 }
 
 /// Helper: plan with an existing (possibly tuned) planner.
-fn plan_of_with(planner: &mut HtnPlanner, root: &str, state: &PlanState) -> Vec<String> {
+fn plan_of_with<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Vec<String> {
     planner
-        .plan(root, state)
+        .plan(_root, state)
         .task_names()
         .iter()
         .map(|n| n.to_string())
@@ -222,7 +225,7 @@ fn miner_bench_states_plan_exactly() {
 
     for (i, want) in expected {
         let state = miner_scratch(&domain, *i);
-        let got = plan_of(&domain, "earn_gold", &state);
+        let got = plan_of(&domain, miner_tasks::earn_gold, &state);
         assert_eq!(&got, want, "miner entity {i} plan diverged");
     }
 }
@@ -233,10 +236,10 @@ fn miner_bench_plans_identical_without_lookahead() {
     let domain = miner_domain();
     for i in [0usize, 1, 2, 3, 5, 7, 11, 13, 41, 97] {
         let state = miner_scratch(&domain, i);
-        let with = plan_of(&domain, "earn_gold", &state);
+        let with = plan_of(&domain, miner_tasks::earn_gold, &state);
         let mut planner = HtnPlanner::new(&domain);
         planner.set_lookahead(false);
-        let without = plan_of_with(&mut planner, "earn_gold", &state);
+        let without = plan_of_with(&mut planner, miner_tasks::earn_gold, &state);
         assert_eq!(
             with, without,
             "miner entity {i}: look-ahead changed the plan"
@@ -257,7 +260,7 @@ fn outpost_bench_states_plan_exactly() {
     assert_eq!(
         plan_of(
             &domain,
-            "secure_outpost",
+            outpost_tasks::secure_outpost,
             &outpost_scratch(&domain, fresh_outpost())
         ),
         [
@@ -277,7 +280,7 @@ fn outpost_bench_states_plan_exactly() {
     assert_eq!(
         plan_of(
             &domain,
-            "secure_outpost",
+            outpost_tasks::secure_outpost,
             &outpost_scratch(&domain, marginal_outpost())
         ),
         [
@@ -297,7 +300,7 @@ fn outpost_bench_states_plan_exactly() {
     assert_eq!(
         plan_of(
             &domain,
-            "secure_outpost",
+            outpost_tasks::secure_outpost,
             &outpost_scratch(&domain, high_fuel_outpost())
         ),
         [
@@ -322,10 +325,10 @@ fn outpost_bench_plans_identical_without_lookahead() {
         outpost_scratch(&domain, marginal_outpost()),
         outpost_scratch(&domain, high_fuel_outpost()),
     ] {
-        let with = plan_of(&domain, "secure_outpost", &state);
+        let with = plan_of(&domain, outpost_tasks::secure_outpost, &state);
         let mut planner = HtnPlanner::new(&domain);
         planner.set_lookahead(false);
-        let without = plan_of_with(&mut planner, "secure_outpost", &state);
+        let without = plan_of_with(&mut planner, outpost_tasks::secure_outpost, &state);
         assert_eq!(
             with, without,
             "outpost state {state:?}: look-ahead changed the plan"
@@ -344,14 +347,14 @@ fn lookahead_bench_domains_plan_exactly() {
     let domain = gate_domain();
     let state = PlanState::build(&domain.components).finish();
     assert_eq!(
-        plan_of(&domain, "gate_root", &state),
+        plan_of(&domain, gate_tasks::gate_root, &state),
         ["strike", "gate_final"]
     );
 
     // Doomed recursion: the non-terminating spiral is refuted → safe method.
     let domain = doomed_recursion_domain();
     let state = PlanState::build(&domain.components).finish();
-    assert_eq!(plan_of(&domain, "act", &state), ["safe"]);
+    assert_eq!(plan_of(&domain, doomed_tasks::act, &state), ["safe"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -361,9 +364,9 @@ fn lookahead_bench_domains_plan_exactly() {
 /// Run exactly what the benches run per measured iteration: `cycles` rounds of
 /// plan → execute-one-step → replan, against the working state. Returns every
 /// cycle's plan and the final state.
-fn run_replan_cycle(
+fn run_replan_cycle<F: TaskFn + Copy>(
     domain: &bevy_bhtn::HtnDomain,
-    root: &str,
+    _root: F,
     initial: &PlanState,
     cycles: usize,
 ) -> (Vec<Vec<String>>, PlanState) {
@@ -371,7 +374,7 @@ fn run_replan_cycle(
     let mut planner = HtnPlanner::new(domain);
     let mut plans = Vec::with_capacity(cycles);
     for _ in 0..cycles {
-        let plan = planner.plan(root, &state);
+        let plan = planner.plan(_root, &state);
         plans.push(plan.task_names().iter().map(|n| n.to_string()).collect());
         execute_plan_step(domain, &mut state, &plan);
     }
@@ -382,7 +385,7 @@ fn run_replan_cycle(
 fn miner_replan_cycle_progresses_deterministically() {
     let domain = miner_domain();
     let initial = miner_scratch(&domain, 0);
-    let (plans, final_state) = run_replan_cycle(&domain, "earn_gold", &initial, 10);
+    let (plans, final_state) = run_replan_cycle(&domain, miner_tasks::earn_gold, &initial, 10);
 
     // The agent works through its plan one action per cycle: the plan shrinks
     // as state advances (sell the held metal, smelt, mine), then settles into
@@ -425,7 +428,8 @@ fn miner_replan_cycle_progresses_deterministically() {
 fn outpost_replan_cycle_completes_all_objectives() {
     let domain = outpost_domain();
     let initial = outpost_scratch(&domain, fresh_outpost());
-    let (plans, final_state) = run_replan_cycle(&domain, "secure_outpost", &initial, 10);
+    let (plans, final_state) =
+        run_replan_cycle(&domain, outpost_tasks::secure_outpost, &initial, 10);
 
     // One objective per cycle until the domain's terminal method takes over:
     // the plan shrinks to empty once every objective is secured.

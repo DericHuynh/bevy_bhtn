@@ -37,7 +37,7 @@ mod common;
 
 use bevy_bhtn::planner::HtnPlanner;
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::TaskBuilder;
+use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -94,10 +94,17 @@ fn fetch_one(task: &mut TaskBuilder) {
         .effect(|t: &mut Touched| t.0 += 1);
 }
 
-/// Plan, then execute the full plan, once per iteration.
-fn plan_cycle(domain: &HtnDomain, root: &str, state: &PlanState, planner: &mut HtnPlanner) {
+/// Plan, then execute the full plan, once per iteration. `F` is inferred from
+/// the root function item, so the lookup uses the same `TypeId` the domain
+/// recorded at bake time.
+fn plan_cycle<F: TaskFn>(
+    domain: &HtnDomain,
+    _root: F,
+    state: &PlanState,
+    planner: &mut HtnPlanner,
+) {
     let mut state = state.clone();
-    let plan = planner.plan(root, black_box(&state));
+    let plan = planner.plan(_root, black_box(&state));
     execute_plan(domain, &mut state, &plan);
     black_box(plan.task_names().len());
 }
@@ -122,15 +129,14 @@ fn bench_wide_sets(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("set_vs_chain_8");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, domain, state, root) in [
-            ("chain", &d_chain, &s_chain, "chain8"),
-            ("any_order", &d_set, &s_set, "set8"),
-        ] {
-            let mut planner = HtnPlanner::new(domain);
-            group.bench_function(label, |b| {
-                b.iter(|| plan_cycle(domain, root, state, &mut planner))
-            });
-        }
+        let mut planner = HtnPlanner::new(&d_chain);
+        group.bench_function("chain", |b| {
+            b.iter(|| plan_cycle(&d_chain, chain8, &s_chain, &mut planner))
+        });
+        let mut planner = HtnPlanner::new(&d_set);
+        group.bench_function("any_order", |b| {
+            b.iter(|| plan_cycle(&d_set, set8, &s_set, &mut planner))
+        });
         group.finish();
     }
 
@@ -151,15 +157,14 @@ fn bench_wide_sets(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("set_retry_vs_chain_2");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, domain, state, root) in [
-            ("chain", &d_chain, &s_chain, "chain2"),
-            ("one_retry", &d_set, &s_set, "set2"),
-        ] {
-            let mut planner = HtnPlanner::new(domain);
-            group.bench_function(label, |b| {
-                b.iter(|| plan_cycle(domain, root, state, &mut planner))
-            });
-        }
+        let mut planner = HtnPlanner::new(&d_chain);
+        group.bench_function("chain", |b| {
+            b.iter(|| plan_cycle(&d_chain, chain2, &s_chain, &mut planner))
+        });
+        let mut planner = HtnPlanner::new(&d_set);
+        group.bench_function("one_retry", |b| {
+            b.iter(|| plan_cycle(&d_set, set2, &s_set, &mut planner))
+        });
         group.finish();
     }
 
@@ -181,15 +186,14 @@ fn bench_wide_sets(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("recursion_vs_set_fetch");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, domain, state, root) in [
-            ("recursive_16_items", &d_rec, &s_rec, "fetch_all"),
-            ("set_8_members", &d_set, &s_set, "set8"),
-        ] {
-            let mut planner = HtnPlanner::new(domain);
-            group.bench_function(label, |b| {
-                b.iter(|| plan_cycle(domain, root, state, &mut planner))
-            });
-        }
+        let mut planner = HtnPlanner::new(&d_rec);
+        group.bench_function("recursive_16_items", |b| {
+            b.iter(|| plan_cycle(&d_rec, fetch_all, &s_rec, &mut planner))
+        });
+        let mut planner = HtnPlanner::new(&d_set);
+        group.bench_function("set_8_members", |b| {
+            b.iter(|| plan_cycle(&d_set, set8, &s_set, &mut planner))
+        });
         group.finish();
     }
 
@@ -212,15 +216,14 @@ fn bench_wide_sets(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("wide_set_buried_dependency");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, domain, state, root) in [
-            ("members_8_beyond_cap", &d8, &s8, "wide8"),
-            ("members_4_within_cap", &d4, &s4, "wide4"),
-        ] {
-            let mut planner = HtnPlanner::new(domain);
-            group.bench_function(label, |b| {
-                b.iter(|| plan_cycle(domain, root, state, &mut planner))
-            });
-        }
+        let mut planner = HtnPlanner::new(&d8);
+        group.bench_function("members_8_beyond_cap", |b| {
+            b.iter(|| plan_cycle(&d8, wide8, &s8, &mut planner))
+        });
+        let mut planner = HtnPlanner::new(&d4);
+        group.bench_function("members_4_within_cap", |b| {
+            b.iter(|| plan_cycle(&d4, wide4, &s4, &mut planner))
+        });
         group.finish();
     }
 }

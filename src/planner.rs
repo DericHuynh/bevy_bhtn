@@ -33,12 +33,13 @@ use ustr::Ustr;
 
 use crate::domain::SelectionPolicy;
 use crate::selection::{DecompositionTrace, TraceOutcome};
+use crate::tasks::TaskFn;
 
 use crate::domain::HtnDomain;
+use crate::domain::Task;
 use crate::lookahead::{self, Lookahead};
 use crate::order::{linearize, SubtaskOrder};
 use crate::state::{PlanState, Slot};
-use crate::domain::Task;
 
 /// The method traversal record of a completed plan: the index of the chosen
 /// method at each decomposition level. Used to compare plans by priority
@@ -448,11 +449,16 @@ impl<'a> HtnPlanner<'a> {
         self
     }
 
-    /// Decompose `root` into a [`Plan`]. Never errors: on failure it returns
-    /// the best partial plan found (with an empty task list if nothing was
-    /// decomposable). Check [`Plan::status`] to tell a finished decomposition
-    /// ([`PlanStatus::Complete`]) from one the sanity budget or fail-fast cut
-    /// short ([`PlanStatus::Partial`]) — a partial plan may not reach the goal.
+    /// Decompose the task function `root` into a [`Plan`]. Never errors: on
+    /// failure it returns the best partial plan found (with an empty task list
+    /// if nothing was decomposable). Check [`Plan::status`] to tell a finished
+    /// decomposition ([`PlanStatus::Complete`]) from one the sanity budget or
+    /// fail-fast cut short ([`PlanStatus::Partial`]) — a partial plan may not
+    /// reach the goal.
+    ///
+    /// `root` is the task function itself, passed by value (fn items are
+    /// zero-sized): its `TypeId` is resolved through the baked type index —
+    /// names are display-only. An unregistered function yields an empty plan.
     ///
     /// `state` is only read: the planner works on its own clone of the
     /// scratchpad.
@@ -461,8 +467,8 @@ impl<'a> HtnPlanner<'a> {
     /// ([`lookahead`]) proves the remaining sequence can possibly succeed;
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
-    pub fn plan(&mut self, root: &str, state: &PlanState) -> Plan {
-        match self.domain.task_index(root.into()) {
+    pub fn plan<F: TaskFn>(&mut self, root: F, state: &PlanState) -> Plan {
+        match self.domain.task_index_by_type(root.task_type_id()) {
             Some(idx) => self.plan_inner(idx, state, None),
             None => Plan::default(),
         }
@@ -474,19 +480,21 @@ impl<'a> HtnPlanner<'a> {
         self.plan_inner(root, state, None)
     }
 
-    /// Decompose `root` into a [`Plan`], appending one
+    /// Decompose the task function `root` into a [`Plan`], appending one
     /// [`DecompositionTrace`] per branch-selection decision to `trace`.
+    ///
+    /// `root` is the task function itself, passed by value (see [`Self::plan`]).
     ///
     /// Tracing is per *commitment* — one event per branch that was selected,
     /// failed its preconditions, or was backtracked past — never per
     /// precondition attempt inside the look-ahead sweep.
-    pub fn plan_traced(
+    pub fn plan_traced<F: TaskFn>(
         &mut self,
-        root: &str,
+        root: F,
         state: &PlanState,
         trace: &mut Vec<DecompositionTrace>,
     ) -> Plan {
-        match self.domain.task_index(root.into()) {
+        match self.domain.task_index_by_type(root.task_type_id()) {
             Some(idx) => self.plan_inner(idx, state, Some(trace)),
             None => Plan::default(),
         }

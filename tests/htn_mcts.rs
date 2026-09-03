@@ -7,11 +7,11 @@ use std::sync::Arc;
 use bevy_bhtn::domain::SelectionPolicy;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::mcts::MctsSearcher;
-use bevy_bhtn::planner::HtnPlanner;
 use bevy_bhtn::planner::PlanStatus;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::selection::{HtnSearchStrategy, SearchOverride, Searcher};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::TaskBuilder;
+use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
 use bevy_bhtn::{HtnDomain, Task};
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::Schedule;
@@ -97,6 +97,12 @@ fn execute(domain: &HtnDomain, state: &PlanState, plan: &[u32]) -> PlanState {
         }
     }
     out
+}
+
+/// `HtnPlanner::plan` with the root fn-item type inferred from the fn value
+/// (fn-item types cannot be named directly in turbofish).
+fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
+    planner.plan(_root, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +332,7 @@ fn mcts_beats_the_sanity_truncation_on_gate_domain() {
     // DFS, look-ahead off, default budget: truncated prefix.
     let mut dfs = HtnPlanner::new(&domain);
     dfs.set_lookahead(false);
-    let partial = dfs.plan("gate_root", &state);
+    let partial = plan_root(&mut dfs, common::gate_tasks::gate_root, &state);
     assert!(partial.is_partial());
 
     // MCTS, same default budget: the full winning plan.

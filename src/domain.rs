@@ -47,6 +47,7 @@ impl HtnDomain {
     /// Begin building a domain from a root task function. The function (and
     /// everything it references via `.then`) is recorded immediately; add
     /// goals with [`DomainBuilder::goal`], then [`DomainBuilder::build`].
+    #[track_caller]
     pub fn from_root<F: TaskFn>(root: F) -> DomainBuilder {
         let mut rec = Recorder {
             registry: RegistryBuilder::default(),
@@ -65,7 +66,8 @@ impl HtnDomain {
         // repeated `.then` references resolve against `index_of`, so each
         // task function is expanded exactly once and cycles become edges.
         let root_tid = SubtaskRef::Fn(TypeId::of::<F>());
-        let root_name = F::task_name();
+        let root_name =
+            crate::tasks::reference_display_name(F::task_name(), std::panic::Location::caller());
         rec.index_of.insert(root_tid, 0);
         rec.tasks.push((
             root_tid,
@@ -82,8 +84,9 @@ impl HtnDomain {
         }
 
         // Expand every referenced task function (LIFO order; each function
-        // is recorded exactly once — cycles become plain graph edges).
-        while let Some(f) = rec.queue.pop_front() {
+        // is recorded exactly once — cycles become plain graph edges). The
+        // display name is the one captured at the FIRST reference site.
+        while let Some((f, name)) = rec.queue.pop_front() {
             let tid = SubtaskRef::Fn(f.task_type_id());
             if rec.index_of.contains_key(&tid) {
                 continue; // already recorded — the edge was recorded at `then`
@@ -91,7 +94,7 @@ impl HtnDomain {
             rec.index_of.insert(tid, rec.tasks.len());
             rec.tasks.push((
                 tid,
-                f.task_name_erased(),
+                name,
                 TaskProto::Compound {
                     methods: Vec::new(),
                     policy: SelectionPolicy::default(),
@@ -113,45 +116,40 @@ impl HtnDomain {
         &self.tasks[self.root]
     }
 
-    /// Look up a task by name (O(1) via the precomputed index map).
+    /// Look up a task by its display name (O(1) via the precomputed index
+    /// map). Introspection only — planning addresses tasks by their task
+    /// function's `TypeId` (see [`Self::task_index`]).
     pub fn get_task(&self, name: &str) -> Option<&Task> {
         let idx = *self.index_of.get(&Ustr::from(name))?;
         self.tasks.get(idx)
     }
 
-    /// Resolve a task name to its index into [`Self::tasks`] (O(1)).
-    pub fn task_index(&self, name: Ustr) -> Option<usize> {
-        self.index_of.get(&name).copied()
+    /// Resolve a task function to its index into [`Self::tasks`] (O(1)) — the
+    /// typed replacement for name lookup. The graph identity of a task is its
+    /// function's `TypeId`; the fn item is passed by value (fn items are
+    /// zero-sized and their types are unnameable).
+    pub fn task_index<F: TaskFn>(&self, task: F) -> Option<usize> {
+        self.type_index.get(&task.task_type_id()).copied()
     }
 
-    /// Resolve a task function's `TypeId` to its index (O(1)).
+    /// Resolve a raw task `TypeId` to its index (O(1)) — the type-erased form
+    /// of [`Self::task_index`] (GTN-synthesized tasks have no function type).
     pub fn task_index_by_type(&self, tid: TypeId) -> Option<usize> {
         self.type_index.get(&tid).copied()
     }
 
-    /// The inferred [`TaskSummary`] of a task, by name (O(1)).
-    pub fn task_summary(&self, name: &str) -> Option<&TaskSummary> {
-        let idx = *self.index_of.get(&Ustr::from(name))?;
+    /// The inferred [`TaskSummary`] of a task function (O(1)). The fn item is
+    /// passed by value (see [`Self::task_index`]).
+    pub fn task_summary<F: TaskFn>(&self, task: F) -> Option<&TaskSummary> {
+        let idx = self.task_index(task)?;
         self.summaries.get(idx)
     }
 
-    /// The inferred possible-write set of one method of a compound task, by
-    /// task name and method index (O(1)). This is what the forward planner's
-    /// look-ahead sweep uses for optimistic state propagation.
-    pub fn method_possible_writes(
-        &self,
-        task: &str,
-        method: usize,
-    ) -> Option<&crate::state::FieldSet> {
-        match self.get_task(task)? {
-            Task::Compound(c) => c.methods.get(method).map(|m| &m.possible_writes),
-            _ => None,
-        }
-    }
-
-    /// Look up a goal task by name (for back-planning).
-    pub fn goal(&self, name: &str) -> Option<&GoalTask> {
-        match self.get_task(name) {
+    /// Look up a goal task by its goal function (for back-planning). The fn
+    /// item is passed by value (see [`Self::task_index`]).
+    pub fn goal<F: GoalFn>(&self, goal: F) -> Option<&GoalTask> {
+        let idx = self.type_index.get(&goal.goal_type_id()).copied()?;
+        match self.tasks.get(idx) {
             Some(Task::Goal(g)) => Some(g),
             _ => None,
         }
@@ -182,7 +180,7 @@ impl std::fmt::Debug for HtnDomain {
 /// [`build`](Self::build).
 pub struct DomainBuilder {
     rec: Recorder,
-    goals: Vec<(&'static str, Vec<crate::tasks::Effect>)>,
+    goals: Vec<(&'static str, TypeId, Vec<crate::tasks::Effect>)>,
 }
 
 impl DomainBuilder {
@@ -217,6 +215,7 @@ impl DomainBuilder {
     /// from the forward root unless referenced — forward planning is
     /// unaffected.
     #[must_use]
+    #[track_caller]
     pub fn root<F: TaskFn>(mut self, f: F) -> Self {
         let tid = SubtaskRef::Fn(TypeId::of::<F>());
         if self.rec.index_of.contains_key(&tid) {
@@ -228,7 +227,7 @@ impl DomainBuilder {
         self.rec.index_of.insert(tid, self.rec.tasks.len());
         self.rec.tasks.push((
             tid,
-            F::task_name(),
+            crate::tasks::reference_display_name(F::task_name(), std::panic::Location::caller()),
             TaskProto::Compound {
                 methods: Vec::new(),
                 policy: SelectionPolicy::default(),
@@ -239,7 +238,7 @@ impl DomainBuilder {
         builder.finish();
         // Drain queued (`.then`-referenced) tasks, same discipline as the
         // root expansion loop.
-        while let Some(g) = self.rec.queue.pop_front() {
+        while let Some((g, name)) = self.rec.queue.pop_front() {
             let gid = SubtaskRef::Fn(g.task_type_id());
             if self.rec.index_of.contains_key(&gid) {
                 continue;
@@ -247,7 +246,7 @@ impl DomainBuilder {
             self.rec.index_of.insert(gid, self.rec.tasks.len());
             self.rec.tasks.push((
                 gid,
-                g.task_name_erased(),
+                name,
                 TaskProto::Compound {
                     methods: Vec::new(),
                     policy: SelectionPolicy::default(),
@@ -270,6 +269,7 @@ impl DomainBuilder {
     /// re-insert it forever), so curation is deliberate. Candidates are
     /// routed through shared wrappers when the task is also shared.
     #[must_use]
+    #[track_caller]
     pub fn insertable<F: TaskFn>(mut self, f: F) -> Self {
         let tid = SubtaskRef::Fn(TypeId::of::<F>());
         self.rec.insertables.push(tid);
@@ -279,7 +279,7 @@ impl DomainBuilder {
         self.rec.index_of.insert(tid, self.rec.tasks.len());
         self.rec.tasks.push((
             tid,
-            F::task_name(),
+            crate::tasks::reference_display_name(F::task_name(), std::panic::Location::caller()),
             TaskProto::Compound {
                 methods: Vec::new(),
                 policy: SelectionPolicy::default(),
@@ -290,7 +290,7 @@ impl DomainBuilder {
         builder.finish();
         // Drain queued (`.then`-referenced) tasks, same discipline as the
         // root expansion loop.
-        while let Some(g) = self.rec.queue.pop_front() {
+        while let Some((g, name)) = self.rec.queue.pop_front() {
             let gid = SubtaskRef::Fn(g.task_type_id());
             if self.rec.index_of.contains_key(&gid) {
                 continue;
@@ -298,7 +298,7 @@ impl DomainBuilder {
             self.rec.index_of.insert(gid, self.rec.tasks.len());
             self.rec.tasks.push((
                 gid,
-                g.task_name_erased(),
+                name,
                 TaskProto::Compound {
                     methods: Vec::new(),
                     policy: SelectionPolicy::default(),
@@ -312,14 +312,15 @@ impl DomainBuilder {
     }
 
     /// Register a goal task (a named set of desired effects) for
-    /// back-planning. The goal function's name becomes the goal's lookup key.
+    /// back-planning. The goal function's `TypeId` is the goal's identity; its
+    /// name is display/debug only.
     #[must_use]
     pub fn goal<F: GoalFn>(mut self, f: F) -> Self {
         let name = F::goal_name();
         let mut gb = GoalBuilder::new(&mut self.rec);
         f.record(&mut gb);
         let effects = gb.finish();
-        self.goals.push((name, effects));
+        self.goals.push((name, TypeId::of::<F>(), effects));
         self
     }
 
@@ -357,9 +358,11 @@ impl DomainBuilder {
 
         for (i, (tid, name, proto)) in self.rec.tasks.into_iter().enumerate() {
             let key = Ustr::from(name);
-            if index_of.insert(key, i).is_some() {
-                return Err(HtnError::builder(format!("duplicate task name `{name}`")));
-            }
+            // Display names are not identity: two distinct task functions may
+            // share a last-path-segment name (same-named fns in different
+            // modules, closures' `{{closure}}`), so this map is first-wins and
+            // introspection only. Identity is the `TypeId` below.
+            index_of.entry(key).or_insert(i);
             // Only task functions participate in the TypeId graph index —
             // transform-synthesized tasks (GTN compilation) have no identity.
             if let SubtaskRef::Fn(tid) = tid {
@@ -452,10 +455,13 @@ impl DomainBuilder {
             });
         }
 
-        for (name, effects) in self.goals {
+        for (name, tid, effects) in self.goals {
             let key = Ustr::from(name);
-            if index_of.insert(key, tasks.len()).is_some() {
-                return Err(HtnError::builder(format!("duplicate task name `{name}`")));
+            index_of.entry(key).or_insert(tasks.len());
+            if type_index.insert(tid, tasks.len()).is_some() {
+                return Err(HtnError::builder(format!(
+                    "duplicate goal function `{name}` (a goal function may be registered once)"
+                )));
             }
             tasks.push(Task::Goal(GoalTask { name, effects }));
         }

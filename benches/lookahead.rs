@@ -31,15 +31,25 @@
 
 mod common;
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
+use bevy_bhtn::tasks::TaskFn;
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
+use common::doomed_tasks::act;
+use common::gate_tasks::gate_root;
+use common::outpost_tasks::secure_outpost;
 use common::{
     doomed_recursion_domain, execute_plan, fresh_outpost, gate_domain, outpost_domain,
     outpost_scratch,
 };
+
+/// Plan from `root` — `F` is inferred from the function item, so the lookup
+/// uses the same `TypeId` the domain recorded at bake time.
+fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
+    planner.plan(_root, state)
+}
 
 fn bench_lookahead(c: &mut Criterion) {
     // --- exponential_backtrack: 2^12 leaf failures vs one sweep ------------
@@ -58,7 +68,7 @@ fn bench_lookahead(c: &mut Criterion) {
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    let plan = planner.plan("gate_root", black_box(&state));
+                    let plan = plan_root(&mut planner, gate_root, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
                     black_box(plan.task_names().len());
                 })
@@ -80,7 +90,7 @@ fn bench_lookahead(c: &mut Criterion) {
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    let plan = planner.plan("act", black_box(&state));
+                    let plan = plan_root(&mut planner, act, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
                     black_box(plan.task_names().len());
                 })
@@ -102,7 +112,7 @@ fn bench_lookahead(c: &mut Criterion) {
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
-                    let plan = planner.plan("secure_outpost", black_box(&state));
+                    let plan = plan_root(&mut planner, secure_outpost, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
                     black_box(plan.task_names().len());
                 })

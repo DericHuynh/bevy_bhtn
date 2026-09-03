@@ -16,17 +16,29 @@
 //!   exhaustive descent into a successful alternative method.
 //!
 //! Domains are task-function graphs built inline (nested `fn`s inside each
-//! domain constructor; the parameterized gate/chain generators are baked as
+//! domain constructor; domains whose summaries are pinned keep their task
+//! functions in a sibling `*_tasks` module so tests can name them for
+//! type-based lookup; the parameterized gate/chain generators are baked as
 //! macro-generated static graphs). Summaries range over component slot
 //! indices, resolved via `domain.components.get::<T>()`.
+//!
+//! Domains whose forward plans are exercised always plan their domain root
+//! (resolved by task index, like [`common::HtnTestBed::plan_forward`]).
 
 mod common;
 use common::{Food, Fuel, Gold, Noise};
 
 use bevy_bhtn::planner::HtnPlanner;
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::{FieldSet, HtnDomain, TaskBuilder};
+use bevy_bhtn::{FieldSet, HtnDomain, Task, TaskBuilder, TaskFn, TaskSummary};
 use bevy_ecs::prelude::*;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through this inference helper: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {
+    domain.task_summary(_f)
+}
 
 // ---------------------------------------------------------------------------
 // Components (one per former state field)
@@ -148,25 +160,30 @@ fn field_set_bit_operations() {
 // Summary domains
 // ---------------------------------------------------------------------------
 
-fn work_domain() -> HtnDomain {
-    fn work(task: &mut TaskBuilder) {
+mod work_tasks {
+    use super::*;
+
+    pub fn work(task: &mut TaskBuilder) {
         task.branch().then(dig).then(haul);
         task.branch().then(sell);
     }
-    fn dig(task: &mut TaskBuilder) {
+    pub fn dig(task: &mut TaskBuilder) {
         task.precondition(|fuel: &Fuel| fuel.0 > 0)
             .effect(|gold: &mut Gold| gold.0 += 1)
             .effect(|fuel: &mut Fuel| fuel.0 -= 1);
     }
-    fn haul(task: &mut TaskBuilder) {
+    pub fn haul(task: &mut TaskBuilder) {
         task.precondition(|gold: &Gold| gold.0 > 0)
             .effect(|at_base: &mut AtBase| at_base.0 = true);
     }
-    fn sell(task: &mut TaskBuilder) {
+    pub fn sell(task: &mut TaskBuilder) {
         task.precondition(|at_base: &AtBase| at_base.0)
             .effect(|gold: &mut Gold| gold.0 -= 1);
     }
-    HtnDomain::from_root(work)
+}
+
+fn work_domain() -> HtnDomain {
+    HtnDomain::from_root(work_tasks::work)
         .build()
         .expect("work domain is well-formed")
 }
@@ -178,7 +195,7 @@ fn summaries_pin_flat_domain() {
     // Work: possible = union over both methods; guaranteed = intersection
     // (dig writes all three, sell only gold); required = intersection of the
     // methods' sequence requirements (dig needs fuel, sell needs at_base) = ∅.
-    let work = domain.task_summary("work").expect("work summary");
+    let work = summary_of(&domain, work_tasks::work).expect("work summary");
     assert!(slot_names(&domain, &work.required_fields).is_empty());
     assert_eq!(
         slot_names(&domain, &work.possible_writes),
@@ -188,7 +205,7 @@ fn summaries_pin_flat_domain() {
 
     // Dig: reads fuel before writing it; writes gold and fuel — pinned by
     // slot index, not by name.
-    let dig = domain.task_summary("dig").expect("dig summary");
+    let dig = summary_of(&domain, work_tasks::dig).expect("dig summary");
     assert_eq!(slot_names(&domain, &dig.required_fields), vec!["Fuel"]);
     assert!(dig.required_fields.contains(slot_of::<Fuel>(&domain)));
     assert!(!dig.required_fields.contains(slot_of::<Gold>(&domain)));
@@ -202,59 +219,80 @@ fn summaries_pin_flat_domain() {
     );
 
     // Haul: requires gold, writes at_base.
-    let haul = domain.task_summary("haul").expect("haul summary");
+    let haul = summary_of(&domain, work_tasks::haul).expect("haul summary");
     assert_eq!(slot_names(&domain, &haul.required_fields), vec!["Gold"]);
     assert_eq!(slot_names(&domain, &haul.possible_writes), vec!["AtBase"]);
     assert_eq!(slot_names(&domain, &haul.guaranteed_writes), vec!["AtBase"]);
 
     // Sell: requires at_base, writes gold.
-    let sell = domain.task_summary("sell").expect("sell summary");
+    let sell = summary_of(&domain, work_tasks::sell).expect("sell summary");
     assert_eq!(slot_names(&domain, &sell.required_fields), vec!["AtBase"]);
     assert_eq!(slot_names(&domain, &sell.possible_writes), vec!["Gold"]);
     assert_eq!(slot_names(&domain, &sell.guaranteed_writes), vec!["Gold"]);
 
     // Method-level possible writes: dig's chain writes everything, sell only
-    // gold. These drive the look-ahead's optimistic propagation.
-    let dig_writes = domain
-        .method_possible_writes("work", 0)
-        .expect("dig method writes");
+    // gold. These drive the look-ahead's optimistic propagation. The per-method
+    // sets are bake-internal now, so pin the equivalent public data: a
+    // total-order method's possible writes are exactly the union of its member
+    // primitives' write slots.
+    let Some(Task::Compound(work_task)) = domain.get_task("work") else {
+        panic!("work must be compound");
+    };
+    let method_write_names = |method: usize| -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = work_task.methods[method]
+            .subtasks
+            .iter()
+            .filter_map(|&s| match &domain.tasks[s as usize] {
+                Task::Primitive(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| p.write_slots())
+            .map(|i| domain.components.name_of(i))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
     assert_eq!(
-        slot_names(&domain, dig_writes),
-        vec!["AtBase", "Fuel", "Gold"]
+        method_write_names(0),
+        vec!["AtBase", "Fuel", "Gold"],
+        "dig method writes"
     );
-    let sell_writes = domain
-        .method_possible_writes("work", 1)
-        .expect("sell method writes");
-    assert_eq!(slot_names(&domain, sell_writes), vec!["Gold"]);
+    assert_eq!(method_write_names(1), vec!["Gold"], "sell method writes");
 }
 
-fn recursion_domain() -> HtnDomain {
+mod recursion_tasks {
+    use super::*;
+
     // Synthetic root so every top-level task is baked (from_root records the
-    // transitive .then graph only); tests plan the individual tasks by name.
-    fn root(task: &mut TaskBuilder) {
+    // transitive .then graph only); tests address the individual tasks by type.
+    pub fn root(task: &mut TaskBuilder) {
         task.branch().then(loop_);
         task.branch().then(descend);
         task.branch().then(spiral);
     }
-    fn loop_(task: &mut TaskBuilder) {
+    pub fn loop_(task: &mut TaskBuilder) {
         task.branch().then(tick);
         task.branch().then(loop_).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn descend(task: &mut TaskBuilder) {
+    pub fn descend(task: &mut TaskBuilder) {
         task.branch().then(descend).then(eat);
         task.branch().then(eat);
     }
-    fn eat(task: &mut TaskBuilder) {
+    pub fn eat(task: &mut TaskBuilder) {
         task.precondition(|food: &Food| food.0 > 0)
             .effect(|food: &mut Food| food.0 -= 1);
     }
-    fn spiral(task: &mut TaskBuilder) {
+    pub fn spiral(task: &mut TaskBuilder) {
         task.branch().then(spiral).then(tick);
     }
-    HtnDomain::from_root(root)
+}
+
+fn recursion_domain() -> HtnDomain {
+    HtnDomain::from_root(recursion_tasks::root)
         .build()
         .expect("recursion domain is well-formed")
 }
@@ -264,7 +302,7 @@ fn summaries_pin_recursive_domains() {
     let domain = recursion_domain();
 
     // Loop terminates (base branch `tick`): every refinement is Tick^k, k>=1.
-    let loop_summary = domain.task_summary("loop_").expect("loop summary");
+    let loop_summary = summary_of(&domain, recursion_tasks::loop_).expect("loop summary");
     assert!(slot_names(&domain, &loop_summary.required_fields).is_empty());
     assert_eq!(
         slot_names(&domain, &loop_summary.possible_writes),
@@ -277,7 +315,7 @@ fn summaries_pin_recursive_domains() {
 
     // Descend: every refinement is Eat^k, k>=1 — food is read before anything
     // writes it in every refinement, so it survives the recursion as required.
-    let descend = domain.task_summary("descend").expect("descend summary");
+    let descend = summary_of(&domain, recursion_tasks::descend).expect("descend summary");
     assert_eq!(slot_names(&domain, &descend.required_fields), vec!["Food"]);
     assert_eq!(slot_names(&domain, &descend.possible_writes), vec!["Food"]);
     assert_eq!(
@@ -289,19 +327,24 @@ fn summaries_pin_recursive_domains() {
     // refinements, so nothing is required (the inference papers' "undef"
     // convention, conservatively mapped to empty). Possible writes stay an
     // over-approximation.
-    let spiral = domain.task_summary("spiral").expect("spiral summary");
+    let spiral = summary_of(&domain, recursion_tasks::spiral).expect("spiral summary");
     assert!(slot_names(&domain, &spiral.required_fields).is_empty());
     assert_eq!(slot_names(&domain, &spiral.possible_writes), vec!["Count"]);
 }
 
-fn gamble_domain() -> HtnDomain {
-    fn gamble(task: &mut TaskBuilder) {
+mod gamble_tasks {
+    use super::*;
+
+    pub fn gamble(task: &mut TaskBuilder) {
         task.branch().then(hope);
     }
-    fn hope(task: &mut TaskBuilder) {
+    pub fn hope(task: &mut TaskBuilder) {
         task.expected(|luck: &mut Luck| luck.0 = true);
     }
-    HtnDomain::from_root(gamble)
+}
+
+fn gamble_domain() -> HtnDomain {
+    HtnDomain::from_root(gamble_tasks::gamble)
         .build()
         .expect("gamble domain is well-formed")
 }
@@ -310,11 +353,11 @@ fn gamble_domain() -> HtnDomain {
 fn expected_effects_are_possible_but_not_guaranteed() {
     let domain = gamble_domain();
 
-    let hope = domain.task_summary("hope").expect("hope summary");
+    let hope = summary_of(&domain, gamble_tasks::hope).expect("hope summary");
     assert_eq!(slot_names(&domain, &hope.possible_writes), vec!["Luck"]);
     assert!(slot_names(&domain, &hope.guaranteed_writes).is_empty());
 
-    let gamble = domain.task_summary("gamble").expect("gamble summary");
+    let gamble = summary_of(&domain, gamble_tasks::gamble).expect("gamble summary");
     assert_eq!(slot_names(&domain, &gamble.possible_writes), vec!["Luck"]);
     assert!(slot_names(&domain, &gamble.guaranteed_writes).is_empty());
 }
@@ -353,7 +396,7 @@ fn doomed_domain() -> HtnDomain {
 fn lookahead_beats_sanity_limit_on_doomed_method() {
     use common::HtnTestBed;
 
-    let bed = HtnTestBed::new(doomed_domain(), "act");
+    let bed = HtnTestBed::new(doomed_domain());
     let start = PlanState::build(&bed.domain().components)
         .set(Gold(0))
         .finish();
@@ -367,7 +410,7 @@ fn lookahead_beats_sanity_limit_on_doomed_method() {
 fn lookahead_keeps_plans_identical_when_backtracking_suffices() {
     use common::HtnTestBed;
 
-    let bed = HtnTestBed::new(work_domain(), "work");
+    let bed = HtnTestBed::new(work_domain());
 
     // dig is refuted by the sweep (fuel known 0, nothing writes it before
     // dig); plain backtracking would find the same plan.
@@ -413,7 +456,7 @@ fn maybe_domain() -> HtnDomain {
 fn lookahead_treats_unknown_fields_as_maybe() {
     use common::HtnTestBed;
 
-    let bed = HtnTestBed::new(maybe_domain(), "root");
+    let bed = HtnTestBed::new(maybe_domain());
     let start = PlanState::build(&bed.domain().components)
         .set(Luck(false))
         .finish();
@@ -465,7 +508,7 @@ fn backtracking_restores_queue_after_mid_sequence_failure() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(true);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        planner.plan_index(domain.root, &state).task_names(),
         ["rescue"],
         "look-ahead should refute the broken branch without entering it"
     );
@@ -476,7 +519,7 @@ fn backtracking_restores_queue_after_mid_sequence_failure() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        planner.plan_index(domain.root, &state).task_names(),
         ["rescue"],
         "plain backtracking must discard the abandoned branch and fall through"
     );
@@ -525,7 +568,7 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
     // gold > 100 and nothing in the sequence writes gold).
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        planner.plan_index(domain.root, &state).task_names(),
         ["ok"],
         "look-ahead should refute the doomed branch without entering it"
     );
@@ -535,7 +578,7 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        planner.plan_index(domain.root, &state).task_names(),
         ["ok"],
         "backtracking must restore the ancestor suffix consumed by the failed tail"
     );
@@ -548,24 +591,29 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
 /// old sweep had nothing to refute (every method applies, no condition ever
 /// definitely fails), so the doomed method burned the whole sanity budget.
 /// The bake-time `terminating` flag refutes it in one sweep.
-fn pure_recursion_domain() -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
+mod pure_recursion_tasks {
+    use super::*;
+
+    pub fn root(task: &mut TaskBuilder) {
         task.branch().then(prime).then(spiral);
         task.branch().then(ok);
     }
-    fn spiral(task: &mut TaskBuilder) {
+    pub fn spiral(task: &mut TaskBuilder) {
         task.branch().then(spiral).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn prime(task: &mut TaskBuilder) {
+    pub fn prime(task: &mut TaskBuilder) {
         task.effect(|noise: &mut Noise| noise.0 = true);
     }
-    fn ok(task: &mut TaskBuilder) {
+    pub fn ok(task: &mut TaskBuilder) {
         task.effect(|gold: &mut Gold| gold.0 = 1);
     }
-    HtnDomain::from_root(root)
+}
+
+fn pure_recursion_domain() -> HtnDomain {
+    HtnDomain::from_root(pure_recursion_tasks::root)
         .build()
         .expect("pure-recursion domain is well-formed")
 }
@@ -576,45 +624,62 @@ fn terminating_flag_refutes_pure_infinite_recursion() {
     let state = default_state(&domain);
 
     // The flag itself: spiral can only refine forever.
-    assert!(!domain.task_summary("spiral").unwrap().terminating);
-    assert_eq!(domain.task_summary("spiral").unwrap().min_yield, usize::MAX);
+    assert!(
+        !summary_of(&domain, pure_recursion_tasks::spiral)
+            .unwrap()
+            .terminating
+    );
+    assert_eq!(
+        summary_of(&domain, pure_recursion_tasks::spiral)
+            .unwrap()
+            .min_yield,
+        usize::MAX
+    );
 
     // Look-ahead on: the doomed branch is refuted at the frame without
     // recursing.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["ok"]);
+    assert_eq!(planner.plan_index(domain.root, &state).task_names(), ["ok"]);
 
     // Look-ahead off: plain backtracking burns the sanity budget and returns
     // the partial plan (the documented fallback semantics).
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
-    assert_eq!(planner.plan("root", &state).task_names(), ["prime"]);
+    assert_eq!(
+        planner.plan_index(domain.root, &state).task_names(),
+        ["prime"]
+    );
 }
 
 /// The non-terminating task is buried one level deep: the sweep must refute
 /// via `probe`'s own flag (its only refinement path is non-terminating)
 /// without decomposing anything.
-fn nested_recursion_domain() -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
+mod nested_recursion_tasks {
+    use super::*;
+
+    pub fn root(task: &mut TaskBuilder) {
         task.branch().then(probe).then(wrap);
         task.branch().then(ok);
     }
-    fn probe(task: &mut TaskBuilder) {
+    pub fn probe(task: &mut TaskBuilder) {
         task.branch().then(spiral);
     }
-    fn spiral(task: &mut TaskBuilder) {
+    pub fn spiral(task: &mut TaskBuilder) {
         task.branch().then(spiral).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn wrap(task: &mut TaskBuilder) {
+    pub fn wrap(task: &mut TaskBuilder) {
         task.effect(|noise: &mut Noise| noise.0 = false);
     }
-    fn ok(task: &mut TaskBuilder) {
+    pub fn ok(task: &mut TaskBuilder) {
         task.effect(|gold: &mut Gold| gold.0 = 1);
     }
-    HtnDomain::from_root(root)
+}
+
+fn nested_recursion_domain() -> HtnDomain {
+    HtnDomain::from_root(nested_recursion_tasks::root)
         .build()
         .expect("nested-recursion domain is well-formed")
 }
@@ -624,40 +689,52 @@ fn terminating_flag_refutes_through_nested_compounds() {
     let domain = nested_recursion_domain();
     let state = default_state(&domain);
 
-    assert!(!domain.task_summary("probe").unwrap().terminating);
+    assert!(
+        !summary_of(&domain, nested_recursion_tasks::probe)
+            .unwrap()
+            .terminating
+    );
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["ok"]);
+    assert_eq!(planner.plan_index(domain.root, &state).task_names(), ["ok"]);
 
     // Off: the doomed branch is entered; no primitive ever executes before
     // the budget burns, so the partial plan is empty.
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
-    assert!(planner.plan("root", &state).task_names().is_empty());
+    assert!(planner
+        .plan_index(domain.root, &state)
+        .task_names()
+        .is_empty());
 }
 
 /// A non-terminating *method alternative*: the risky method is tried first,
 /// refuted by the sweep at its own commitment, and the viable one is taken —
 /// where the old planner burned the budget inside `risky` and returned an
 /// empty partial plan.
-fn mixed_termination_domain() -> HtnDomain {
-    fn pick(task: &mut TaskBuilder) {
+mod mixed_termination_tasks {
+    use super::*;
+
+    pub fn pick(task: &mut TaskBuilder) {
         task.branch().then(risky);
         task.branch().then(ok);
     }
-    fn risky(task: &mut TaskBuilder) {
+    pub fn risky(task: &mut TaskBuilder) {
         task.branch().then(spiral);
     }
-    fn spiral(task: &mut TaskBuilder) {
+    pub fn spiral(task: &mut TaskBuilder) {
         task.branch().then(spiral).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn ok(task: &mut TaskBuilder) {
+    pub fn ok(task: &mut TaskBuilder) {
         task.effect(|gold: &mut Gold| gold.0 = 1);
     }
-    HtnDomain::from_root(pick)
+}
+
+fn mixed_termination_domain() -> HtnDomain {
+    HtnDomain::from_root(mixed_termination_tasks::pick)
         .build()
         .expect("mixed-termination domain is well-formed")
 }
@@ -668,30 +745,38 @@ fn non_terminating_method_skipped_among_viable_ones() {
     let state = default_state(&domain);
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("pick", &state).task_names(), ["ok"]);
+    assert_eq!(planner.plan_index(domain.root, &state).task_names(), ["ok"]);
 
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
-    assert!(planner.plan("pick", &state).task_names().is_empty());
+    assert!(planner
+        .plan_index(domain.root, &state)
+        .task_names()
+        .is_empty());
 }
 
 /// Over-refutation guard: *terminating* recursion must keep its flag and keep
 /// planning — a wrong `terminating = false` here would collapse the plan.
-fn terminating_recursion_domain() -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
+mod terminating_recursion_tasks {
+    use super::*;
+
+    pub fn root(task: &mut TaskBuilder) {
         task.branch().then(loop_).then(check);
     }
-    fn loop_(task: &mut TaskBuilder) {
+    pub fn loop_(task: &mut TaskBuilder) {
         task.branch().then(tick);
         task.branch().then(loop_).then(tick);
     }
-    fn tick(task: &mut TaskBuilder) {
+    pub fn tick(task: &mut TaskBuilder) {
         task.effect(|count: &mut Count| count.0 += 1);
     }
-    fn check(task: &mut TaskBuilder) {
+    pub fn check(task: &mut TaskBuilder) {
         task.precondition(|count: &Count| count.0 > 0);
     }
-    HtnDomain::from_root(root)
+}
+
+fn terminating_recursion_domain() -> HtnDomain {
+    HtnDomain::from_root(terminating_recursion_tasks::root)
         .build()
         .expect("terminating-recursion domain is well-formed")
 }
@@ -701,12 +786,15 @@ fn terminating_recursion_not_flagged() {
     let domain = terminating_recursion_domain();
     let state = default_state(&domain);
 
-    let summary = domain.task_summary("loop_").unwrap();
+    let summary = summary_of(&domain, terminating_recursion_tasks::loop_).unwrap();
     assert!(summary.terminating);
     assert_eq!(summary.min_yield, 1);
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["tick", "check"]);
+    assert_eq!(
+        planner.plan_index(domain.root, &state).task_names(),
+        ["tick", "check"]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -812,13 +900,16 @@ fn per_condition_reads_prune_despite_unknown_sibling_field() {
     // On: `y == 5` is definitely false (y known 0) even though `x == 1` is
     // maybe — the doomed method is refuted at the frame.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["ok"]);
+    assert_eq!(planner.plan_index(domain.root, &state).task_names(), ["ok"]);
 
     // Off: the doomed method is entered (first task set_x) and burns the
     // budget on the gate enumeration.
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
-    assert_eq!(planner.plan("root", &state).task_names()[0], "set_x");
+    assert_eq!(
+        planner.plan_index(domain.root, &state).task_names()[0],
+        "set_x"
+    );
 }
 
 /// An identifier condition (`a == b`) with one unknown operand must be
@@ -854,7 +945,10 @@ fn identifier_condition_with_unknown_field_is_maybe() {
     let state = PlanState::build(&domain.components).set(B(5)).finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["set_a", "cmp"]);
+    assert_eq!(
+        planner.plan_index(domain.root, &state).task_names(),
+        ["set_a", "cmp"]
+    );
 }
 
 /// A negated condition on an unknown field must likewise be "maybe": the
@@ -888,7 +982,10 @@ fn notted_condition_on_unknown_field_is_maybe() {
     let state = PlanState::build(&domain.components).set(A(5)).finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["set_a", "cmp"]);
+    assert_eq!(
+        planner.plan_index(domain.root, &state).task_names(),
+        ["set_a", "cmp"]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +1036,7 @@ fn occurrence_pin_domain() -> HtnDomain {
 fn pins_apply_per_occurrence_not_per_task_index() {
     use common::HtnTestBed;
 
-    let bed = HtnTestBed::new(occurrence_pin_domain(), "root");
+    let bed = HtnTestBed::new(occurrence_pin_domain());
     let start = default_state(bed.domain());
 
     // The sweep pins occurrence 1 to `phase zero` and occurrence 2 to
@@ -956,7 +1053,7 @@ fn pins_apply_per_occurrence_not_per_task_index() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_lookahead(false);
     assert_eq!(
-        planner.plan("root", &start).task_names(),
+        planner.plan_index(domain.root, &start).task_names(),
         ["step0", "bump", "step1", "verify"],
         "plain backtracking must agree with the pinned plan"
     );

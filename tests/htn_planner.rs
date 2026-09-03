@@ -15,11 +15,23 @@
 #![recursion_limit = "1024"]
 
 mod common;
+use common::bench_common::{gate_tasks::gate_root, miner_tasks::earn_gold};
 use common::HtnTestBed;
 
 use bevy_bhtn::prelude::*;
 use bevy_ecs::prelude::Component;
 use ustr::Ustr;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn bed_backward<F: GoalFn>(bed: &HtnTestBed, _f: F, state: &PlanState) -> HtnResult<Vec<Ustr>> {
+    bed.plan_backward(_f, state)
+}
 
 // ---------------------------------------------------------------------------
 // Travel domain — mirrors the classic bevy_htn `test_travel_htn`.
@@ -99,14 +111,14 @@ fn travel_state(domain: &HtnDomain, cash: i32, distance_to_park: i32) -> PlanSta
 
 #[test]
 fn forward_plans_walk_when_close() {
-    let bed = HtnTestBed::new(travel_domain(), "go_to_park");
+    let bed = HtnTestBed::new(travel_domain());
     let state = travel_state(bed.domain(), 0, 1);
     assert_eq!(bed.plan_forward(&state), vec![Ustr::from("walk")]);
 }
 
 #[test]
 fn forward_plans_taxi_when_far() {
-    let bed = HtnTestBed::new(travel_domain(), "go_to_park");
+    let bed = HtnTestBed::new(travel_domain());
     let state = travel_state(bed.domain(), 10, 9);
     // Walk fails (too far) -> backtracks -> taxi succeeds.
     assert_eq!(
@@ -121,7 +133,7 @@ fn forward_plans_taxi_when_far() {
 
 #[test]
 fn forward_plan_is_terminal_and_executes() {
-    let bed = HtnTestBed::new(travel_domain(), "go_to_park");
+    let bed = HtnTestBed::new(travel_domain());
     let mut state = travel_state(bed.domain(), 10, 9);
     let plan = bed.plan_forward(&state);
     assert_eq!(plan.len(), 3);
@@ -169,7 +181,7 @@ fn idempotent_domain() -> HtnDomain {
 
 #[test]
 fn forward_plan_returns_empty_when_goal_already_met() {
-    let bed = HtnTestBed::new(idempotent_domain(), "ensure_on");
+    let bed = HtnTestBed::new(idempotent_domain());
     let on = PlanState::build(&bed.domain().components)
         .set(Powered(true))
         .finish();
@@ -211,11 +223,9 @@ fn goal_domain() -> HtnDomain {
 
 #[test]
 fn backward_plan_finds_satisfying_leaf() {
-    let bed = HtnTestBed::new(goal_domain(), "ore_root");
+    let bed = HtnTestBed::new(goal_domain());
     let state = PlanState::build(&bed.domain().components).finish();
-    let plan = bed
-        .plan_backward("have_ore", &state)
-        .expect("back plan reaches goal");
+    let plan = bed_backward(&bed, have_ore, &state).expect("back plan reaches goal");
     assert_eq!(plan, vec![Ustr::from("mine")]);
 }
 
@@ -238,10 +248,10 @@ fn backward_plan_rejects_unreachable_goal() {
         .goal(want_more)
         .build()
         .expect("unreachable-goal domain is well-formed");
-    let bed = HtnTestBed::new(domain, "unreachable_root");
+    let bed = HtnTestBed::new(domain);
     let state = PlanState::build(&bed.domain().components).finish();
     // `has_rope` is never produced by any primitive -> goal unreachable.
-    assert!(bed.plan_backward("want_more", &state).is_err());
+    assert!(bed_backward(&bed, want_more, &state).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +260,7 @@ fn backward_plan_rejects_unreachable_goal() {
 
 #[test]
 fn task_functions_record_conditions_and_effects() {
-    let bed = HtnTestBed::new(travel_domain(), "go_to_park");
+    let bed = HtnTestBed::new(travel_domain());
     let Some(Task::Primitive(walk)) = bed.domain().get_task("walk") else {
         panic!("walk primitive missing");
     };
@@ -281,7 +291,7 @@ fn task_functions_record_conditions_and_effects() {
 
 #[test]
 fn conditions_evaluate_against_state() {
-    let bed = HtnTestBed::new(travel_domain(), "go_to_park");
+    let bed = HtnTestBed::new(travel_domain());
     let Some(Task::Primitive(walk)) = bed.domain().get_task("walk") else {
         panic!("walk primitive missing");
     };
@@ -294,7 +304,7 @@ fn conditions_evaluate_against_state() {
 
 #[test]
 fn effects_apply_to_state() {
-    let bed = HtnTestBed::new(idempotent_domain(), "ensure_on");
+    let bed = HtnTestBed::new(idempotent_domain());
     let Some(Task::Primitive(switch)) = bed.domain().get_task("switch_on") else {
         panic!("switch_on primitive missing");
     };
@@ -655,7 +665,7 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
         .finish();
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(1000);
-    let plan = planner.plan("wide_root", &state);
+    let plan = plan_of(&mut planner, wide_root, &state);
     assert!(
         plan.is_complete(),
         "the raised budget fully refutes the doomed branch"
@@ -667,7 +677,7 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
     let mut la = HtnPlanner::new(&domain);
     la.set_sanity_limit(1000).set_lookahead(true);
     assert_eq!(
-        la.plan("wide_root", &state).task_names(),
+        plan_of(&mut la, wide_root, &state).task_names(),
         ["strike", "leaf_check"]
     );
 }
@@ -686,7 +696,7 @@ fn plan_status_reports_complete_vs_partial() {
     let miner = common::miner_domain();
     let state = PlanState::build(&miner.components).finish();
     let mut planner = HtnPlanner::new(&miner);
-    assert!(planner.plan("earn_gold", &state).is_complete());
+    assert!(plan_of(&mut planner, earn_gold, &state).is_complete());
 
     // Budget-truncated: with the look-ahead off, the gate domain's doomed
     // method must enumerate 2^12 gate combinations — the default sanity
@@ -695,7 +705,7 @@ fn plan_status_reports_complete_vs_partial() {
     let state = PlanState::build(&gate.components).finish();
     let mut planner = HtnPlanner::new(&gate);
     planner.set_lookahead(false);
-    let partial = planner.plan("gate_root", &state);
+    let partial = plan_of(&mut planner, gate_root, &state);
     assert!(partial.is_partial());
     assert!(
         !partial.is_empty(),
@@ -706,7 +716,7 @@ fn plan_status_reports_complete_vs_partial() {
     // in one sweep pass and the direct method plans — final, no budget raise
     // needed (full enumeration would cost ~2^12 gate combinations).
     let mut planner = HtnPlanner::new(&gate);
-    let done = planner.plan("gate_root", &state);
+    let done = plan_of(&mut planner, gate_root, &state);
     assert!(done.is_complete());
     assert_eq!(done.task_names(), ["strike", "gate_final"]);
 
@@ -723,7 +733,7 @@ fn plan_status_reports_complete_vs_partial() {
     let dead = HtnDomain::from_root(impossible).build().unwrap();
     let state = PlanState::build(&dead.components).finish();
     let mut planner = HtnPlanner::new(&dead);
-    let plan = planner.plan("impossible", &state);
+    let plan = plan_of(&mut planner, impossible, &state);
     assert!(plan.is_complete());
     assert!(plan.is_empty());
 }

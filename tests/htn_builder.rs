@@ -4,12 +4,31 @@
 //! names), build-time validation errors, and that baked domains feed
 //! summaries/look-ahead exactly like the old parsed ones.
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
-use bevy_bhtn::{BackPlanner, HtnDomain, HtnError, Task};
+use bevy_bhtn::tasks::{GoalBuilder, GoalFn, TaskBuilder, TaskFn};
+use bevy_bhtn::{BackPlanner, HtnDomain, HtnError, HtnResult, Task, TaskSummary};
 use bevy_ecs::prelude::*;
 use std::any::TypeId;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {
+    domain.task_summary(_f)
+}
+
+fn back_plan_of<F: GoalFn>(
+    planner: &mut BackPlanner<'_>,
+    _f: F,
+    state: &PlanState,
+) -> HtnResult<Plan> {
+    planner.plan(_f, state)
+}
 
 /// Capture a function item's `TypeId` (fn item types are unnameable in type
 /// position, but generic inference recovers them from the value).
@@ -79,26 +98,32 @@ fn recursion_and_forward_references_bake_to_edges() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     // `tail` is a precondition-only primitive: pickable, executes as a no-op.
-    assert_eq!(planner.plan("root", &state).task_names(), ["late", "tail"]);
+    assert_eq!(
+        plan_of(&mut planner, root, &state).task_names(),
+        ["late", "tail"]
+    );
 
     let spiral = HtnDomain::from_root(spiral_root)
         .build()
         .expect("well-formed");
-    let summary = spiral.task_summary("spiral_root").expect("summary present");
+    let summary = summary_of(&spiral, spiral_root).expect("summary present");
     assert!(summary.recursive, "self-reference is a recursion edge");
     let state = PlanState::build(&spiral.components).finish();
     let mut planner = HtnPlanner::new(&spiral);
     assert_eq!(
-        planner.plan("spiral_root", &state).task_names(),
+        plan_of(&mut planner, spiral_root, &state).task_names(),
         ["spiral_step", "spiral_step"],
         "two iterations reach the terminal branch"
     );
 }
 
-/// Duplicate task names (two same-named functions in different modules) are
-/// rejected at `build` time.
+/// Two distinct task functions with the same display name (last path segment
+/// of `type_name`) are separate identities: both bake, resolve through their
+/// own `TypeId`s, and both execute. Display names are not identity — the
+/// old name-keyed bake check spuriously rejected this shape (regression pin
+/// for the lookup-by-type migration; the same collision broke closures).
 #[test]
-fn duplicate_task_names_yield_builder_error() {
+fn same_display_names_are_distinct_identities() {
     mod a {
         use super::*;
         pub fn dup(task: &mut TaskBuilder) {
@@ -112,20 +137,81 @@ fn duplicate_task_names_yield_builder_error() {
         }
     }
     fn root(task: &mut TaskBuilder) {
-        task.branch().then(a::dup);
-    }
-
-    // b::dup is never referenced, so this builds fine...
-    HtnDomain::from_root(root)
-        .build()
-        .expect("unreferenced duplicates are fine");
-
-    fn clashing(task: &mut TaskBuilder) {
         task.branch().then(a::dup).then(b::dup);
     }
-    let err = HtnDomain::from_root(clashing).build().unwrap_err();
+
+    let domain = HtnDomain::from_root(root)
+        .build()
+        .expect("same-named task fns are distinct identities and bake fine");
+    // Distinct `TypeId`s resolve to distinct task indices.
+    let a_idx = domain.task_index_by_type(type_id_of(a::dup)).unwrap();
+    let b_idx = domain.task_index_by_type(type_id_of(b::dup)).unwrap();
+    assert_ne!(a_idx, b_idx, "the two `dup` fns must not alias");
+    // Display-name introspection is first-wins (and finds *something*).
+    assert!(domain.get_task("dup").is_some());
+    // Both tasks exist and execute in declaration order. Steps are addressed
+    // by index (plan.names is display-only and both steps share "dup").
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = plan_of(&mut planner, root, &state);
+    assert_eq!(plan.task_names(), ["dup", "dup"]);
+    let mut executed = state.clone();
+    for &step in &plan.steps {
+        let Task::Primitive(p) = &domain.tasks[step as usize] else {
+            panic!("plans are primitive sequences");
+        };
+        p.apply_effects(&mut executed);
+    }
+    let gold = domain.components.get::<Gold>().unwrap();
+    let noise = domain.components.get::<Noise>().unwrap();
+    assert_eq!(executed.get::<Gold>(gold).0, 1, "a::dup ran");
+    assert!(executed.get::<Noise>(noise).0, "b::dup ran");
+}
+
+/// Registering the same goal function twice is a bake error — the second
+/// registration would silently shadow the first in the `TypeId` index
+/// (regression pin for the goal `TypeId` index added with lookup-by-type).
+#[test]
+fn duplicate_goal_fn_registration_is_a_bake_error() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(leaf);
+    }
+    fn leaf(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 1);
+    }
+    fn want_gold(goal: &mut GoalBuilder) {
+        goal.effect(|gold: &mut Gold| gold.0 = 3);
+    }
+
+    let err = HtnDomain::from_root(root)
+        .goal(want_gold)
+        .goal(want_gold)
+        .build()
+        .unwrap_err();
     assert!(matches!(err, HtnError::Builder { .. }));
-    assert!(err.to_string().contains("duplicate"));
+    assert!(err.to_string().contains("duplicate goal function"));
+}
+
+/// Planning from a task function that was never recorded in the domain yields
+/// an empty plan (never a panic) — the type-addressed analogue of the old
+/// unknown-name behavior, now keyed by the fn item's `TypeId`.
+#[test]
+fn unregistered_root_yields_an_empty_plan() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(leaf);
+    }
+    fn leaf(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 1);
+    }
+    fn never_registered(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 = 99);
+    }
+
+    let domain = HtnDomain::from_root(root).build().expect("well-formed");
+    assert_eq!(domain.task_index(never_registered), None);
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    assert!(plan_of(&mut planner, never_registered, &state).is_empty());
 }
 
 /// A task mixing compound (`branch`) and primitive (`effect`) declarations is
@@ -202,13 +288,13 @@ fn baked_domains_get_summaries_and_lookahead() {
     }
 
     let domain = HtnDomain::from_root(act).build().expect("well-formed");
-    let summary = domain.task_summary("spiral").expect("summary present");
+    let summary = summary_of(&domain, spiral).expect("summary present");
     assert_eq!(summary.min_yield, usize::MAX);
     assert!(!summary.terminating);
 
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("act", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, act, &state).task_names(), ["safe"]);
 }
 
 /// A baked domain plans end-to-end: compound decomposition, preconditions,
@@ -235,12 +321,12 @@ fn baked_domain_plans_forward_and_backward() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("wealthy", &state).task_names(),
+        plan_of(&mut planner, wealthy, &state).task_names(),
         ["work", "work", "work"]
     );
 
     let mut back = BackPlanner::new(&domain);
-    let back_plan = back.plan("three_gold", &state).expect("reachable");
+    let back_plan = back_plan_of(&mut back, three_gold, &state).expect("reachable");
     // Compound participation: the greedy chains through `wealthy`'s recursive
     // method until its own `gold >= 3` gate closes — the plan really reaches
     // the goal's value (the old primitive-only greedy stopped after one `work`,
@@ -273,7 +359,7 @@ fn baked_domain_executes_on_the_scratchpad() {
     let mut state = PlanState::build(&domain.components).set(Energy(0)).finish();
     let mut planner = HtnPlanner::new(&domain);
 
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
     assert_eq!(plan.task_names(), ["recharge", "recharge", "recharge"]);
 
     for name in plan.task_names() {

@@ -429,11 +429,10 @@ pub trait TaskFn: 'static {
     /// This function's `TypeId` (type-erased access for the expansion loop).
     fn task_type_id(&self) -> TypeId;
 
-    /// The task's clean debug name, available through the erased trait object.
-    fn task_name_erased(&self) -> &'static str;
-
     /// The task's clean debug name (the last path segment of
-    /// `std::any::type_name::<Self>()`).
+    /// `std::any::type_name::<Self>()`). For closures this is the mangled
+    /// `{{closure}}` — reference sites replace it with their own
+    /// `file:line:col` via [`reference_display_name`].
     fn task_name() -> &'static str
     where
         Self: Sized,
@@ -451,9 +450,25 @@ impl<F: Fn(&mut TaskBuilder) + 'static> TaskFn for F {
     fn task_type_id(&self) -> TypeId {
         TypeId::of::<F>()
     }
+}
 
-    fn task_name_erased(&self) -> &'static str {
-        F::task_name()
+/// The display name of a task reference, computed at the reference site
+/// (`then`/`subtask`/`from_root`/`root` are all `#[track_caller]`): named
+/// functions keep their clean `type_name` last segment; closures — whose
+/// mangled `{{closure}}` carries no information and collides across every
+/// closure literal — are named after the reference site's `file:line:col`
+/// instead. Display-only cosmetics; identity is the `TypeId`. The formatted
+/// name is leaked: domains bake once and the allocation is bounded by the
+/// task count (the same discipline as the GTN compilation's synthetic names).
+pub(crate) fn reference_display_name(
+    name: &'static str,
+    loc: &std::panic::Location<'_>,
+) -> &'static str {
+    if name.contains("{{closure") {
+        let file = loc.file().rsplit(['/', '\\']).next().unwrap_or(loc.file());
+        Box::leak(format!("{file}:{}:{}", loc.line(), loc.column()).into_boxed_str())
+    } else {
+        name
     }
 }
 
@@ -461,8 +476,13 @@ impl<F: Fn(&mut TaskBuilder) + 'static> TaskFn for F {
 /// identity scheme as [`TaskFn`] — the function item is the goal's name and
 /// identity.
 pub trait GoalFn: 'static {
-    /// Run this function against a recording goal builder.
+    /// Run this function against a recording builder.
     fn record(&self, builder: &mut GoalBuilder);
+
+    /// This goal function's `TypeId` (the goal's graph identity).
+    fn goal_type_id(&self) -> TypeId {
+        TypeId::of::<Self>()
+    }
 
     /// The goal's clean debug name.
     fn goal_name() -> &'static str
@@ -540,7 +560,11 @@ pub(crate) struct Recorder {
     pub(crate) registry: RegistryBuilder,
     pub(crate) tasks: Vec<(SubtaskRef, &'static str, TaskProto)>,
     pub(crate) index_of: HashMap<SubtaskRef, usize>,
-    pub(crate) queue: VecDeque<Box<dyn TaskFn>>,
+    /// Queued task functions awaiting expansion, paired with the display name
+    /// captured at the reference site (closures get the site's
+    /// `file:line:col` — see [`reference_display_name`]). The expansion loop
+    /// records each function once, under the FIRST reference's name.
+    pub(crate) queue: VecDeque<(Box<dyn TaskFn>, &'static str)>,
     pub(crate) errors: Vec<String>,
     /// Next id for transform-synthesized tasks (see [`SubtaskRef::Synthetic`]).
     pub(crate) next_synthetic: u32,
@@ -756,10 +780,12 @@ impl<'a> MethodBuilder<'a> {
 
     /// Append a subtask at the end of the current total order: it runs after
     /// every member declared before it.
+    #[track_caller]
     pub fn then<F: TaskFn>(&mut self, f: F) -> &mut Self {
+        let name = reference_display_name(F::task_name(), std::panic::Location::caller());
         let tid = SubtaskRef::Fn(TypeId::of::<F>());
-        self.proto.subtasks.push((tid, F::task_name(), true));
-        self.rec.queue.push_back(Box::new(f));
+        self.proto.subtasks.push((tid, name, true));
+        self.rec.queue.push_back((Box::new(f), name));
         self
     }
 
@@ -769,12 +795,14 @@ impl<'a> MethodBuilder<'a> {
     /// constraints. The search schedules the branch's unordered members in
     /// any topological order of the constraints, backtracking over
     /// alternatives.
+    #[track_caller]
     pub fn subtask<F: TaskFn>(&mut self, f: F) -> SubtaskHandle {
         let pos = self.proto.subtasks.len() as u32;
+        let name = reference_display_name(F::task_name(), std::panic::Location::caller());
         let tid = SubtaskRef::Fn(TypeId::of::<F>());
-        self.proto.subtasks.push((tid, F::task_name(), false));
+        self.proto.subtasks.push((tid, name, false));
         self.proto.unordered = true;
-        self.rec.queue.push_back(Box::new(f));
+        self.rec.queue.push_back((Box::new(f), name));
         SubtaskHandle { pos }
     }
 

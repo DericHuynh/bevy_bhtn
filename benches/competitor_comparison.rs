@@ -68,9 +68,9 @@ use std::hint::black_box;
 // ---------------------------------------------------------------------------
 
 mod bhtn_side {
-    use bevy_bhtn::planner::HtnPlanner;
+    use bevy_bhtn::planner::{HtnPlanner, Plan};
     use bevy_bhtn::state::PlanState;
-    use bevy_bhtn::tasks::TaskBuilder;
+    use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
     use bevy_bhtn::{HtnDomain, Task};
     use bevy_ecs::prelude::*;
     use bevy_ecs::schedule::Schedule;
@@ -139,11 +139,17 @@ mod bhtn_side {
         PlanState::build(&domain.components).finish() // all defaults: false
     }
 
+    /// Plan from `root` — `F` is inferred from the function item, so the
+    /// lookup uses the same `TypeId` the domain recorded at bake time.
+    fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
+        planner.plan(_root, state)
+    }
+
     /// Single-actor episode: one plan, then execute every step.
     pub fn single_actor_episode(domain: &HtnDomain, state: &PlanState) -> usize {
         let mut state = state.clone();
         let mut planner = HtnPlanner::new(domain);
-        let plan = planner.plan("get_item", &state);
+        let plan = plan_root(&mut planner, get_item, &state);
         let steps = plan.task_names().len();
         crate::common::execute_plan(domain, &mut state, &plan);
         steps
@@ -382,7 +388,7 @@ mod bhtn_side {
         let mut state = state.clone();
         let mut planner = HtnPlanner::new(domain);
         planner.set_sanity_limit(DEEP_SANITY_LIMIT);
-        let plan = planner.plan("deep_root", &state);
+        let plan = plan_root(&mut planner, deep_root, &state);
         // The plan must be the full corridor — a partial plan here means the
         // sanity limit bit and the bench is comparing less work (pinned).
         assert!(

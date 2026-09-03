@@ -64,7 +64,7 @@ fn nested_domain() -> HtnDomain {
 
 #[test]
 fn deep_nested_plan_decomposes_in_order() {
-    let bed = HtnTestBed::new(nested_domain(), "get_treasure");
+    let bed = HtnTestBed::new(nested_domain());
     let state = PlanState::build(&bed.domain().components).finish();
     let plan = bed.plan_forward(&state);
     // Level 1 (get_treasure) -> Level 2 (traverse) -> leaves, in order.
@@ -153,7 +153,7 @@ fn apply_effects(bed: &HtnTestBed, task_name: &str, state: &mut PlanState) {
 
 #[test]
 fn plan_adapts_when_world_changes_mid_execution() {
-    let bed = HtnTestBed::new(survival_domain(), "survive");
+    let bed = HtnTestBed::new(survival_domain());
 
     // Turn 1: it's cold — plan to take shelter then warm up.
     let mut state = survival_state(bed.domain(), 5);
@@ -182,7 +182,7 @@ fn plan_adapts_when_world_changes_mid_execution() {
 
 #[test]
 fn changing_requirements_force_a_new_root_branch() {
-    let bed = HtnTestBed::new(survival_domain(), "survive");
+    let bed = HtnTestBed::new(survival_domain());
     // Start warm -> scavenge immediately.
     let state = survival_state(bed.domain(), 20);
     let plan_warm = bed.plan_forward(&state);

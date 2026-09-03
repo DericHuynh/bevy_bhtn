@@ -4,11 +4,17 @@
 //! like a hand-written domain — same planner, same look-ahead, same driver.
 
 use bevy_bhtn::gtn::SharedMarks;
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::TaskBuilder;
+use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::Component;
+
+/// `HtnPlanner::plan` with the root fn-item type inferred from the fn value
+/// (fn-item types cannot be named directly in turbofish).
+fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
+    planner.plan(_root, state)
+}
 
 // ---------------------------------------------------------------------------
 // Task sharing — Theorem 4.8
@@ -58,7 +64,7 @@ fn shared_task_appears_once_in_the_plan() {
 
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     // First occurrence runs `do`; the second takes the empty `done` method.
     assert_eq!(plan.task_names(), ["equip", "hike", "climb"]);
@@ -100,7 +106,7 @@ fn distinct_shared_tasks_track_distinct_markers() {
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     // The shared tasks are deduped independently; the unshared `climb` still
     // appears once per occurrence.
@@ -160,7 +166,7 @@ fn insertion_repairs_a_plan_that_would_otherwise_fail() {
     let plain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&plain.components).finish();
     let mut planner = HtnPlanner::new(&plain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     assert!(plan.is_empty(), "no decomposition exists without insertion");
 
@@ -175,7 +181,7 @@ fn insertion_repairs_a_plan_that_would_otherwise_fail() {
     assert!(repaired.get_task("gtn/insert").is_some());
     let state = PlanState::build(&repaired.components).finish();
     let mut planner = HtnPlanner::new(&repaired);
-    let plan = planner.plan("root", &state);
+    let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     assert_eq!(plan.task_names(), ["travel", "pick_key", "escape"]);
 }
@@ -199,7 +205,7 @@ fn insertion_leaves_clean_plans_clean() {
     for domain in [&plain, &with_gaps] {
         let state = PlanState::build(&domain.components).finish();
         let mut planner = HtnPlanner::new(domain);
-        let plan = planner.plan("plain_root", &state);
+        let plan = plan_root(&mut planner, plain_root, &state);
         assert!(plan.is_complete());
         assert_eq!(plan.task_names(), ["pick_key", "escape"]);
     }
@@ -231,7 +237,7 @@ fn insertion_respects_sharing() {
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     assert_eq!(plan.task_names(), ["equip", "climb2"]);
 }

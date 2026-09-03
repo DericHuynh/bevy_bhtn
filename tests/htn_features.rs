@@ -704,30 +704,188 @@ fn branchless_root_yields_builder_error() {
     assert!(err.to_string().contains("no branches"));
 }
 
-mod dup_a {
-    use bevy_bhtn::tasks::TaskBuilder;
-
-    pub fn dup(task: &mut TaskBuilder) {
-        task.branch();
-    }
-}
-
-mod dup_b {
-    use bevy_bhtn::tasks::TaskBuilder;
-
-    pub fn dup(task: &mut TaskBuilder) {
-        task.branch();
-    }
-}
-
+/// Closure subtasks get unique identities: each closure literal is its own
+/// type, so two distinct closures record as two distinct tasks and both
+/// execute — even though `type_name` mangles both to `{{closure}}`. This is
+/// the regression pin for the old lookup-by-name failure (all closures
+/// collided on one display name); identity is now the `TypeId` alone.
 #[test]
-fn duplicate_task_names_yield_builder_error() {
-    fn dup_root(task: &mut TaskBuilder) {
-        task.branch().then(dup_a::dup).then(dup_b::dup);
+fn closure_subtasks_record_unique_identities() {
+    use std::any::TypeId;
+    fn tid_of<T: 'static>(_: &T) -> TypeId {
+        TypeId::of::<T>()
     }
-    let err = HtnDomain::from_root(dup_root).build().unwrap_err();
-    assert!(matches!(err, HtnError::Builder { .. }));
-    assert!(err.to_string().contains("duplicate"));
+
+    let first = |t: &mut TaskBuilder| {
+        t.effect(|count: &mut Count| count.0 = 5);
+    };
+    let second = |t: &mut TaskBuilder| {
+        t.effect(|flag: &mut Flag| flag.0 = true);
+    };
+    let root = move |task: &mut TaskBuilder| {
+        task.branch().then(first).then(second);
+    };
+
+    let domain = HtnDomain::from_root(root)
+        .build()
+        .expect("distinct closures are distinct identities");
+    // Each closure resolved to its own task (root + 2 closure tasks).
+    assert_eq!(domain.tasks.len(), 3);
+    let a_idx = domain.task_index_by_type(tid_of(&first)).unwrap();
+    let b_idx = domain.task_index_by_type(tid_of(&second)).unwrap();
+    assert_ne!(a_idx, b_idx, "the two closures must not alias");
+
+    // Both closure steps execute.
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan(root, &state);
+    assert_eq!(plan.task_names().len(), 2);
+    let mut executed = state.clone();
+    for &step in &plan.steps {
+        let Task::Primitive(p) = &domain.tasks[step as usize] else {
+            panic!("plans are primitive sequences");
+        };
+        p.apply_effects(&mut executed);
+    }
+    let count = domain.components.get::<Count>().unwrap();
+    let flag = domain.components.get::<Flag>().unwrap();
+    assert_eq!(executed.get::<Count>(count).0, 5);
+    assert!(executed.get::<Flag>(flag).0);
+}
+
+/// Referencing the *same* closure value from several `then` edges records the
+/// task exactly once (edge dedup by `TypeId` — identical to repeated fn-item
+/// references) while every occurrence still executes.
+#[test]
+fn same_closure_value_dedupes_to_one_recorded_task() {
+    let step = |t: &mut TaskBuilder| {
+        t.effect(|count: &mut Count| count.0 += 1);
+    };
+    let root = move |task: &mut TaskBuilder| {
+        task.branch().then(step).then(step).then(step);
+    };
+
+    let domain = HtnDomain::from_root(root).build().expect("well-formed");
+    // root + the single closure task — three references, one recording.
+    assert_eq!(domain.tasks.len(), 2, "the closure task is recorded once");
+
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan(root, &state);
+    assert_eq!(plan.task_names().len(), 3, "each edge still executes");
+    let mut executed = state.clone();
+    for &step in &plan.steps {
+        let Task::Primitive(p) = &domain.tasks[step as usize] else {
+            panic!("plans are primitive sequences");
+        };
+        p.apply_effects(&mut executed);
+    }
+    let count = domain.components.get::<Count>().unwrap();
+    assert_eq!(executed.get::<Count>(count).0, 3);
+}
+
+/// Closure tasks are displayed by their REFERENCE SITE (`file:line:col`, via
+/// `#[track_caller]`) instead of the mangled, collision-prone `{{closure}}`;
+/// the braces are stripped. Named functions keep their clean names. Display
+/// only — identity is the `TypeId` either way.
+#[test]
+fn closure_display_names_use_the_reference_site() {
+    let first = |t: &mut TaskBuilder| {
+        t.effect(|count: &mut Count| count.0 = 1);
+    };
+    let second = |t: &mut TaskBuilder| {
+        t.effect(|count: &mut Count| count.0 += 10);
+    };
+    let root = move |task: &mut TaskBuilder| {
+        task.branch().then(first).then(second);
+    };
+
+    let domain = HtnDomain::from_root(root).build().expect("well-formed");
+    // No mangled name survives baking — every closure is a location.
+    for t in &domain.tasks {
+        assert!(
+            !t.name().contains("{{closure"),
+            "mangled display name leaked: {:?}",
+            t.name()
+        );
+    }
+    // All three tasks are closures: root (the `from_root` call site) and the
+    // two `then` sites inside the root body. Distinct sites → distinct names,
+    // each shaped `htn_features.rs:LINE:COL`.
+    let names: Vec<&str> = domain.tasks.iter().map(Task::name).collect();
+    assert_eq!(names.len(), 3);
+    for n in &names {
+        assert!(
+            n.contains("htn_features.rs:") && n.matches(':').count() >= 2,
+            "expected `file:line:col`, got {n:?}"
+        );
+    }
+    assert_eq!(&names[1..], &names[1..], "sanity");
+    assert_ne!(
+        names[1], names[2],
+        "same-line `then` sites differ by column"
+    );
+
+    // And named functions keep their clean type-derived names — both the
+    // root fn and subtask fns.
+    fn named(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 = 0);
+    }
+    fn tidy_root(task: &mut TaskBuilder) {
+        task.branch().then(named);
+    }
+    let tidy = HtnDomain::from_root(tidy_root)
+        .build()
+        .expect("well-formed");
+    let tidy_names: Vec<&str> = tidy.tasks.iter().map(Task::name).collect();
+    assert_eq!(tidy_names, ["tidy_root", "named"]);
+}
+
+/// Coercing task functions to `fn(&mut TaskBuilder)` pointers collapses their
+/// identities into ONE `TypeId`: the second body is never recorded, and both
+/// references silently execute the first. This is the known fn-pointer trap
+/// (the same reason `any_order` takes tuples, not arrays) — pass fn items,
+/// never pointers. Pinned so a future identity scheme that fixes it trips
+/// this test.
+#[test]
+fn fn_pointer_coercion_collapses_identity() {
+    fn strike(task: &mut TaskBuilder) {
+        task.effect(|count: &mut Count| count.0 += 1);
+    }
+    fn bash(task: &mut TaskBuilder) {
+        task.effect(|flag: &mut Flag| flag.0 = true);
+    }
+    let root = |task: &mut TaskBuilder| {
+        task.branch()
+            .then(strike as fn(&mut TaskBuilder))
+            .then(bash as fn(&mut TaskBuilder));
+    };
+
+    // The collapse is silent: bake succeeds.
+    let domain = HtnDomain::from_root(root).build().expect("bakes");
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan(root, &state);
+    assert_eq!(
+        plan.task_names().len(),
+        2,
+        "two edges — but both point at the first recorded body"
+    );
+    let mut executed = state.clone();
+    for &step in &plan.steps {
+        let Task::Primitive(p) = &domain.tasks[step as usize] else {
+            panic!("plans are primitive sequences");
+        };
+        p.apply_effects(&mut executed);
+    }
+    let count = domain.components.get::<Count>().unwrap();
+    assert_eq!(executed.get::<Count>(count).0, 2, "strike's body ran twice");
+    // bash's body never even recorded — its Flag effect never registered the
+    // component in the domain's registry. Silent, total loss of the task.
+    assert!(
+        domain.components.get::<Flag>().is_none(),
+        "bash's body never ran — the trap"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +977,7 @@ fn domain_root_goal_and_primitive_names() {
         .build()
         .expect("helper domain is well-formed");
     assert_eq!(domain.root_task().name(), "helper_root");
-    assert!(domain.goal("helper_goal").is_some());
+    assert!(domain.goal(helper_goal).is_some());
     assert_eq!(
         domain
             .primitive_names()
@@ -830,7 +988,8 @@ fn domain_root_goal_and_primitive_names() {
     );
     // Unregistered names resolve to nothing.
     assert!(domain.get_task("Missing").is_none());
-    assert!(domain.goal("Missing").is_none());
+    fn missing_goal(_goal: &mut GoalBuilder) {}
+    assert!(domain.goal(missing_goal).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +1021,7 @@ fn expected_effects_chain_preconditions() {
     let domain = HtnDomain::from_root(travel_root)
         .build()
         .expect("travel domain is well-formed");
-    let bed = HtnTestBed::new(domain, "travel_root");
+    let bed = HtnTestBed::new(domain);
     let state = PlanState::build(&bed.domain().components)
         .set(Zone::Inside)
         .finish();
@@ -882,7 +1041,7 @@ fn expected_effects_do_not_apply_on_execution() {
         .set(Count(0))
         .finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("travel_root", &state);
+    let plan = planner.plan(travel_root, &state);
     assert_eq!(plan.task_names(), ["approach", "arrive"]);
 
     // Execution applies `effects` only: arrive's real Count write lands, but
@@ -934,9 +1093,7 @@ fn summaries_reflect_precondition_reads_and_effect_writes() {
         .expect("Weight registered");
     let maybe = domain.components.get::<Maybe>().expect("Maybe registered");
 
-    let leaf = domain
-        .task_summary("summary_leaf")
-        .expect("summary present");
+    let leaf = domain.task_summary(summary_leaf).expect("summary present");
     // Reads: both precondition components are required before any write.
     assert!(leaf.required_fields.contains(flag));
     assert!(leaf.required_fields.contains(count));
@@ -950,9 +1107,7 @@ fn summaries_reflect_precondition_reads_and_effect_writes() {
     assert!(!leaf.guaranteed_writes.contains(maybe));
 
     // The compound root inherits the leaf's write sets.
-    let root = domain
-        .task_summary("summary_root")
-        .expect("summary present");
+    let root = domain.task_summary(summary_root).expect("summary present");
     assert!(root.possible_writes.contains(weight));
     assert!(root.possible_writes.contains(maybe));
 }
@@ -969,12 +1124,16 @@ fn unknown_goal_yields_unknown_task_error() {
     fn lonely_leaf(task: &mut TaskBuilder) {
         task.effect(|f: &mut Flag| f.0 = true);
     }
+    // A goal fn that was never registered on the domain.
+    fn missing_goal(goal: &mut GoalBuilder) {
+        goal.effect(|f: &mut Flag| f.0 = true);
+    }
     let domain = HtnDomain::from_root(lonely_root)
         .build()
         .expect("lonely domain is well-formed");
     let state = PlanState::build(&domain.components).finish();
     let mut planner = BackPlanner::new(&domain);
-    let err = planner.plan("MissingGoal", &state).unwrap_err();
+    let err = planner.plan(missing_goal, &state).unwrap_err();
     assert!(matches!(err, HtnError::UnknownTask { .. }));
 }
 
@@ -996,7 +1155,7 @@ fn unreachable_goal_yields_no_plan_error() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = BackPlanner::new(&domain);
     // No primitive writes `Maybe` -> the goal can never be advanced.
-    let err = planner.plan("stranded_goal", &state).unwrap_err();
+    let err = planner.plan(stranded_goal, &state).unwrap_err();
     assert!(matches!(err, HtnError::NoPlan));
 }
 
@@ -1041,7 +1200,7 @@ fn backward_plan_commits_full_coverage_compound() {
     // redundant `single_shot` along. The plan still reaches the goal's
     // values — which the old primitive-only greedy also did here, but not in
     // value-recursive domains (see the htn_builder end-to-end pin).
-    let plan = planner.plan("both_goal", &state).expect("back plan");
+    let plan = planner.plan(both_goal, &state).expect("back plan");
     let names = plan.task_names();
     assert!(!names.is_empty());
     assert_eq!(names, ["single_shot", "double_shot"]);
@@ -1088,7 +1247,7 @@ fn back_plan_combines_leaves_for_distinct_fields() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = BackPlanner::new(&domain);
     // No single leaf covers both slots -> both are chained.
-    let plan = planner.plan("combine_goal", &state).expect("back plan");
+    let plan = planner.plan(combine_goal, &state).expect("back plan");
     let names = plan.task_names();
     assert_eq!(names.len(), 2);
     assert_ne!(names[0], names[1]);

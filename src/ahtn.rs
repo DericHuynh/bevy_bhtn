@@ -73,6 +73,7 @@ use std::collections::VecDeque;
 use crate::domain::{HtnDomain, Task};
 use crate::error::{HtnError, HtnResult};
 use crate::state::PlanState;
+use crate::tasks::TaskFn;
 
 /// Which player's turn it is (index into the two queues).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,29 +141,27 @@ impl<'a> Ahtn<'a> {
 
     /// Run the adversarial search.
     ///
-    /// `max_root` and `min_root` name the two players' root tasks (both must
-    /// be compound tasks — register the opponent's via
+    /// `max_root` and `min_root` are the two players' root task functions,
+    /// passed by value and resolved by their `TypeId`s through the baked type
+    /// index (both must be compound tasks — register the opponent's via
     /// [`DomainBuilder::root`](crate::domain::DomainBuilder::root)). `eval`
     /// scores a state from max's perspective; `depth` bounds the number of
     /// primitive actions issued (by either player) before evaluation.
     ///
     /// Returns `Ok(None)` when max has no viable plan (every branch ends
-    /// with max stuck); `Err` for unknown root names or non-compound roots.
-    pub fn search(
+    /// with max stuck); `Err` for unregistered roots or non-compound roots.
+    pub fn search<MaxRoot: TaskFn, MinRoot: TaskFn>(
         &self,
-        max_root: &str,
-        min_root: &str,
+        max_root: MaxRoot,
+        min_root: MinRoot,
         state: &PlanState,
         eval: impl Fn(&PlanState) -> f32,
         depth: usize,
     ) -> HtnResult<Option<AhtnOutcome>> {
-        let resolve = |name: &str| -> HtnResult<usize> {
-            let idx = self
-                .domain
-                .task_index(name.into())
-                .ok_or_else(|| HtnError::UnknownTask {
-                    name: name.to_string(),
-                })?;
+        let resolve = |name: &str, idx: Option<usize>| -> HtnResult<usize> {
+            let idx = idx.ok_or_else(|| HtnError::UnknownTask {
+                name: name.to_string(),
+            })?;
             if !self.domain.tasks[idx].is_compound() {
                 return Err(HtnError::builder(format!(
                     "adversarial root `{name}` must be a compound task"
@@ -170,8 +169,14 @@ impl<'a> Ahtn<'a> {
             }
             Ok(idx)
         };
-        let max_idx = resolve(max_root)?;
-        let min_idx = resolve(min_root)?;
+        let max_idx = resolve(
+            MaxRoot::task_name(),
+            self.domain.task_index_by_type(max_root.task_type_id()),
+        )?;
+        let min_idx = resolve(
+            MinRoot::task_name(),
+            self.domain.task_index_by_type(min_root.task_type_id()),
+        )?;
 
         let mut queues = [VecDeque::from([max_idx]), VecDeque::from([min_idx])];
         let mut budget = self.max_decompositions;

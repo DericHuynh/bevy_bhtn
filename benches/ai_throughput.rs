@@ -16,8 +16,9 @@
 
 mod common;
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
+use bevy_bhtn::tasks::TaskFn;
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -25,12 +26,16 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use ustr::Ustr;
 
+use common::miner_tasks::earn_gold;
 use common::{
     execute_plan, miner_domain, miner_scratch, Energy, Gold, HasMetal, HasOre, Hunger, Location,
 };
 
-/// The root task of the miner domain (the task function's name).
-const ROOT: &str = "earn_gold";
+/// Plan from `root` — `F` is inferred from the function item, so the lookup
+/// uses the same `TypeId` the domain recorded at bake time.
+fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
+    planner.plan(_root, state)
+}
 
 /// The per-entity planning scratchpad: a dense snapshot of the miner
 /// components the domain's closures read and write. [`PlanState`] is
@@ -77,7 +82,7 @@ fn run_ai(
     q.par_iter_mut().for_each(|(mut scratch, mut output)| {
         let domain = &resources.domain;
         let mut planner = HtnPlanner::new(domain);
-        let planned = planner.plan(ROOT, &scratch.0);
+        let planned = plan_root(&mut planner, earn_gold, &scratch.0);
         execute_plan(domain, &mut scratch.0, &planned);
         output.0 = planned.task_names().to_vec();
         processed.0.fetch_add(1, Ordering::Relaxed);
@@ -180,7 +185,7 @@ pub fn miner_planner(c: &mut Criterion) {
         b.iter(|| {
             let mut state = single_state.clone();
             let mut planner = HtnPlanner::new(&domain);
-            let plan = planner.plan(ROOT, &state);
+            let plan = plan_root(&mut planner, earn_gold, &state);
             execute_plan(&domain, &mut state, &plan);
             black_box(&plan);
         });

@@ -19,15 +19,26 @@
 //! - **Builder validation**: cyclic `before` constraints and >64-member sets
 //!   are build errors.
 
+use bevy_bhtn::domain::SelectionPolicy;
 use bevy_bhtn::domain::Task;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::order::SubtaskOrder;
-use bevy_bhtn::planner::HtnPlanner;
-use bevy_bhtn::domain::SelectionPolicy;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::TaskBuilder;
-use bevy_bhtn::HtnDomain;
+use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
+use bevy_bhtn::{HtnDomain, TaskSummary};
 use bevy_ecs::prelude::*;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {
+    domain.task_summary(_f)
+}
 
 #[derive(Component, Clone, Default, Debug, PartialEq)]
 struct Gold(i32);
@@ -64,7 +75,7 @@ fn any_order_runs_every_member_in_declaration_order_by_default() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["gather_wood", "gather_stone", "sell_spoils"],
         "order 0 is the declaration order"
     );
@@ -97,7 +108,7 @@ fn unordered_set_backtracks_to_a_valid_linearization() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
     assert_eq!(
         plan.task_names(),
         ["find_key", "unlock_door"],
@@ -133,7 +144,7 @@ fn before_constraints_force_the_first_topological_order() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["fetch_ingredient", "cook_meal"],
         "the constraint DAG, not declaration order, decides"
     );
@@ -164,7 +175,7 @@ fn then_tail_runs_after_the_unordered_set() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["gather_wood", "gather_stone", "sell_spoils"]
     );
 
@@ -203,7 +214,7 @@ fn compound_members_decompose_inside_unordered_sets() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["gather_wood", "gather_stone", "unlock_door"],
         "the compound member's full decomposition precedes the next member"
     );
@@ -228,7 +239,7 @@ fn partial_method_min_yield_sums_members() {
     }
 
     let domain = HtnDomain::from_root(root).build().unwrap();
-    assert_eq!(domain.task_summary("root").unwrap().min_yield, 2);
+    assert_eq!(summary_of(&domain, root).unwrap().min_yield, 2);
 }
 
 /// `required_fields` uses the conservative set rule: a component is required
@@ -248,7 +259,7 @@ fn partial_method_required_fields_are_conservative() {
     }
 
     let domain = HtnDomain::from_root(root).build().unwrap();
-    let required = &domain.task_summary("root").unwrap().required_fields;
+    let required = &summary_of(&domain, root).unwrap().required_fields;
     let gold = domain.components.get::<Gold>().unwrap();
     let key = domain.components.get::<Key>().unwrap();
     assert!(
@@ -291,7 +302,7 @@ fn lookahead_refutes_dead_sets() {
     let mut on = HtnPlanner::new(&domain);
     on.set_sanity_limit(2);
     assert_eq!(
-        on.plan("root", &state).task_names(),
+        plan_of(&mut on, root, &state).task_names(),
         ["works"],
         "the dead set was refuted without exploring it"
     );
@@ -302,7 +313,7 @@ fn lookahead_refutes_dead_sets() {
     let mut off = HtnPlanner::new(&domain);
     off.set_lookahead(false).set_sanity_limit(4);
     assert_eq!(
-        off.plan("root", &state).task_names(),
+        plan_of(&mut off, root, &state).task_names(),
         ["busywork"],
         "without the sweep, the budget is spent inside the doomed set"
     );
@@ -335,7 +346,7 @@ fn cost_bounded_prunes_partial_methods_by_their_member_sum() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     planner.set_cost_bounded(true);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
     assert_eq!(plan.task_names(), ["cheap"]);
     assert_eq!(plan.mtr().0, [1]);
 }
@@ -458,7 +469,7 @@ fn wide_set_envelope_buried_dependencies() {
     let s4 = PlanState::build(&d4.components).finish();
     let mut p4 = HtnPlanner::new(&d4);
     assert_eq!(
-        p4.plan("wide4", &s4).task_names(),
+        plan_of(&mut p4, wide4, &s4).task_names(),
         ["find_key", "locked", "gather_wood", "gather_stone"],
         "within the cap, the valid linearization is reached"
     );
@@ -471,13 +482,13 @@ fn wide_set_envelope_buried_dependencies() {
     let s8 = PlanState::build(&d8.components).finish();
     let mut p8 = HtnPlanner::new(&d8);
     assert!(
-        p8.plan("wide8", &s8).is_empty(),
+        plan_of(&mut p8, wide8, &s8).is_empty(),
         "default budget: the retry storm consumes the sanity limit"
     );
     let mut p8b = HtnPlanner::new(&d8);
     p8b.set_sanity_limit(10_000);
     assert_eq!(
-        p8b.plan("wide8", &s8b_state(&d8)).task_names(),
+        plan_of(&mut p8b, wide8, &s8b_state(&d8)).task_names(),
         ["fallback"],
         "raised budget: the cap exhausts and the fallback plans"
     );
@@ -551,7 +562,7 @@ fn ranked_compound_inside_unordered_set() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["find_key", "unlock_door"],
         "the compound member decomposed via its highest-utility branch"
     );
@@ -580,7 +591,7 @@ fn linearization_retry_rolls_back_partial_member_effects() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).set(Gold(0)).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
     assert_eq!(
         plan.task_names(),
         ["gate", "gather"],

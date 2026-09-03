@@ -10,21 +10,31 @@
 
 mod common;
 
-use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::planner::{HtnPlanner, Plan};
+use bevy_bhtn::state::PlanState;
+use bevy_bhtn::tasks::TaskFn;
 use bevy_bhtn::Task;
 use ustr::Ustr;
 
+use common::bench_common::outpost_tasks::secure_outpost;
 use common::{
     execute_plan, fresh_outpost, high_fuel_outpost, marginal_outpost, outpost_domain,
     outpost_scratch, Armored, Caches, Morale, Perimeter, Reinforced,
 };
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through this inference helper: the fn value pins `F` to the fn
+/// item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
 
 #[test]
 fn fresh_actor_plan_is_deep_and_terminates() {
     let domain = outpost_domain();
     let state = outpost_scratch(&domain, fresh_outpost());
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("secure_outpost", &state);
+    let plan = plan_of(&mut planner, secure_outpost, &state);
 
     // Depth >= 5: at least one leaf per objective (4 objectives) plus a
     // terminal stance. Any fresh actor that provably walks into a fixpoint must
@@ -42,7 +52,7 @@ fn plan_when_executed_reaches_all_objectives() {
     let domain = outpost_domain();
     let mut state = outpost_scratch(&domain, fresh_outpost());
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("secure_outpost", &state);
+    let plan = plan_of(&mut planner, secure_outpost, &state);
 
     execute_plan(&domain, &mut state, &plan);
 
@@ -89,7 +99,7 @@ fn marginal_fuel_forces_backtracking_off_drive() {
     let domain = outpost_domain();
     let state = outpost_scratch(&domain, marginal_outpost());
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("secure_outpost", &state);
+    let plan = plan_of(&mut planner, secure_outpost, &state);
 
     // The first primitive in the plan cannot be drive: drive is not pickable,
     // so the plan must have resorted to the rations march or the collapse path.
@@ -115,7 +125,7 @@ fn high_fuel_agent_drives_directly() {
     let domain = outpost_domain();
     let state = outpost_scratch(&domain, high_fuel_outpost());
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("secure_outpost", &state);
+    let plan = plan_of(&mut planner, secure_outpost, &state);
     // The plan must begin with the vehicle run reaching the posting.
     assert_eq!(plan.task_names()[0], Ustr::from("drive"));
 }
@@ -125,7 +135,7 @@ fn deep_plan_uses_only_primitive_tasks() {
     let domain = outpost_domain();
     let state = outpost_scratch(&domain, fresh_outpost());
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("secure_outpost", &state);
+    let plan = plan_of(&mut planner, secure_outpost, &state);
     for name in plan.task_names() {
         match domain.get_task(name) {
             Some(Task::Primitive(_)) => {}

@@ -23,22 +23,19 @@ pub use bench_common::{
 use bevy_bhtn::back_planner::BackPlanner;
 use bevy_bhtn::planner::HtnPlanner;
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::{GoalBuilder, HtnDomain, HtnResult};
+use bevy_bhtn::{GoalFn, HtnDomain, HtnResult};
 use ustr::Ustr;
 
 /// A ready-to-use HTN test arena.
 pub struct HtnTestBed {
     domain: HtnDomain,
-    root: String,
 }
 
 impl HtnTestBed {
-    /// Build a bed from a function-defined domain and its root task name.
-    pub fn new(domain: HtnDomain, root: impl Into<String>) -> Self {
-        Self {
-            domain,
-            root: root.into(),
-        }
+    /// Build a bed from a function-defined domain. Forward planning always
+    /// targets the domain root — resolved by task index, no name involved.
+    pub fn new(domain: HtnDomain) -> Self {
+        Self { domain }
     }
 
     /// The domain (for structural assertions on tasks/methods).
@@ -49,18 +46,25 @@ impl HtnTestBed {
     /// Forward-plan the root task against a scratchpad state.
     pub fn plan_forward(&self, state: &PlanState) -> Vec<Ustr> {
         let mut planner = HtnPlanner::new(&self.domain);
-        planner.plan(&self.root, state).task_names().to_vec()
+        planner
+            .plan_index(self.domain.root, state)
+            .task_names()
+            .to_vec()
     }
 
     /// Forward-plan with the look-ahead sweep explicitly on or off (A/B).
     pub fn plan_forward_lookahead(&self, state: &PlanState, lookahead: bool) -> Vec<Ustr> {
         let mut planner = HtnPlanner::new(&self.domain);
         planner.set_lookahead(lookahead);
-        planner.plan(&self.root, state).task_names().to_vec()
+        planner
+            .plan_index(self.domain.root, state)
+            .task_names()
+            .to_vec()
     }
 
-    /// Backward-plan toward a named goal task from a scratchpad state.
-    pub fn plan_backward(&self, goal: &str, state: &PlanState) -> HtnResult<Vec<Ustr>> {
+    /// Backward-plan toward the goal function `goal` (passed by value;
+    /// resolved by its `TypeId`) from a scratchpad state.
+    pub fn plan_backward<F: GoalFn>(&self, goal: F, state: &PlanState) -> HtnResult<Vec<Ustr>> {
         let mut planner = BackPlanner::new(&self.domain);
         planner.plan(goal, state).map(|p| p.task_names().to_vec())
     }

@@ -13,9 +13,29 @@ use bevy_bhtn::selection::{
     DecompositionTrace, HtnSearchStrategy, SearchOverride, Searcher, TraceOutcome,
 };
 use bevy_bhtn::state::PlanState;
-use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
+use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder, TaskFn};
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
+
+/// A task fn's item type cannot be named directly, so the lookup-by-type API
+/// is reached through these inference helpers: the fn value pins `F` to the
+/// fn item's unique type, resolved through the baked `TypeId` index.
+fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
+    planner.plan(_f, state)
+}
+
+fn task_index_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<usize> {
+    domain.task_index(_f)
+}
+
+fn plan_traced_of<F: TaskFn>(
+    planner: &mut HtnPlanner<'_>,
+    _f: F,
+    state: &PlanState,
+    trace: &mut Vec<DecompositionTrace>,
+) -> Plan {
+    planner.plan_traced(_f, state, trace)
+}
 
 #[derive(Component, Clone, Default, Debug, PartialEq)]
 struct Gold(i32);
@@ -54,20 +74,20 @@ fn named_branches_are_recorded() {
 // HighestUtility
 // ---------------------------------------------------------------------------
 
+fn utility_root(task: &mut TaskBuilder) {
+    task.select(SelectionPolicy::HighestUtility);
+    task.branch()
+        .named("big")
+        .precondition(|gold: &Gold| gold.0 >= 5)
+        .utility(100.0)
+        .then(win);
+    task.branch().named("small").utility(40.0).then(win);
+}
+fn win(task: &mut TaskBuilder) {
+    task.effect(|gold: &mut Gold| gold.0 += 1);
+}
 fn utility_domain() -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
-        task.select(SelectionPolicy::HighestUtility);
-        task.branch()
-            .named("big")
-            .precondition(|gold: &Gold| gold.0 >= 5)
-            .utility(100.0)
-            .then(win);
-        task.branch().named("small").utility(40.0).then(win);
-    }
-    fn win(task: &mut TaskBuilder) {
-        task.effect(|gold: &mut Gold| gold.0 += 1);
-    }
-    HtnDomain::from_root(root).build().unwrap()
+    HtnDomain::from_root(utility_root).build().unwrap()
 }
 
 /// The highest-utility *valid* branch wins; ties and invalid branches behave
@@ -79,13 +99,16 @@ fn highest_utility_selects_the_best_valid_branch() {
 
     // Both branches valid: "big" (100) beats "small" (40).
     let rich = PlanState::build(&domain.components).set(Gold(10)).finish();
-    assert_eq!(planner.plan("root", &rich).task_names(), ["win"]);
-    let mtr = planner.plan("root", &rich);
+    assert_eq!(
+        plan_of(&mut planner, utility_root, &rich).task_names(),
+        ["win"]
+    );
+    let mtr = plan_of(&mut planner, utility_root, &rich);
     assert_eq!(mtr.mtr().0, [0], "branch 0 (big) selected");
 
     // "big" invalid (gold < 5): "small" is the only valid branch.
     let poor = PlanState::build(&domain.components).set(Gold(0)).finish();
-    let plan = planner.plan("root", &poor);
+    let plan = plan_of(&mut planner, utility_root, &poor);
     assert_eq!(plan.task_names(), ["win"]);
     assert_eq!(plan.mtr().0, [1], "branch 1 (small) selected");
 }
@@ -106,7 +129,7 @@ fn first_match_ignores_utility() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).mtr().0,
+        plan_of(&mut planner, root, &state).mtr().0,
         [0],
         "declaration order"
     );
@@ -135,30 +158,28 @@ fn utility_fn_scores_from_components() {
     let near = PlanState::build(&domain.components)
         .set(Distance(2))
         .finish();
-    assert_eq!(planner.plan("root", &near).mtr().0, [0]);
+    assert_eq!(plan_of(&mut planner, root, &near).mtr().0, [0]);
 
     // Distance 200 → "close" scores 0 < 10.
     let far = PlanState::build(&domain.components)
         .set(Distance(200))
         .finish();
-    assert_eq!(planner.plan("root", &far).mtr().0, [1]);
+    assert_eq!(plan_of(&mut planner, root, &far).mtr().0, [1]);
 }
 
 // ---------------------------------------------------------------------------
 // WeightedRandom
 // ---------------------------------------------------------------------------
 
+fn weighted_root(task: &mut TaskBuilder) {
+    task.select(SelectionPolicy::WeightedRandom { seed: 42 });
+    task.branch().named("likely").utility(100.0).then(win);
+    task.branch().named("unlikely").utility(0.001).then(win);
+}
+
 fn weighted_domain(seed: u64) -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
-        task.select(SelectionPolicy::WeightedRandom { seed: 42 });
-        task.branch().named("likely").utility(100.0).then(win);
-        task.branch().named("unlikely").utility(0.001).then(win);
-    }
-    fn win(task: &mut TaskBuilder) {
-        task.effect(|gold: &mut Gold| gold.0 += 1);
-    }
     let _ = seed;
-    HtnDomain::from_root(root).build().unwrap()
+    HtnDomain::from_root(weighted_root).build().unwrap()
 }
 
 /// The weighted sampler is deterministic for a given seed and state: two
@@ -171,8 +192,8 @@ fn weighted_random_is_deterministic_and_weight_respecting() {
 
     let mut a = HtnPlanner::new(&domain);
     let mut b = HtnPlanner::new(&domain);
-    let plan_a = a.plan("root", &state);
-    let plan_b = b.plan("root", &state);
+    let plan_a = plan_of(&mut a, weighted_root, &state);
+    let plan_b = plan_of(&mut b, weighted_root, &state);
     assert_eq!(plan_a.mtr(), plan_b.mtr(), "same seed → same order");
 
     // Weight 100 vs 0.001: the heavy branch wins with overwhelming
@@ -209,7 +230,7 @@ fn weighted_random_exhausts_sampled_order_on_backtrack() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(),
         ["safe"],
         "the fallback is reached after the sampled branch fails"
     );
@@ -249,7 +270,7 @@ fn custom_ranker_orders_branches_and_is_sanitized() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     // The ranker reverses declaration order → branch 1 is tried first.
-    assert_eq!(planner.plan("root", &state).mtr().0, [1]);
+    assert_eq!(plan_of(&mut planner, root, &state).mtr().0, [1]);
 }
 
 /// A misbehaving ranker (dropping candidates) cannot make branches
@@ -287,7 +308,7 @@ fn ranker_omissions_fall_back_to_declaration_order() {
     let mut planner = HtnPlanner::new(&domain);
     // The ranker only offered branch 0; the sanitizer appends branch 1, so
     // the search still reaches the safe plan.
-    assert_eq!(planner.plan("root", &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,31 +335,31 @@ fn cost_is_recorded_on_primitives() {
     // Inert under DepthFirst: the plan is unaffected.
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["cheap"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["cheap"]);
 }
 
 // ---------------------------------------------------------------------------
 // Strategies: fail-fast + per-agent override + Searcher trait
 // ---------------------------------------------------------------------------
 
+fn fail_fast_root(task: &mut TaskBuilder) {
+    // Branch 1 passes ranking but fails *downstream* (after `prime`
+    // applies, `impossible`'s precondition is false) — the case fail-fast
+    // exists for.
+    task.branch().then(prime).then(impossible);
+    task.branch().then(works);
+}
+fn prime(task: &mut TaskBuilder) {
+    task.effect(|gold: &mut Gold| gold.0 += 1);
+}
+fn impossible(task: &mut TaskBuilder) {
+    task.precondition(|gold: &Gold| gold.0 > 100);
+}
+fn works(task: &mut TaskBuilder) {
+    task.effect(|gold: &mut Gold| gold.0 = 1);
+}
 fn fail_fast_domain() -> HtnDomain {
-    fn root(task: &mut TaskBuilder) {
-        // Branch 1 passes ranking but fails *downstream* (after `prime`
-        // applies, `impossible`'s precondition is false) — the case fail-fast
-        // exists for.
-        task.branch().then(prime).then(impossible);
-        task.branch().then(works);
-    }
-    fn prime(task: &mut TaskBuilder) {
-        task.effect(|gold: &mut Gold| gold.0 += 1);
-    }
-    fn impossible(task: &mut TaskBuilder) {
-        task.precondition(|gold: &Gold| gold.0 > 100);
-    }
-    fn works(task: &mut TaskBuilder) {
-        task.effect(|gold: &mut Gold| gold.0 = 1);
-    }
-    HtnDomain::from_root(root).build().unwrap()
+    HtnDomain::from_root(fail_fast_root).build().unwrap()
 }
 
 /// Full backtracking recovers from the first branch's downstream failure...
@@ -347,7 +368,10 @@ fn depth_first_backtracks_to_the_second_branch() {
     let domain = fail_fast_domain();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan("root", &state).task_names(), ["works"]);
+    assert_eq!(
+        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        ["works"]
+    );
 }
 
 /// ...while fail-fast returns the partial plan immediately (the already-
@@ -359,7 +383,7 @@ fn fail_fast_returns_partial_plan_on_first_failure() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_fail_fast(true);
     assert_eq!(
-        planner.plan("root", &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(),
         ["prime"],
         "fail-fast keeps the partial plan instead of backtracking"
     );
@@ -375,7 +399,7 @@ fn mtr_after_backtrack_records_only_the_chosen_method() {
     let domain = fail_fast_domain();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, fail_fast_root, &state);
     assert_eq!(plan.task_names(), ["works"]);
     assert_eq!(
         plan.mtr().0,
@@ -412,7 +436,7 @@ fn mtr_after_nested_backtrack_records_only_chosen_methods() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan("root", &state);
+    let plan = plan_of(&mut planner, root, &state);
     assert_eq!(plan.task_names(), ["works"]);
     assert_eq!(
         plan.mtr().0,
@@ -427,7 +451,7 @@ struct FixedSearcher;
 impl Searcher for FixedSearcher {
     fn search(&self, domain: &HtnDomain, _state: &PlanState) -> Option<Plan> {
         // A "strategy" that always picks the second branch's single step.
-        let idx = domain.task_index("works".into())?;
+        let idx = task_index_of(domain, works)?;
         Some(Plan {
             steps: vec![idx as u32],
             names: vec!["works".into()],
@@ -502,7 +526,7 @@ fn plan_traced_reports_selection_decisions() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let mut trace = Vec::new();
-    let plan = planner.plan_traced("root", &state, &mut trace);
+    let plan = plan_traced_of(&mut planner, root, &state, &mut trace);
 
     assert_eq!(plan.task_names(), ["safe"]);
     assert!(
