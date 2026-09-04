@@ -764,3 +764,212 @@ fn plan_roots_accept_functions_and_indices_alike() {
     assert!(planner.plan(999, &state).is_empty());
     assert!(planner.plan(usize::MAX, &state).is_empty());
 }
+
+/// `LookaheadMode::Adaptive` gating: the sweep is skipped exactly where it
+/// duplicates the next queue pop (single-subtask, totally-ordered methods
+/// with a terminating step) and kept everywhere else. Pins:
+///
+/// 1. The headline refutation win is preserved — the doomed-recursion
+///    domain's doomed method is a 3-subtask sequence, so Adaptive still
+///    refutes it at the frame and returns the same `Complete` plan as
+///    `Always`, while `Off` burns the whole sanity budget inside the spiral.
+/// 2. That budget preservation is the observable difference from `Off`.
+#[test]
+fn adaptive_lookahead_keeps_multi_step_refutations_and_the_budget() {
+    use bevy_bhtn::selection::LookaheadMode;
+    use common::bench_common::doomed_tasks;
+    use common::doomed_recursion_domain;
+
+    let domain = doomed_recursion_domain();
+    let state = PlanState::build(&domain.components).finish();
+
+    let mut always = HtnPlanner::new(&domain);
+    always.set_lookahead_mode(LookaheadMode::Always);
+    let always_plan = plan_of(&mut always, doomed_tasks::act, &state);
+    assert_eq!(always_plan.task_names(), ["safe"], "Always refutes the doomed branch");
+    assert!(always_plan.is_complete());
+
+    let mut adaptive = HtnPlanner::new(&domain);
+    adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
+    let adaptive_plan = plan_of(&mut adaptive, doomed_tasks::act, &state);
+    assert_eq!(
+        adaptive_plan.task_names(),
+        ["safe"],
+        "Adaptive keeps the sweep on multi-step methods — same refutation"
+    );
+    assert_eq!(adaptive_plan, always_plan, "identical plan, less effort");
+
+    let mut off = HtnPlanner::new(&domain);
+    off.set_lookahead_mode(LookaheadMode::Off);
+    let off_plan = plan_of(&mut off, doomed_tasks::act, &state);
+    assert!(
+        off_plan.is_partial(),
+        "Off descends into the spiral and burns the sanity budget"
+    );
+    assert_eq!(off_plan.task_names().first(), Some(&Ustr::from("prime")));
+}
+
+/// The skip is keyed to the method shape, not the domain: the same
+/// doomed-recursion fixture driven through a single-subtask wrapping method
+/// still terminates cleanly under Adaptive — the single step is committed,
+/// popped, and its failing precondition backtracked, without sweeping. (The
+/// non-terminating single-step case keeps its sweep, so no budget is burned
+/// here either: both modes return the same `Complete` empty plan.)
+#[test]
+fn adaptive_lookahead_skips_single_step_sweeps_safely() {
+    use bevy_bhtn::selection::LookaheadMode;
+    use common::bench_common::GateGold;
+
+    fn root(task: &mut TaskBuilder) {
+        // Single-subtask method whose step leads to an immediate dead end:
+        // `bomb`'s precondition can never hold. Under Adaptive the sweep at
+        // [wrapper] is skipped; the real check happens when `bomb` pops.
+        task.branch().then(wrapper);
+    }
+    fn wrapper(task: &mut TaskBuilder) {
+        task.branch().then(bomb);
+    }
+    fn bomb(task: &mut TaskBuilder) {
+        task.precondition(|g: &GateGold| g.0 > 100);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+
+    let mut adaptive = HtnPlanner::new(&domain);
+    adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
+    let plan = plan_of(&mut adaptive, root, &state);
+    assert!(plan.is_complete() && plan.is_empty(), "backtracking finds the same empty plan");
+}
+
+// ---------------------------------------------------------------------------
+// Regression pins for the Adaptive look-ahead tiers
+// ---------------------------------------------------------------------------
+
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Depth(pub i32);
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Finished(pub bool);
+
+/// Regression (stale pins): under `LookaheadMode::Adaptive`, a method whose
+/// sweep is disabled by the streak rule must NOT inherit the pins of the last
+/// method that *was* swept. `sweep_pins` is reused caller scratch; the old
+/// code attached it unconditionally, so the third commitment of this
+/// corridor's recursive method inherited level 2's pin (`next_step` → its
+/// level-2 branch), which fails at level 3 — exhausting the selector and
+/// yielding an empty plan. The fix: only full sweeps produce pins.
+#[test]
+fn regression_adaptive_skipped_sweeps_do_not_attach_stale_pins() {
+    use bevy_bhtn::selection::LookaheadMode;
+
+    fn advance0(task: &mut TaskBuilder) {
+        task.precondition(|d: &Depth| d.0 == 0)
+            .effect(|d: &mut Depth| d.0 = 1);
+    }
+    fn advance1(task: &mut TaskBuilder) {
+        task.precondition(|d: &Depth| d.0 == 1)
+            .effect(|d: &mut Depth| d.0 = 2);
+    }
+    fn advance2(task: &mut TaskBuilder) {
+        task.precondition(|d: &Depth| d.0 == 2)
+            .effect(|d: &mut Depth| d.0 = 3);
+    }
+    // The selector whose branch depends on the current depth.
+    fn gate(task: &mut TaskBuilder) {
+        task.branch().precondition(|d: &Depth| d.0 == 0).then(advance0);
+        task.branch().precondition(|d: &Depth| d.0 == 1).then(advance1);
+        task.branch().precondition(|d: &Depth| d.0 == 2).then(advance2);
+    }
+    // A single-subtask method over a COMPOUND: shape-skipped under Adaptive,
+    // so its subtask occurrence would (pre-fix) inherit the stale pin of
+    // whatever method was swept last — here `outer_root`'s pos-0 pin, which
+    // names INNER's method, not gate's. Pinned to inner's branch 0, `gate`
+    // fails at depth >= 1 and the whole plan collapses to empty.
+    fn inner(task: &mut TaskBuilder) {
+        task.branch().precondition(|d: &Depth| d.0 < 3).then(gate);
+    }
+    fn fin(task: &mut TaskBuilder) {
+        task.precondition(|d: &Depth| d.0 == 3)
+            .effect(|f: &mut Finished| f.0 = true);
+    }
+    fn outer_root(task: &mut TaskBuilder) {
+        // Multi-subtask recursive method: full sweeps on probation produce
+        // the pins whose staleness poisoned `gate` pre-fix.
+        task.branch()
+            .precondition(|d: &Depth| d.0 < 3)
+            .then(inner)
+            .then(outer_root);
+        task.branch().precondition(|d: &Depth| d.0 == 3).then(fin);
+    }
+
+    let domain = HtnDomain::from_root(outer_root).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    let expected = ["advance0", "advance1", "advance2", "fin"];
+
+    let mut always = HtnPlanner::new(&domain);
+    always.set_lookahead_mode(LookaheadMode::Always);
+    let always_plan = plan_of(&mut always, outer_root, &state);
+    assert_eq!(always_plan.task_names(), expected, "Always: full corridor");
+
+    let mut adaptive = HtnPlanner::new(&domain);
+    adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
+    let adaptive_plan = plan_of(&mut adaptive, outer_root, &state);
+    assert_eq!(
+        adaptive_plan.task_names(),
+        expected,
+        "Adaptive: skipped sweeps must not poison later commitments with stale pins"
+    );
+    assert!(adaptive_plan.is_complete());
+    assert_eq!(adaptive_plan, always_plan);
+}
+
+/// Regression (downgrade tier): a method whose sweep was downgraded to
+/// refutation-only (streak ≥ 2) must still refute dead ends that the cheap
+/// sweep can see — primitive preconditions that definitely fail. The gate
+/// dead-ends exactly at the third commitment (depth 2): `Always` refutes it
+/// on a full sweep, `Adaptive` on the downgraded sweep — neither may commit +
+/// backtrack the method — while `Off` must show the backtrack (proving the
+/// test actually distinguishes refutation from descent).
+#[test]
+fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
+    use bevy_bhtn::selection::{DecompositionTrace, LookaheadMode, TraceOutcome};
+
+    fn gate(task: &mut TaskBuilder) {
+        task.precondition(|d: &Depth| d.0 < 2)
+            .effect(|d: &mut Depth| d.0 += 1);
+    }
+    fn root2(task: &mut TaskBuilder) {
+        // Dead-ends at depth 2 (gate's precondition definitely fails).
+        task.branch().precondition(|d: &Depth| d.0 <= 2).then(gate).then(root2);
+        // Terminal at depth 2.
+        task.branch().precondition(|d: &Depth| d.0 == 2);
+    }
+
+    let domain = HtnDomain::from_root(root2).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    // root2 = task 0; the doomed method is its branch 0.
+    let doomed = |t: &DecompositionTrace| {
+        t.compound == 0 && t.branch == 0 && t.outcome == TraceOutcome::Backtracked
+    };
+
+    for (label, mode, expect_backtracked) in [
+        ("always", LookaheadMode::Always, false),
+        ("adaptive", LookaheadMode::Adaptive, false),
+        ("off", LookaheadMode::Off, true),
+    ] {
+        let mut planner = HtnPlanner::new(&domain);
+        planner.set_lookahead_mode(mode);
+        let mut trace = Vec::new();
+        let plan = planner.plan_traced(root2, &state, &mut trace);
+        assert_eq!(
+            plan.task_names(),
+            ["gate", "gate"],
+            "{label}: same plan in every mode"
+        );
+        assert_eq!(
+            trace.iter().any(doomed),
+            expect_backtracked,
+            "{label}: refutation-vs-descent contract violated (trace: {trace:?})"
+        );
+    }
+}

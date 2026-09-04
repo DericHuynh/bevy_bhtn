@@ -130,7 +130,7 @@ use crate::domain::HtnDomain;
 use crate::domain::Task;
 use crate::error::HtnResult;
 use crate::planner::{HtnPlanner, Plan};
-use crate::selection::{DecompositionTrace, HtnSearchStrategy, SearchOverride};
+use crate::selection::{DecompositionTrace, HtnSearchStrategy, LookaheadMode, SearchOverride};
 use crate::state::PlanState;
 
 /// The per-entity AI component: current plan and cursor.
@@ -156,8 +156,9 @@ pub struct HtnConfig {
     ///
     /// [`DepthFirst`]: HtnSearchStrategy::DepthFirst
     pub strategy: HtnSearchStrategy,
-    /// Whether the forward planner's look-ahead sweep runs (default `true`).
-    pub lookahead: bool,
+    /// The forward planner's look-ahead gating mode (default
+    /// [`LookaheadMode::Always`]).
+    pub lookahead: LookaheadMode,
     /// The forward planner's decomposition-step budget (default `100`).
     pub sanity_limit: usize,
     /// Whether the driver forwards [`DecompositionTrace`] events to
@@ -176,7 +177,7 @@ impl HtnConfig {
         Self {
             domain,
             strategy: HtnSearchStrategy::default(),
-            lookahead: true,
+            lookahead: LookaheadMode::default(),
             sanity_limit: 100,
             debug_trace: false,
             #[cfg(feature = "hotpatching")]
@@ -212,9 +213,19 @@ impl HtnConfig {
         self
     }
 
-    /// Enable or disable the look-ahead sweep.
+    /// Enable or disable the look-ahead sweep (maps onto [`LookaheadMode`]).
     pub fn with_lookahead(mut self, enabled: bool) -> Self {
-        self.lookahead = enabled;
+        self.lookahead = if enabled {
+            LookaheadMode::Always
+        } else {
+            LookaheadMode::Off
+        };
+        self
+    }
+
+    /// Set the look-ahead gating mode.
+    pub fn with_lookahead_mode(mut self, mode: LookaheadMode) -> Self {
+        self.lookahead = mode;
         self
     }
 
@@ -359,7 +370,7 @@ pub fn htn_ai_system(world: &mut World) {
                 let sanity = sanity.unwrap_or(config.sanity_limit);
                 let mut planner = HtnPlanner::new(&config.domain);
                 planner
-                    .set_lookahead(config.lookahead)
+                    .set_lookahead_mode(config.lookahead)
                     .set_sanity_limit(sanity)
                     .set_strategy(strategy.clone());
                 let mut trace_buf: Vec<DecompositionTrace> = Vec::new();

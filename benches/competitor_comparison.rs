@@ -57,6 +57,30 @@
 //! (`DEEP_SANITY_LIMIT`): 101 primitives cost ~300 decomposition steps, past
 //! the default budget of 100, under which the planner returns a ~33-step
 //! partial plan — pinned by the completion assertion in the episode bench.
+//!
+//! The bevy_bhtn side encodes the corridor as a **recursive selector**
+//! (`next_step` with 101 FirstMatch branches + a recursive root). That is the
+//! worst-case planning shape for a decompositional planner: branch
+//! preconditions are re-scanned from branch 0 at every recursion level, so
+//! planning costs O(n²) branch evaluations (~5,150 here), and the look-ahead
+//! sweep re-walks the same shape at every commitment. BAE's `Sequence` — and
+//! bevy_bhtn's total-order method — flatten the corridor in one O(n) pass
+//! (each child's condition is checked against the simulated state, which
+//! advances in lockstep with the pushed steps). Measured (debug probe,
+//! progress = 0): selector 1.2 ms / selector with look-ahead off 419 µs /
+//! chain encoding 110 µs.
+//!
+//! # The like-for-like deep case (`deep_sequence_*`)
+//!
+//! The same corridor with the bevy_bhtn side re-encoded the way BAE's model
+//! naturally expresses it: a single total-order method (`s0 … s99,
+//! deep_pickup` committed as one linear subtask sequence — no branch
+//! re-scanning). This is the matched-encoding comparison; htnp is excluded
+//! (its corridor is its own encoding, not a `Sequence`). Note the semantic
+//! trade both linear encodings share: a flattened corridor can only be
+//! (re)planned from its start state — mid-corridor replanning after drift is
+//! the recursive selector's strength, which is why that encoding stays
+//! benchmarked above as its own case.
 
 mod common;
 
@@ -408,6 +432,76 @@ mod bhtn_side {
 
     pub fn deep_frame_world(n: usize) -> (World, Schedule) {
         let domain = deep_domain();
+        let state = deep_initial_state(&domain);
+        let mut world = World::new();
+        world
+            .spawn_batch((0..n).map(|_| (Scratch(PlanState::clone(&state)), AgentState::default())))
+            .count();
+        world.insert_resource(HtnRes(domain, state));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(run_ai_steady);
+        (world, schedule)
+    }
+
+    // -- deep chain, matched encoding: one total-order method (BAE's
+    //    `Sequence` semantic equivalent) — no branch re-scanning --------------
+
+    macro_rules! deep_sequence {
+        ($($step:ident),* $(,)?) => {
+            fn deep_seq_root(task: &mut TaskBuilder) {
+                // Terminal: done when the item is picked up.
+                task.branch().precondition(|i: &ItemPickedUp| i.0);
+                // The corridor as ONE method: s0 … s99 committed in total
+                // order, then the pickup. No selector re-scanning — planning
+                // walks the subtask list once, like BAE's `Sequence`.
+                task.branch()
+                    .precondition(|p: &Progress| p.0 < DEPTH)
+                    $(.then($step))*
+                    .then(deep_pickup);
+            }
+        };
+    }
+
+    deep_sequence!(
+        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19,
+        s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31, s32, s33, s34, s35, s36, s37,
+        s38, s39, s40, s41, s42, s43, s44, s45, s46, s47, s48, s49, s50, s51, s52, s53, s54, s55,
+        s56, s57, s58, s59, s60, s61, s62, s63, s64, s65, s66, s67, s68, s69, s70, s71, s72, s73,
+        s74, s75, s76, s77, s78, s79, s80, s81, s82, s83, s84, s85, s86, s87, s88, s89, s90, s91,
+        s92, s93, s94, s95, s96, s97, s98, s99,
+    );
+
+    pub fn deep_seq_domain() -> HtnDomain {
+        HtnDomain::from_root(deep_seq_root)
+            .build()
+            .expect("well-formed")
+    }
+
+    pub fn deep_seq_single_actor_episode(domain: &HtnDomain, state: &PlanState) -> usize {
+        let mut state = state.clone();
+        let mut planner = HtnPlanner::new(domain);
+        planner.set_sanity_limit(DEEP_SANITY_LIMIT);
+        let plan = plan_root(&mut planner, deep_seq_root, &state);
+        assert!(
+            plan.is_complete(),
+            "deep sequence plan was truncated by the sanity limit"
+        );
+        assert_eq!(
+            plan.steps.len(),
+            DEPTH as usize + 1,
+            "deep sequence plan truncated"
+        );
+        let steps = plan.task_names().len();
+        crate::common::execute_plan(domain, &mut state, &plan);
+        let progress = domain.components.get::<Progress>().unwrap();
+        let picked = domain.components.get::<ItemPickedUp>().unwrap();
+        assert_eq!(state.get::<Progress>(progress).0, DEPTH, "goal not reached");
+        assert!(state.get::<ItemPickedUp>(picked).0, "item not picked up");
+        steps
+    }
+
+    pub fn deep_seq_frame_world(n: usize) -> (World, Schedule) {
+        let domain = deep_seq_domain();
         let state = deep_initial_state(&domain);
         let mut world = World::new();
         world
@@ -1138,6 +1232,56 @@ fn competitor_comparison(c: &mut Criterion) {
                 for &agent in &htnp_agents {
                     if htnp_side::deep_picked_up(&mut htnp.app, agent) {
                         htnp_side::deep_reset_agent(&mut htnp, agent);
+                    }
+                }
+            })
+        });
+        group.finish();
+    }
+
+    // --- Deep chain, matched encoding: bevy_bhtn total-order method vs BAE
+    //     Sequence (htnp excluded — its deep corridor is its own encoding) ---
+    {
+        let domain = bhtn_side::deep_seq_domain();
+        let state = bhtn_side::deep_initial_state(&domain);
+        let mut bae = bae_side::deep_app_with_agents(1);
+        let bae_agent = bae.agents[0];
+
+        let mut group = c.benchmark_group("deep_sequence_single_actor");
+        group.throughput(criterion::Throughput::Elements(1));
+        group.bench_function("bevy_bhtn", |b| {
+            b.iter(|| black_box(bhtn_side::deep_seq_single_actor_episode(&domain, &state)))
+        });
+        group.bench_function("bevy_bae", |b| {
+            b.iter(|| {
+                let mut frames = 0usize;
+                while !bae_side::picked_up(bae.app.world_mut(), bae_agent) {
+                    bae.app.update();
+                    frames += 1;
+                    assert!(frames < 1_000, "BAE deep-sequence episode never finished");
+                }
+                bae_side::deep_reset_agent(&mut bae.app, bae_agent);
+                black_box(frames)
+            })
+        });
+        group.finish();
+    }
+    for n in [100usize, 1_000] {
+        let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::deep_seq_frame_world(n);
+        let mut bae = bae_side::deep_app_with_agents(n);
+        let bae_agents = bae.agents.clone();
+
+        let mut group = c.benchmark_group(format!("deep_sequence_frame_{n}"));
+        group.throughput(criterion::Throughput::Elements(n as u64));
+        group.bench_function("bevy_bhtn", |b| {
+            b.iter(|| bhtn_schedule.run(&mut bhtn_world))
+        });
+        group.bench_function("bevy_bae", |b| {
+            b.iter(|| {
+                bae.app.update();
+                for &agent in &bae_agents {
+                    if bae_side::picked_up(bae.app.world_mut(), agent) {
+                        bae_side::deep_reset_agent(&mut bae.app, agent);
                     }
                 }
             })

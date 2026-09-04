@@ -63,6 +63,45 @@ pub trait Searcher: Send + Sync {
     fn search(&self, domain: &HtnDomain, state: &PlanState) -> Option<Plan>;
 }
 
+/// When the forward planner's look-ahead sweep runs. The sweep's value scales
+/// with the committed method's **subtask-sequence length**: a mid-sequence
+/// dead end (or a non-terminating step) is refuted before the search commits
+/// any of the sequence's state, while a single-step method's dead end is
+/// discovered by the very next queue pop anyway — sweeping it duplicates the
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LookaheadMode {
+    /// Sweep before every method commitment (the default; full refutation
+    /// and pin coverage).
+    #[default]
+    Always,
+    /// Sweep only where it pays for itself, in three tiers per commitment:
+    ///
+    /// 1. **Skip** — single-subtask, totally-ordered methods with a
+    ///    terminating step (finite `min_yield`): the next queue pop performs
+    ///    the same precondition check against the real state.
+    /// 2. **Refutation-only sweep** — once a method has been swept
+    ///    [`ADAPTIVE_SWEEP_TRIALS`](crate::planner) consecutive times without
+    ///    a single refutation (streak tracked per method, reset on any
+    ///    refutation, reset per plan), its sweep downgrades to budget
+    ///    refutation + primitive-precondition checks: no compound-survivor
+    ///    analysis (no pins, no compound dead ends, no optimistic
+    ///    propagation) — on wide selectors that analysis re-evaluates every
+    ///    branch and dominates the sweep cost.
+    /// 3. **Full sweep** — everything else: multi-step sequences
+    ///    (mid-sequence dead ends), non-terminating single steps (budget
+    ///    refutation), partially-ordered sets, and every method still on
+    ///    probation.
+    ///
+    /// Plans are identical to [`Always`](Self::Always) except where a
+    /// refutation or pin would have fired at a downgraded/skipped site: the
+    /// search descends and discovers the dead end instead, so under a tight
+    /// sanity budget a refuted `Complete` can become a truncated `Partial`.
+    Adaptive,
+    /// Never sweep (plain MTR backtracking).
+    Off,
+}
+
 /// Per-agent search override. Agents opt in by inserting this component; the
 /// driver uses it instead of [`HtnConfig`](crate::ecs::HtnConfig)'s strategy
 /// for that entity.

@@ -38,9 +38,9 @@
 //! ends are refuted when their own frame commits.
 
 use crate::domain::HtnDomain;
-use crate::state::PlanState;
-use crate::state::FieldSet;
 use crate::domain::Task;
+use crate::state::FieldSet;
+use crate::state::PlanState;
 use crate::tasks::Precondition;
 
 /// The verdict of one look-ahead sweep.
@@ -57,6 +57,19 @@ pub(crate) enum Lookahead {
     Refine,
     /// No refinement of the sequence can succeed from the current state.
     DeadEnd,
+}
+
+/// How much analysis one look-ahead sweep performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepDepth {
+    /// Full analysis: compound-survivor checks (dead ends + pins + optimistic
+    /// propagation), primitive-precondition checks, budget refutation.
+    Full,
+    /// Refutation-only: budget refutation and primitive-precondition checks
+    /// — no compound-survivor analysis (no pins, no compound dead ends, no
+    /// optimistic propagation). A fraction of the cost on wide selectors,
+    /// where the survivor analysis re-evaluates every branch.
+    RefutationOnly,
 }
 
 /// Sweep `sequence` (task indices, in execution order) against `state`.
@@ -85,6 +98,7 @@ pub(crate) fn sweep(
     pins: &mut Vec<(usize, usize)>,
     surviving_buf: &mut Vec<usize>,
     set_semantics: bool,
+    depth: SweepDepth,
 ) -> Lookahead {
     // The sweep is only sound when the inferred summaries are present (they
     // define what "possibly written" and "terminating" mean).
@@ -164,6 +178,13 @@ pub(crate) fn sweep(
                 // budget — a task that can only refine forever can never
                 // complete, so any method whose sequence contains it is
                 // refuted outright.)
+                // Refutation-only sweeps skip the survivor analysis: no
+                // pins, no compound dead ends, no optimistic propagation —
+                // on wide selectors that analysis re-evaluates every branch
+                // and dominates the sweep cost.
+                if depth == SweepDepth::RefutationOnly {
+                    continue;
+                }
                 // Single pass: evaluate each method's preconditions once,
                 // collecting survivors; then pin (unique survivor) and
                 // propagate optimistic writes.

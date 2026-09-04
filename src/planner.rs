@@ -34,7 +34,7 @@ use std::any::TypeId;
 use ustr::Ustr;
 
 use crate::domain::SelectionPolicy;
-use crate::selection::{DecompositionTrace, HtnSearchStrategy, TraceOutcome};
+use crate::selection::{DecompositionTrace, HtnSearchStrategy, LookaheadMode, TraceOutcome};
 use crate::tasks::TaskFn;
 
 use crate::domain::HtnDomain;
@@ -59,6 +59,11 @@ pub enum PlanStatus {
     /// for unbounded recursion (the `terminating` summary flags it).
     Partial,
 }
+
+/// How many consecutive non-refuting sweeps a method tolerates under
+/// [`LookaheadMode::Adaptive`] before its sweep is disabled for the rest of
+/// the plan (a refutation resets the streak immediately).
+const ADAPTIVE_SWEEP_TRIALS: u32 = 2;
 
 /// What a planning call starts from: a task function (its `TypeId` resolves
 /// through the baked type index) or a task index into
@@ -394,9 +399,8 @@ struct DecompositionFrame {
 /// cheaply across turns.
 pub struct HtnPlanner<'a> {
     domain: &'a HtnDomain,
-    /// Whether the look-ahead sweep runs before each method commitment
-    /// (default: enabled).
-    lookahead: bool,
+    /// The look-ahead gating mode (default: [`Always`](LookaheadMode::Always)).
+    lookahead: LookaheadMode,
     /// Decomposition-step budget before the best partial plan is returned
     /// (default: 100).
     sanity_limit: usize,
@@ -405,6 +409,15 @@ pub struct HtnPlanner<'a> {
     /// `cost_bounded` bools could represent combinations (both on) whose
     /// behavior was undefined.
     strategy: HtnSearchStrategy,
+    /// Flat method-index base per task (`method_base[task] + method_idx`
+    /// addresses a method's sweep-streak slot). Built lazily on the first
+    /// [`LookaheadMode::Adaptive`] plan — the other modes never touch it, so
+    /// planner construction stays allocation-free.
+    method_base: Vec<usize>,
+    /// Per-method consecutive non-refuting sweep count under
+    /// [`LookaheadMode::Adaptive`] — reset at every `plan_inner` entry, so
+    /// gating is deterministic per plan and re-learns on each replan.
+    sweep_streaks: Vec<u32>,
 }
 
 impl<'a> HtnPlanner<'a> {
@@ -412,9 +425,11 @@ impl<'a> HtnPlanner<'a> {
     pub fn new(domain: &'a HtnDomain) -> Self {
         Self {
             domain,
-            lookahead: true,
+            lookahead: LookaheadMode::default(),
             sanity_limit: 100,
             strategy: HtnSearchStrategy::default(),
+            method_base: Vec::new(),
+            sweep_streaks: Vec::new(),
         }
     }
 
@@ -428,7 +443,17 @@ impl<'a> HtnPlanner<'a> {
     /// for domains where the sweep's per-commitment cost outweighs its
     /// pruning (e.g. shallow domains with no dead ends).
     pub fn set_lookahead(&mut self, enabled: bool) -> &mut Self {
-        self.lookahead = enabled;
+        self.lookahead = if enabled {
+            LookaheadMode::Always
+        } else {
+            LookaheadMode::Off
+        };
+        self
+    }
+
+    /// Set the look-ahead gating mode (see [`LookaheadMode`]).
+    pub fn set_lookahead_mode(&mut self, mode: LookaheadMode) -> &mut Self {
+        self.lookahead = mode;
         self
     }
 
@@ -525,6 +550,26 @@ impl<'a> HtnPlanner<'a> {
         // their search (and their statistics); lookahead/sanity do not apply.
         if let HtnSearchStrategy::Custom(searcher) = &self.strategy {
             return searcher.search(self.domain, state).unwrap_or_default();
+        }
+        // Adaptive sweep streaks are per-plan: gating decisions are
+        // deterministic for a given (domain, state) and re-learn on replan.
+        // The stats are built lazily — only Adaptive pays for them.
+        let adaptive = matches!(self.lookahead, LookaheadMode::Adaptive);
+        if adaptive && self.sweep_streaks.is_empty() {
+            let mut base = Vec::with_capacity(self.domain.tasks.len() + 1);
+            let mut running = 0usize;
+            for task in &self.domain.tasks {
+                base.push(running);
+                if let crate::domain::Task::Compound(c) = task {
+                    running += c.methods.len();
+                }
+            }
+            base.push(running);
+            self.method_base = base;
+            self.sweep_streaks = vec![0u32; running];
+        }
+        if adaptive {
+            self.sweep_streaks.fill(0);
         }
         // The strategy enum encodes the valid combinations the old independent
         // bools left undefined (fail-fast + cost-bounded together).
@@ -804,27 +849,98 @@ impl<'a> HtnPlanner<'a> {
                         // member's writes are optimistic-unknown and no
                         // effects are applied, since the execution order is
                         // chosen by the search.
-                        let verdict = if self.lookahead {
-                            seq_buf.clear();
-                            seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
-                            lookahead::sweep(
-                                self.domain,
-                                &state,
-                                &mut sweep_owned,
-                                &seq_buf,
-                                sanity_limit.saturating_sub(count),
-                                &mut sweep_unknown,
-                                &mut sweep_pins,
-                                &mut sweep_surviving,
-                                method.order.is_partial(),
-                            )
+                        // Adaptive only: flat slot of this method's sweep
+                        // streak (`None` in the other modes — no stats, no
+                        // per-commitment bookkeeping).
+                        let flat_method = if adaptive {
+                            Some(self.method_base[current] + idx)
                         } else {
-                            Lookahead::Refine
+                            None
+                        };
+                        // Adaptive tiers: Full sweeps (with pins) until a
+                        // method proves sweep-useless, cheap refutation-only
+                        // sweeps while it is on probation, no sweep where the
+                        // sweep provably duplicates the next queue pop.
+                        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+                        enum SweepTier {
+                            Full,
+                            RefutationOnly,
+                            Skip,
+                        }
+                        let sweep_tier = match self.lookahead {
+                            LookaheadMode::Always => SweepTier::Full,
+                            LookaheadMode::Off => SweepTier::Skip,
+                            LookaheadMode::Adaptive => {
+                                // Tier 1 — shape: a single-subtask,
+                                // totally-ordered method with a terminating
+                                // step duplicates the next queue pop's
+                                // precondition check exactly.
+                                let shape_skip = method.subtasks.len() == 1
+                                    && !method.order.is_partial()
+                                    && self.domain.summaries[method.subtasks[0] as usize].min_yield
+                                        != usize::MAX;
+                                if shape_skip {
+                                    SweepTier::Skip
+                                } else if self.sweep_streaks
+                                    [flat_method.expect("adaptive stats built")]
+                                    >= ADAPTIVE_SWEEP_TRIALS
+                                {
+                                    // Tier 3 — track record: swept
+                                    // `ADAPTIVE_SWEEP_TRIALS` times in a row
+                                    // without one refutation → refutation-only
+                                    // for the rest of THIS plan (a refutation
+                                    // resets the streak).
+                                    SweepTier::RefutationOnly
+                                } else {
+                                    // Tier 2 — on probation: full sweep.
+                                    SweepTier::Full
+                                }
+                            }
+                        };
+                        let verdict = match sweep_tier {
+                            SweepTier::Skip => Lookahead::Refine,
+                            SweepTier::RefutationOnly => {
+                                seq_buf.clear();
+                                seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
+                                lookahead::sweep(
+                                    self.domain,
+                                    &state,
+                                    &mut sweep_owned,
+                                    &seq_buf,
+                                    sanity_limit.saturating_sub(count),
+                                    &mut sweep_unknown,
+                                    &mut sweep_pins,
+                                    &mut sweep_surviving,
+                                    method.order.is_partial(),
+                                    lookahead::SweepDepth::RefutationOnly,
+                                )
+                            }
+                            SweepTier::Full => {
+                                seq_buf.clear();
+                                seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
+                                lookahead::sweep(
+                                    self.domain,
+                                    &state,
+                                    &mut sweep_owned,
+                                    &seq_buf,
+                                    sanity_limit.saturating_sub(count),
+                                    &mut sweep_unknown,
+                                    &mut sweep_pins,
+                                    &mut sweep_surviving,
+                                    method.order.is_partial(),
+                                    lookahead::SweepDepth::Full,
+                                )
+                            }
                         };
                         match verdict {
                             Lookahead::DeadEnd => {
                                 // Proven doomed without recursing: try the
-                                // next method at this site.
+                                // next method at this site. The streak
+                                // resets — this method's sweep just paid
+                                // for itself.
+                                if let Some(flat) = flat_method {
+                                    self.sweep_streaks[flat] = 0;
+                                }
                                 if pin.is_some()
                                     || matches!(compound.policy, SelectionPolicy::FirstMatch)
                                 {
@@ -838,6 +954,9 @@ impl<'a> HtnPlanner<'a> {
                                 // The sweep left the inevitable refinements in
                                 // `sweep_pins` (scratch discipline — no
                                 // ownership handoff).
+                                if let Some(flat) = flat_method {
+                                    self.sweep_streaks[flat] += 1;
+                                }
                                 // Snapshot *before* the push: on backtrack the
                                 // truncate must remove THIS method's entry, so
                                 // the node's retry replaces it instead of
@@ -893,20 +1012,36 @@ impl<'a> HtnPlanner<'a> {
                                     SubtaskOrder::Total => {
                                         for pos in (0..method.subtasks.len()).rev() {
                                             let sub_idx = method.subtasks[pos] as usize;
-                                            let sub_pin = sweep_pins
-                                                .iter()
-                                                .find(|(p, _)| *p == pos)
-                                                .map(|&(_, m)| m as u32);
+                                            // Skipped sweeps leave `sweep_pins`
+                                            // holding the LAST swept method's
+                                            // verdicts — attaching them here
+                                            // would pin this method's
+                                            // occurrences to another method's
+                                            // refinements (exhausting nodes
+                                            // wrongly). Only full sweeps
+                                            // produce pins.
+                                            let sub_pin = if sweep_tier != SweepTier::Full {
+                                                None
+                                            } else {
+                                                sweep_pins
+                                                    .iter()
+                                                    .find(|(p, _)| *p == pos)
+                                                    .map(|&(_, m)| m as u32)
+                                            };
                                             stack.push_front(Step::Task(sub_idx, sub_pin));
                                         }
                                     }
                                     SubtaskOrder::Partial { first, .. } => {
                                         for &pos in first.iter().rev() {
                                             let sub_idx = method.subtasks[pos as usize] as usize;
-                                            let sub_pin = sweep_pins
-                                                .iter()
-                                                .find(|(p, _)| *p == pos as usize)
-                                                .map(|&(_, m)| m as u32);
+                                            let sub_pin = if sweep_tier != SweepTier::Full {
+                                                None
+                                            } else {
+                                                sweep_pins
+                                                    .iter()
+                                                    .find(|(p, _)| *p == pos as usize)
+                                                    .map(|&(_, m)| m as u32)
+                                            };
                                             stack.push_front(Step::Task(sub_idx, sub_pin));
                                         }
                                     }

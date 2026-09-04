@@ -32,6 +32,7 @@
 mod common;
 
 use bevy_bhtn::planner::{HtnPlanner, Plan};
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskFn;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -59,9 +60,13 @@ fn bench_lookahead(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("exponential_backtrack");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, on) in [("off", false), ("on", true)] {
+        for (label, mode) in [
+            ("off", LookaheadMode::Off),
+            ("adaptive", LookaheadMode::Adaptive),
+            ("on", LookaheadMode::Always),
+        ] {
             let mut planner = HtnPlanner::new(&domain);
-            planner.set_lookahead(on);
+            planner.set_lookahead_mode(mode);
             // Raise the budget so the off case shows the real exponential
             // enumeration instead of stopping at the default sanity limit.
             planner.set_sanity_limit(1_000_000);
@@ -84,9 +89,13 @@ fn bench_lookahead(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("doomed_recursion");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, on) in [("off", false), ("on", true)] {
+        for (label, mode) in [
+            ("off", LookaheadMode::Off),
+            ("adaptive", LookaheadMode::Adaptive),
+            ("on", LookaheadMode::Always),
+        ] {
             let mut planner = HtnPlanner::new(&domain);
-            planner.set_lookahead(on);
+            planner.set_lookahead_mode(mode);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();
@@ -106,9 +115,13 @@ fn bench_lookahead(c: &mut Criterion) {
 
         let mut group = c.benchmark_group("outpost_deep");
         group.throughput(criterion::Throughput::Elements(1));
-        for (label, on) in [("off", false), ("on", true)] {
+        for (label, mode) in [
+            ("off", LookaheadMode::Off),
+            ("adaptive", LookaheadMode::Adaptive),
+            ("on", LookaheadMode::Always),
+        ] {
             let mut planner = HtnPlanner::new(&domain);
-            planner.set_lookahead(on);
+            planner.set_lookahead_mode(mode);
             group.bench_function(label, |b| {
                 b.iter(|| {
                     let mut state = initial.clone();

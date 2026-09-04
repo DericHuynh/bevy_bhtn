@@ -148,7 +148,7 @@ fn world_drift_triggers_replan_and_recovery() {
 #[test]
 fn driver_handles_multiple_agents_and_config_tuning() {
     let mut cfg = HtnConfig::new(goal_domain());
-    cfg.lookahead = false;
+    cfg.lookahead = bevy_bhtn::selection::LookaheadMode::Off;
     let mut world = World::new();
     world.insert_resource(cfg);
 
