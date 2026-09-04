@@ -94,9 +94,10 @@ fn agent_plans_executes_and_completes() {
 }
 
 /// The world drifted since planning (another system spent the resource): the
-/// driver re-validates the next step's preconditions against the real world,
-/// drops the plan, and the agent recovers by replanning once the world allows
-/// progress again.
+/// driver re-validates the next step's preconditions against the real world.
+/// A failed check drops the plan and **replans from reality in the same
+/// tick** — the fresh plan is selected against the world as it is *now* and
+/// executes immediately, instead of idling until the next tick.
 #[test]
 fn world_drift_triggers_replan_and_recovery() {
     let mut world = World::new();
@@ -107,27 +108,13 @@ fn world_drift_triggers_replan_and_recovery() {
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
 
-    // Simulate drift: another system drains the battery below what the plan
-    // assumed (the plan's next step expects battery < 3 — still true — so
-    // instead invalidate by fully draining to 0 and saturating the plan's
-    // assumption is unchanged; use a *different* kind of drift: remove the
-    // component entirely, so the scratchpad sees Default(0) — still < 3).
-    // The meaningful drift test: the plan's remaining steps assume battery
-    // grows monotonically; drain it and confirm the driver still validates
-    // against reality rather than replaying stale effects.
-    world.get_mut::<Battery>(entity).unwrap().0 = 0;
-
-    // Tick 2: the plan is still valid (battery < 3), so it executes —
-    // validation is against the *real* world, not the stale plan state.
-    htn_ai_system(&mut world);
-    assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
-
-    // Now make the next step's precondition fail: saturate the battery so the
-    // `gather` branch precondition (battery < 3) no longer holds.
+    // Simulate drift: another system charges the battery past the gather
+    // gate (battery < 3) that the plan's remaining steps assume.
     world.get_mut::<Battery>(entity).unwrap().0 = 3;
 
-    // Tick 3: the plan's next gather is invalid → plan dropped (replan next
-    // tick), no effect applied.
+    // Tick 2: the plan's next gather is invalid → dropped — and the fresh
+    // plan is selected the *same tick*: the terminal branch matches (battery
+    // >= 3), so the agent goes planless with no effect applied.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
     assert!(agent.plan.is_none(), "invalid step aborts the plan");
@@ -137,9 +124,73 @@ fn world_drift_triggers_replan_and_recovery() {
         "no effect applied"
     );
 
-    // Tick 4: replans; the terminal branch matches, nothing executes.
+    // Tick 3: still planless — the terminal branch keeps matching.
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 3);
+}
+
+/// The same-tick property, made observable: drift into a state where the
+/// replanned plan is **non-empty**, so the replacement plan's first step
+/// executes within the very tick the drift was detected.
+#[test]
+fn drift_replans_and_executes_same_tick() {
+    #[derive(Component, Clone, Default, Debug, PartialEq)]
+    struct Cell(pub i32);
+
+    fn root(task: &mut TaskBuilder) {
+        task.branch().precondition(|c: &Cell| c.0 >= 5); // terminal: done
+        task.branch()
+            .precondition(|c: &Cell| (3..5).contains(&c.0))
+            .then(fast_charge);
+        task.branch()
+            .precondition(|c: &Cell| c.0 < 3)
+            .then(gather)
+            .then(root);
+    }
+    fn gather(task: &mut TaskBuilder) {
+        task.precondition(|c: &Cell| c.0 < 3)
+            .effect(|c: &mut Cell| c.0 += 1);
+    }
+    fn fast_charge(task: &mut TaskBuilder) {
+        task.precondition(|c: &Cell| (3..5).contains(&c.0))
+            .effect(|c: &mut Cell| c.0 = 6);
+    }
+    let domain = HtnDomain::from_root(root).build().unwrap();
+
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain));
+    let entity = world.spawn((Cell(0), HtnAgent::default())).id();
+
+    // Ticks 1–2: the plan [gather, gather, gather, fast_charge] executes its
+    // first two gathers (0 → 2).
+    htn_ai_system(&mut world);
+    htn_ai_system(&mut world);
+    assert_eq!(world.get::<Cell>(entity).unwrap().0, 2);
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 2);
+
+    // External disturbance: another system charges the cell past the gather
+    // gate — the plan's third gather (precondition < 3) can never fire.
+    world.get_mut::<Cell>(entity).unwrap().0 = 4;
+
+    // Tick 3: the gather step's validation fails → plan dropped → replanned
+    // from reality **this tick**: the fresh plan is [fast_charge], and its
+    // step executes within the same tick (cell jumps 4 → 6 — the *old* plan
+    // would have produced 5 via gather, and only on the next tick).
+    htn_ai_system(&mut world);
+    let agent = world.get::<HtnAgent>(entity).unwrap();
+    assert_eq!(
+        world.get::<Cell>(entity).unwrap().0,
+        6,
+        "the replanned step executed in the drift tick itself"
+    );
+    assert!(
+        agent.plan.is_none(),
+        "one-step plan completed; planless again"
+    );
+
+    // Tick 4: the terminal branch (>= 5) matches — idle.
+    htn_ai_system(&mut world);
+    assert_eq!(world.get::<Cell>(entity).unwrap().0, 6);
 }
 
 /// An empty plan is stored as planless (never wedges the agent), and the
@@ -397,7 +448,9 @@ fn always_hit_domain() -> HtnDomain {
 fn plan_every_throttles_replanning() {
     let mut world = World::new();
     world.insert_resource(HtnConfig::new(always_hit_domain()));
-    let throttled = world.spawn((Hits(0), HtnAgent::default(), PlanEvery(3))).id();
+    let throttled = world
+        .spawn((Hits(0), HtnAgent::default(), PlanEvery(3)))
+        .id();
     let free = world.spawn((Hits(0), HtnAgent::default())).id();
 
     for _ in 0..10 {
@@ -409,7 +462,11 @@ fn plan_every_throttles_replanning() {
         4,
         "plans at runs 1, 4, 7, 10"
     );
-    assert_eq!(world.get::<Hits>(free).unwrap().0, 10, "unthrottled control");
+    assert_eq!(
+        world.get::<Hits>(free).unwrap().0,
+        10,
+        "unthrottled control"
+    );
 }
 
 /// An agent whose domain genuinely has no decomposition gets `NoPlan` from

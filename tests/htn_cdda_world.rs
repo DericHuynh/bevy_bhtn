@@ -25,12 +25,16 @@
 //! graph; movement is ordered through a [`Travel`] component the movement
 //! system steps one tile per tick. The planner simulates all of this on the
 //! scratchpad (effects), the driver re-validates each step against the real
-//! world every tick, and world drift (the survivor not having arrived yet)
-//! drops the plan and replans — the CDDA replan loop, end to end.
+//! world every tick, and world drift (the survivor not having arrived yet,
+//! or an enemy walking into view) drops the plan and **replans from reality
+//! in the same tick** — the fresh plan is selected against the world as it
+//! is *now* and executes immediately.
 //!
 //! The scenario: the survivor at (0,0) wears a jacket holding a stick; a rag
 //! lies at (4,4). Goal: craft a spear (stick + rag). The planner must send
-//! them across the map, pick the rag up, and craft.
+//! them across the map, pick the rag up, and craft. The interrupt scenario
+//! at the bottom spawns an enemy mid-journey and pins the same-tick replan
+//! to the flee branch, tick by tick.
 
 use std::collections::HashMap;
 
@@ -97,8 +101,9 @@ struct Travel {
 /// Whether the survivor has arrived at their [`Travel`] target. Owned by the
 /// movement system in reality (recomputed from the real position every tick);
 /// the planner *simulates* it as an effect of `move_to_item` so the plan can
-/// validate its later steps. The driver's re-validation drops the plan every
-/// tick until the walk has actually completed — the CDDA drift-replan loop.
+/// validate its later steps. The driver's re-validation fails every tick
+/// until the walk completes — each failure drops the plan and replans from
+/// reality in the same tick.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
 struct Arrived(pub bool);
 
@@ -1035,18 +1040,19 @@ impl CddaWorld {
 
 /// The survivor walks to the rag, picks it up, and crafts the spear. The
 /// simulation is deterministic, so the tick count is pinned exactly. Verified
-/// against a per-tick trace; the arithmetic:
+/// against a per-tick trace; the arithmetic (one step per tick; a mid-walk
+/// step whose validation fails is dropped and replanned **the same tick** —
+/// the fresh plan selects against reality and executes immediately):
 ///
-/// 1 (plan + select_missing) + 8 (walk — one tile per tick, the movement
-/// system runs every tick while the driver interleaves move-ticks with
-/// drift-fail and replan ticks) + 1 (replan + select) + 1 (move re-issued,
-/// no-op walk) + 1 (pick_up: arrival confirmed, rag pocketed) + 1 (do_craft)
-/// = 13.
+/// 1 (plan + select) + 8 (walk — each mid-walk drift tick drops the plan
+/// and replans from reality the same tick, immediately re-executing the
+/// journey's first step) + 1 (move re-issued, no-op walk) + 1 (pick_up) +
+/// 1 (do_craft) = 12.
 #[test]
 fn survivor_walks_picks_up_and_crafts_a_spear() {
     let mut sim = CddaWorld::new(ItemKind::Spear);
     let ticks = sim.run_until_crafted(ItemKind::Spear);
-    assert_eq!(ticks, 13, "deterministic tick count for the spear run");
+    assert_eq!(ticks, 12, "deterministic tick count for the spear run");
 
     // The spear exists, in a pocket of the survivor's jacket (the first
     // worn clothing — the pocket the pickup/craft systems target).
@@ -1142,12 +1148,13 @@ fn survivor_crafts_a_bandage_from_two_ground_items() {
 /// carries a bottle: the planner must use the carried one and leave the
 /// ground bottle lying at (3,1) untouched. One fetch only — the shortest
 /// scenario. Verified against a per-tick trace; the arithmetic:
-/// 1 (plan + select) + 4 (walk to the scrap) + 1 (pick_up) + 1 (do_craft) = 7.
+/// 1 (plan + select) + 4 (walk to the scrap) + 1 (move re-issued) + 1
+/// (pick_up) + 1 (do_craft) = 8.
 #[test]
 fn survivor_crafts_a_torch_using_the_carried_bottle() {
     let mut sim = CddaWorld::new(ItemKind::Torch);
     let ticks = sim.run_until_crafted(ItemKind::Torch);
-    assert_eq!(ticks, 7, "deterministic tick count for the torch run");
+    assert_eq!(ticks, 8, "deterministic tick count for the torch run");
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Torch).is_some());
 
@@ -1280,7 +1287,7 @@ fn without_sharing_the_second_trip_reference_fails_the_branch() {
 /// between the pickup and the craft.
 ///
 /// Verified against a per-tick trace; the arithmetic is the plain spear run
-/// (13) plus the one inserted repair step: **14**.
+/// (12) plus the one inserted repair step: **13**.
 #[test]
 fn insertion_weaves_the_unmodeled_repair_step() {
     let mut sim = CddaWorld::new_with(
@@ -1318,8 +1325,8 @@ fn insertion_weaves_the_unmodeled_repair_step() {
     }
     sim.tick_n(1); // settle tick, mirroring `run_until_crafted`
     assert_eq!(
-        ticks, 14,
-        "13-tick spear run + the one inserted repair step"
+        ticks, 13,
+        "12-tick spear run + the one inserted repair step"
     );
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());
@@ -1476,7 +1483,7 @@ fn queue_crafts_two_of_an_item_in_one_count_aware_plan() {
     }
     sim.tick_n(1); // settle tick, mirroring `run_until_crafted`
     assert_eq!(
-        ticks, 34,
+        ticks, 32,
         "deterministic tick count for the doubled-craft queue run"
     );
 
@@ -1484,5 +1491,214 @@ fn queue_crafts_two_of_an_item_in_one_count_aware_plan() {
     assert_eq!(sim.pocket_count(ItemKind::Bandage), 2);
     assert_eq!(kinds_count(&mut sim, ItemKind::Scrap), 0);
     assert_eq!(kinds_count(&mut sim, ItemKind::Berry), 0);
+    assert!(sim.idle());
+}
+
+// ---------------------------------------------------------------------------
+// The interrupt scenario: an enemy comes into view mid-journey
+// ---------------------------------------------------------------------------
+
+/// A threat projection the perception layer derives every tick: true while
+/// any enemy stands within Manhattan distance 2 of the survivor. Domain
+/// authors encode "is it safe to act" as ordinary preconditions over this —
+/// the driver's per-step re-validation then turns an enemy's arrival into a
+/// same-tick replan.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Default)]
+struct Danger(pub bool);
+
+/// A hostile actor. It has a position and nothing else — the danger is in
+/// the geometry, not the entity.
+#[derive(Component, Debug)]
+struct Enemy;
+
+/// The threat projection: runs with the other perception systems, before the
+/// driver, so a replan in the same tick sees the enemy.
+fn threat_assessment(
+    mut survivors: Query<(&Pos, &mut Danger)>,
+    enemies: Query<&Pos, With<Enemy>>,
+) {
+    for (pos, mut danger) in &mut survivors {
+        danger.0 = enemies.iter().any(|e| {
+            (e.x - pos.x).abs() + (e.y - pos.y).abs() <= 2
+        });
+    }
+}
+
+// The vigilant domain: the plain fetch/craft journey (reused task bodies,
+// wrapped with a safety gate) plus a flee branch the planner must prefer
+// while danger stands.
+
+/// Walking into danger is refused: the safety gate composes with the shared
+/// `move_to_item` body (called directly, so its declarations merge into this
+/// primitive).
+fn move_to_item_safe(task: &mut TaskBuilder) {
+    task.precondition(|danger: &Danger| !danger.0);
+    move_to_item(task);
+}
+
+/// Same gate for the pickup.
+fn pick_up_safe(task: &mut TaskBuilder) {
+    task.precondition(|danger: &Danger| !danger.0);
+    pick_up(task);
+}
+
+/// While an enemy is in view, run home. Refused once home (hiding beats
+/// pacing) — the domain says so, the planner enforces it.
+fn flee_home(task: &mut TaskBuilder) {
+    task.precondition(|danger: &Danger| danger.0)
+        .precondition(|pos: &Pos| *pos != Pos { x: 0, y: 0 })
+        .effect(|travel: &mut Travel, arrived: &mut Arrived| {
+            travel.target = Pos { x: 0, y: 0 };
+            arrived.0 = true;
+        });
+}
+
+fn acquire_selected_alert(task: &mut TaskBuilder) {
+    task.branch()
+        .precondition(|focus: &Focus, pockets: &PocketContents| pockets.count(focus.0) > 0);
+    task.branch()
+        .precondition(|focus: &Focus, ground: &GroundKnowledge| ground.contains(focus.0))
+        .then(move_to_item_safe)
+        .then(pick_up_safe);
+}
+
+fn acquire_missing_alert(task: &mut TaskBuilder) {
+    task.branch().precondition(
+        |pockets: &PocketContents, goal: &CraftGoal, book: &RecipeBook| {
+            book.inputs_satisfied(goal.0, pockets)
+        },
+    );
+    task.branch()
+        .then(select_missing)
+        .then(acquire_selected_alert)
+        .then(acquire_missing_alert);
+}
+
+fn ensure_inputs_alert(task: &mut TaskBuilder) {
+    task.branch().precondition(
+        |pockets: &PocketContents, goal: &CraftGoal, book: &RecipeBook| {
+            book.inputs_satisfied(goal.0, pockets)
+        },
+    );
+    task.branch().then(acquire_missing_alert).then(ensure_inputs_alert);
+}
+
+/// Branch order encodes the priority: craft the goal **unless** an enemy is
+/// in view — then flee first. FirstMatch + the re-validation loop is the
+/// whole mechanism.
+fn behave_alert(task: &mut TaskBuilder) {
+    task.branch()
+        .precondition(|pockets: &PocketContents, goal: &CraftGoal| pockets.count(goal.0) > 0);
+    task.branch()
+        .precondition(|danger: &Danger| danger.0)
+        .then(flee_home);
+    task.branch()
+        .then(ensure_inputs_alert)
+        .then(do_craft)
+        .then(behave_alert);
+}
+
+/// The alert world: same grid, same systems, plus the threat projection
+/// running before the driver (an enemy seen this tick is acted on this
+/// tick) and a `Danger` component on the survivor.
+impl CddaWorld {
+    fn new_alert(goal: ItemKind) -> Self {
+        let mut sim =
+            Self::new_with(goal, vec![goal], GROUND_ITEMS.as_slice(), behave_alert, |b| b);
+        sim.world
+            .entity_mut(sim.survivor)
+            .insert(Danger::default());
+        sim.schedule
+            .add_systems(threat_assessment.before(htn_ai_system));
+        sim
+    }
+
+    fn danger(&self) -> bool {
+        self.component::<Danger>().0
+    }
+}
+
+/// **An enemy comes into view while walking → the plan changes the same
+/// tick.** The survivor is mid-journey to the rag when an enemy appears on
+/// the path. The domain gates the fetch steps on "no danger in view", so
+/// the very next re-validation fails; the driver drops the plan and replans
+/// from reality *within that tick*, and the fresh plan is the flee branch —
+/// which executes immediately (the retreat order is issued before the tick
+/// ends). No tick passes where the survivor keeps walking toward an enemy
+/// they have seen, and the journey is re-derived the moment the danger
+/// clears.
+#[test]
+fn enemy_in_view_replans_the_same_tick_and_the_survivor_flees() {
+    let mut sim = CddaWorld::new_alert(ItemKind::Spear);
+
+    // Ticks 1–2: the journey plan is compiled and the walk begins. No enemy:
+    // danger false, the fetch steps validate.
+    sim.tick_n(1);
+    assert_eq!(
+        sim.plan_names(),
+        ["select_missing", "move_to_item_safe", "pick_up_safe", "do_craft"],
+    );
+    assert!(!sim.danger());
+    sim.tick_n(1);
+    assert_eq!(sim.position(), Pos { x: 1, y: 0 }, "walking toward the rag");
+    assert_eq!(sim.component::<Travel>().target, Pos { x: 4, y: 4 });
+
+    // An enemy appears on the path, two tiles ahead — in view.
+    sim.world.spawn((Enemy, Pos { x: 2, y: 1 }));
+
+    // Tick 3: perception flips Danger *before* the driver runs; the current
+    // step's safety precondition fails; the plan is dropped, replanned from
+    // reality (the flee branch now wins), and the retreat executes **within
+    // this tick** — the Travel order points home and the survivor has
+    // already stepped back before the tick ends.
+    sim.tick_n(1);
+    assert!(sim.danger(), "the enemy is in view");
+    assert_eq!(
+        sim.component::<Travel>().target,
+        Pos { x: 0, y: 0 },
+        "the same-tick replan issued the retreat order — no next-tick lag"
+    );
+    assert_eq!(
+        sim.position(),
+        Pos { x: 0, y: 0 },
+        "the survivor is already fleeing"
+    );
+    assert_eq!(
+        sim.pocket_count(ItemKind::Rag),
+        0,
+        "the interrupted journey never realized its remaining steps"
+    );
+
+    // Tick 4: home is out of the enemy's range — danger cleared, so the
+    // replan selects the journey branch again (danger is geometry, not a
+    // memory). The walk order is re-issued when the gated step next
+    // validates and executes.
+    sim.tick_n(1);
+    assert!(!sim.danger(), "home is out of range");
+    assert_eq!(
+        sim.plan_names(),
+        ["select_missing", "move_to_item_safe", "pick_up_safe", "do_craft"],
+        "the journey is re-derived as soon as the danger clears"
+    );
+
+    // The passer-by moves on for good.
+    let enemy = sim
+        .world
+        .query_filtered::<Entity, With<Enemy>>()
+        .single(&sim.world)
+        .expect("the enemy is still around");
+    sim.world.despawn(enemy);
+
+    // And the episode completes — the interruption cost time, not the goal.
+    let mut ticks = 0;
+    while pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_none() {
+        ticks += 1;
+        assert!(ticks <= 40, "the survivor never resumed and finished (40 ticks)");
+        sim.tick_n(1);
+    }
+    assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());
+    assert_eq!(sim.position(), Pos { x: 4, y: 4 });
+    assert_eq!(sim.pocket_count(ItemKind::Spear), 1);
+    assert_eq!(kinds_count(&mut sim, ItemKind::Rag), 0);
     assert!(sim.idle());
 }

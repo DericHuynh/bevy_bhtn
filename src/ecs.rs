@@ -46,12 +46,17 @@
 //!    entities). The graph is the truth; the projection is what the planner
 //!    simulates.
 //!
-//! Together with the driver's **drift-replan loop** this models actions whose
-//! real duration exceeds a tick: the planner *simulates* the outcome as an
-//! effect (e.g. `Arrived(true)`), the movement system recomputes the truth
-//! every tick, and the driver's step-2 re-validation drops the plan until the
-//! world has actually caught up — each drop triggers a replan from reality
-//! next tick. See `tests/htn_cdda_world.rs` for the full pattern end to end.
+//! Together with the driver's **same-tick replan** this models dynamic
+//! worlds: the planner *simulates* the outcome as an effect (e.g.
+//! `Arrived(true)`), the movement system recomputes the truth every tick, and
+//! the driver's per-step re-validation walks the current plan checking
+//! preconditions against reality. A failed check drops the plan and **replans
+//! from reality in the same tick** — an enemy walking into view (a threat
+//! projection flipping a step's safety precondition) changes behavior the
+//! very tick it happens, because the fresh plan is selected against the world
+//! as it is *now*. See `tests/htn_cdda_world.rs` for the grounded scenario:
+//! an enemy appears mid-journey, the survivor flees the same tick, and
+//! resumes the craft when the danger passes.
 //!
 //! # Hot-reloading domains (Subsecond)
 //!
@@ -361,145 +366,172 @@ pub fn htn_ai_system(world: &mut World) {
         // so domain references (preconditions, effects, actions) stay alive
         // while the world itself is mutated.
         world.resource_scope(|world, config: bevy_ecs::prelude::Mut<HtnConfig>| {
-            // 1. Plan if planless. A per-agent [`SearchOverride`] component
-            // replaces the global strategy/budget for this entity.
-            if world
-                .get::<HtnAgent>(entity)
-                .is_some_and(|a| a.plan.is_none())
-            {
-                // LOD throttle: [`PlanEvery`] paces (re)planning to once every
-                // `n` runs while the agent sits planless. Execution of an
-                // existing plan is never delayed.
-                let every = world
-                    .get::<PlanEvery>(entity)
-                    .map(|p| p.0.max(1))
-                    .unwrap_or(1);
-                if every > 1 {
-                    let deferred = world.get_mut::<HtnAgent>(entity).is_some_and(|mut a| {
-                        if a.plan_deferral > 0 {
-                            a.plan_deferral -= 1;
-                            true
-                        } else {
-                            false
+            // The agent's turn: **at most two passes**. Pass 0 plans only if
+            // planless and executes one step. If the step's re-validation
+            // fails (the world drifted since planning — an enemy walked into
+            // view, the item was taken), the plan is dropped and pass 1
+            // **replans from reality in the same tick**: the fresh plan is
+            // selected against the world as it is *now* and executes
+            // immediately, so an interrupt changes behavior the very tick it
+            // happens instead of a tick later. Pass 1 is the last: if its
+            // plan also fails validation (a non-deterministic precondition
+            // oscillating between passes, or a system mutating mid-tick),
+            // the agent goes planless and retries next tick — bounded work
+            // per tick, no spinning.
+            'turn: for pass in 0..2u32 {
+                // 1. Plan if planless. A per-agent [`SearchOverride`]
+                // component replaces the global strategy/budget for this
+                // entity. The same-tick repair replan (pass 1) bypasses the
+                // [`PlanEvery`] throttle — the throttle paces *idle*
+                // replanning, and an execution interrupt deserves an
+                // immediate reaction; the attempt still resets the deferral,
+                // so subsequent planless ticks stay paced.
+                if world
+                    .get::<HtnAgent>(entity)
+                    .is_some_and(|a| a.plan.is_none())
+                {
+                    // LOD throttle: [`PlanEvery`] paces (re)planning to once
+                    // every `n` runs while the agent sits planless. Execution
+                    // of an existing plan is never delayed.
+                    let every = world
+                        .get::<PlanEvery>(entity)
+                        .map(|p| p.0.max(1))
+                        .unwrap_or(1);
+                    if every > 1 && pass == 0 {
+                        let deferred = world.get_mut::<HtnAgent>(entity).is_some_and(|mut a| {
+                            if a.plan_deferral > 0 {
+                                a.plan_deferral -= 1;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if deferred {
+                            break 'turn;
                         }
-                    });
-                    if deferred {
-                        return;
+                    }
+                    let root = config.domain.root;
+                    let registry = &config.domain.components;
+                    // One scratchpad, refreshed in place: planning, validation,
+                    // and the post-action re-extract all reuse the same buffer.
+                    let state = scratch
+                        .state
+                        .get_or_insert_with(|| PlanState::build(registry).finish());
+                    state.refresh(world, entity);
+                    let (strategy, sanity) = world
+                        .get::<SearchOverride>(entity)
+                        .map(|o| {
+                            (
+                                o.strategy
+                                    .clone()
+                                    .unwrap_or_else(|| config.strategy.clone()),
+                                o.sanity_limit,
+                            )
+                        })
+                        .unwrap_or_else(|| (config.strategy.clone(), None));
+                    let sanity = sanity.unwrap_or(config.sanity_limit);
+                    let mut planner = HtnPlanner::new(&config.domain);
+                    planner
+                        .set_lookahead_mode(config.lookahead)
+                        .set_sanity_limit(sanity)
+                        .set_strategy(strategy.clone());
+                    let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
+                    // A planning error (unregistered root or a genuinely
+                    // unsolvable state) is treated like an empty plan: the agent
+                    // stays planless and idles — it never wedges on a bad plan,
+                    // and under a [`PlanEvery`] throttle it retries at the
+                    // reduced cadence instead of every tick.
+                    let plan = (if config.debug_trace {
+                        planner.plan_traced(root, state, &mut trace_buf)
+                    } else {
+                        planner.plan(root, state)
+                    })
+                    .unwrap_or_default();
+                    if !trace_buf.is_empty() {
+                        world
+                            .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
+                            .write_batch(trace_buf.drain(..));
+                    }
+                    // An empty plan means "nothing to do" — store it as planless
+                    // so a later world change can trigger a real replan instead
+                    // of wedging the agent on a zero-length program.
+                    let plan = if plan.is_empty() { None } else { Some(plan) };
+                    if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
+                        agent.plan = plan;
+                        agent.cursor = 0;
+                        agent.plan_deferral = every.saturating_sub(1);
                     }
                 }
-                let root = config.domain.root;
+
+                // 2. Resolve the next step from the compiled program: a flat
+                // array index into the baked task array — no name lookups.
+                let Some(step_idx) = world.get::<HtnAgent>(entity).and_then(|a| {
+                    let plan = a.plan.as_ref()?;
+                    plan.step_task(a.cursor)
+                }) else {
+                    break 'turn;
+                };
+                let Some(Task::Primitive(primitive)) = config.domain.tasks.get(step_idx) else {
+                    break 'turn;
+                };
+
+                // 3. Validate the step against the real world: if the
+                // preconditions no longer hold (the world drifted since
+                // planning), the plan is dropped and — on the first pass — the
+                // agent replans from reality **this tick** (the loop's pass 1).
+                // The scratchpad is the shared driver buffer, refreshed in place.
                 let registry = &config.domain.components;
-                // One scratchpad, refreshed in place: planning, validation,
-                // and the post-action re-extract all reuse the same buffer.
                 let state = scratch
                     .state
                     .get_or_insert_with(|| PlanState::build(registry).finish());
                 state.refresh(world, entity);
-                let (strategy, sanity) = world
-                    .get::<SearchOverride>(entity)
-                    .map(|o| {
-                        (
-                            o.strategy
-                                .clone()
-                                .unwrap_or_else(|| config.strategy.clone()),
-                            o.sanity_limit,
-                        )
-                    })
-                    .unwrap_or_else(|| (config.strategy.clone(), None));
-                let sanity = sanity.unwrap_or(config.sanity_limit);
-                let mut planner = HtnPlanner::new(&config.domain);
-                planner
-                    .set_lookahead_mode(config.lookahead)
-                    .set_sanity_limit(sanity)
-                    .set_strategy(strategy.clone());
-                let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
-                // A planning error (unregistered root or a genuinely
-                // unsolvable state) is treated like an empty plan: the agent
-                // stays planless and idles — it never wedges on a bad plan,
-                // and under a [`PlanEvery`] throttle it retries at the
-                // reduced cadence instead of every tick.
-                let plan = (if config.debug_trace {
-                    planner.plan_traced(root, state, &mut trace_buf)
-                } else {
-                    planner.plan(root, state)
-                })
-                .unwrap_or_default();
-                if !trace_buf.is_empty() {
-                    world
-                        .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
-                        .write_batch(trace_buf.drain(..));
+                if !primitive.preconditions_met(state) {
+                    if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
+                        agent.plan = None;
+                        agent.cursor = 0;
+                    }
+                    if pass == 0 {
+                        continue 'turn;
+                    }
+                    // Defensive: the pass-1 plan already failed its own first
+                    // validation. Go planless; the next tick replans fresh.
+                    break 'turn;
                 }
-                // An empty plan means "nothing to do" — store it as planless
-                // so a later world change can trigger a real replan instead
-                // of wedging the agent on a zero-length program.
-                let plan = if plan.is_empty() { None } else { Some(plan) };
+
+                // 4. Execute: dispatch the action's commands (then flush so the
+                // effects observe post-action state), and commit the effects to
+                // the real components.
+                if let Some(action) = &primitive.action {
+                    let mut commands = world.commands();
+                    let mut entity_commands = commands.entity(entity);
+                    action(&mut entity_commands);
+                    drop(entity_commands);
+                    drop(commands);
+                    world.flush();
+                    // The action may have mutated planning components: re-extract
+                    // so effects apply on top of the post-action state.
+                    state.refresh(world, entity);
+                }
+                // Commit only the baked write slots (read-only effect parameters
+                // are never committed to the real entity).
+                let writes = primitive.write_slot_slice();
+                if !writes.is_empty() {
+                    primitive.apply_effects(state);
+                    state.write_back_with(world, entity, writes);
+                }
+
+                // 5. Advance the cursor (a finished plan is dropped for replan).
+                // One step per tick: the turn ends here even with passes left.
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
-                    agent.plan = plan;
-                    agent.cursor = 0;
-                    agent.plan_deferral = every.saturating_sub(1);
+                    agent.cursor += 1;
+                    let done = agent.plan.as_ref().is_some_and(|p| agent.cursor >= p.len());
+                    if done {
+                        agent.plan = None;
+                        agent.cursor = 0;
+                    }
                 }
-            }
-
-            // 2. Resolve the next step from the compiled program: a flat
-            // array index into the baked task array — no name lookups.
-            let Some(step_idx) = world.get::<HtnAgent>(entity).and_then(|a| {
-                let plan = a.plan.as_ref()?;
-                plan.step_task(a.cursor)
-            }) else {
-                return;
-            };
-            let Some(Task::Primitive(primitive)) = config.domain.tasks.get(step_idx) else {
-                return;
-            };
-
-            // 3. Validate the step against the real world: if the
-            // preconditions no longer hold (the world drifted since
-            // planning), drop the plan and replan next tick. The scratchpad
-            // is the shared driver buffer, refreshed in place.
-            let registry = &config.domain.components;
-            let state = scratch
-                .state
-                .get_or_insert_with(|| PlanState::build(registry).finish());
-            state.refresh(world, entity);
-            if !primitive.preconditions_met(state) {
-                if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
-                    agent.plan = None;
-                    agent.cursor = 0;
-                }
-                return;
-            }
-
-            // 4. Execute: dispatch the action's commands (then flush so the
-            // effects observe post-action state), and commit the effects to
-            // the real components.
-            if let Some(action) = &primitive.action {
-                let mut commands = world.commands();
-                let mut entity_commands = commands.entity(entity);
-                action(&mut entity_commands);
-                drop(entity_commands);
-                drop(commands);
-                world.flush();
-                // The action may have mutated planning components: re-extract
-                // so effects apply on top of the post-action state.
-                state.refresh(world, entity);
-            }
-            // Commit only the baked write slots (read-only effect parameters
-            // are never committed to the real entity).
-            let writes = primitive.write_slot_slice();
-            if !writes.is_empty() {
-                primitive.apply_effects(state);
-                state.write_back_with(world, entity, writes);
-            }
-
-            // 5. Advance the cursor (a finished plan is dropped for replan).
-            if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
-                agent.cursor += 1;
-                let done = agent.plan.as_ref().is_some_and(|p| agent.cursor >= p.len());
-                if done {
-                    agent.plan = None;
-                    agent.cursor = 0;
-                }
-            }
+                break 'turn;
+            } // 'turn
         });
     }
 
