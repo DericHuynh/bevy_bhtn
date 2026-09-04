@@ -239,14 +239,22 @@ pub trait IntoEffect<Args> {
 /// would alias — a soundness violation. (Repeated *shared* reads would be
 /// harmless, but they are rejected too for a single, simple rule.)
 /// Shared-reference preconditions may repeat freely.
-fn assert_distinct_slots(indices: &[usize]) {
+///
+/// Authoring errors are **soft-collected** into the recording registry and
+/// reported together by `HtnDomain::build` as one `HtnError::Builder` — the
+/// recording phase never panics on a bad closure, so one build call surfaces
+/// every authoring bug at once. The Effect is still constructed (with the
+/// aliased slot), but a domain whose build reports this error never bakes, so
+/// the closure is never callable.
+fn assert_distinct_slots(registry: &mut RegistryBuilder, indices: &[usize]) {
     for i in 0..indices.len() {
         for j in (i + 1)..indices.len() {
-            assert!(
-                indices[i] != indices[j],
-                "effect closure takes the same component type twice — a `&mut` \
-                 pair would alias; merge the parameters into one `&mut`"
-            );
+            if indices[i] == indices[j] {
+                registry.push_error(
+                    "effect closure takes the same component type twice — a `&mut` \
+                     pair would alias; merge the parameters into one `&mut`",
+                );
+            }
         }
     }
 }
@@ -326,9 +334,11 @@ macro_rules! impl_effect_tuple {
             fn build(self, registry: &mut RegistryBuilder) -> Effect {
                 $(let $p = <$p as PlanParam>::register(registry);)*
                 // Every parameter's slot must be distinct: a `&mut` pair
-                // would alias, and so would a `&mut`/`&` pair.
+                // would alias, and so would a `&mut`/`&` pair. Soft-collected:
+                // `build()` reports it as a `Builder` error instead of
+                // panicking mid-recording.
                 let all = &[$($p),*];
-                assert_distinct_slots(all);
+                assert_distinct_slots(registry, all);
                 #[allow(unused_mut)]
                 let mut writes: SmallVec<[usize; 4]> = SmallVec::new();
                 $(

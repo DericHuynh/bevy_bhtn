@@ -215,6 +215,10 @@ impl std::fmt::Debug for RegistryLayout {
 pub struct RegistryBuilder {
     layout: RegistryLayout,
     by_type: HashMap<TypeId, usize>,
+    /// Collected domain-authoring errors (e.g. an effect closure taking the
+    /// same component type twice). Recording soft-collects instead of
+    /// panicking; `HtnDomain::build` drains these into its `Builder` error.
+    errors: Vec<String>,
 }
 
 impl RegistryBuilder {
@@ -227,6 +231,18 @@ impl RegistryBuilder {
         let idx = self.layout.push_slot::<T>(std::any::type_name::<T>());
         self.by_type.insert(TypeId::of::<T>(), idx);
         idx
+    }
+
+    /// Soft-collect a domain-authoring error during recording. Baking turns
+    /// every collected error into a single `HtnError::Builder`, so one
+    /// `build()` call reports all authoring bugs at once.
+    pub(crate) fn push_error(&mut self, error: impl Into<String>) {
+        self.errors.push(error.into());
+    }
+
+    /// Drain the collected authoring errors (used by domain baking).
+    pub(crate) fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
     }
 
     /// Freeze the registry: the layout becomes immutably shared with every

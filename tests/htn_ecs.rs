@@ -2,7 +2,7 @@
 //! component, [`HtnConfig`], and the exclusive [`htn_ai_system`] driver's
 //! plan → validate → execute-one-step → replan loop over real components.
 
-use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
+use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig, PlanEvery};
 use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
@@ -369,4 +369,75 @@ mod hotpatch {
         fn _assert_component<T: PlanComponent>() {}
         _assert_component::<Extra>();
     }
+}
+
+// ---------------------------------------------------------------------------
+// LOD scheduling (`PlanEvery`) and unsolvable-domain legibility
+// ---------------------------------------------------------------------------
+
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Hits(pub u32);
+
+/// One-step domain: a planless agent replans and executes every run.
+fn always_hit_domain() -> HtnDomain {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(hit);
+    }
+    fn hit(task: &mut TaskBuilder) {
+        task.effect(|h: &mut Hits| h.0 += 1);
+    }
+    HtnDomain::from_root(root).build().unwrap()
+}
+
+/// `PlanEvery(n)` paces (re)planning to once every `n` runs while the agent
+/// sits planless: over 10 runs a throttled agent acts ⌈10/3⌉ = 4 times where
+/// an unthrottled one acts 10. Execution of an existing plan is never delayed
+/// (the first plan's single step executes on the same run it was planned).
+#[test]
+fn plan_every_throttles_replanning() {
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(always_hit_domain()));
+    let throttled = world.spawn((Hits(0), HtnAgent::default(), PlanEvery(3))).id();
+    let free = world.spawn((Hits(0), HtnAgent::default())).id();
+
+    for _ in 0..10 {
+        htn_ai_system(&mut world);
+    }
+
+    assert_eq!(
+        world.get::<Hits>(throttled).unwrap().0,
+        4,
+        "plans at runs 1, 4, 7, 10"
+    );
+    assert_eq!(world.get::<Hits>(free).unwrap().0, 10, "unthrottled control");
+}
+
+/// An agent whose domain genuinely has no decomposition gets `NoPlan` from
+/// the planner — the driver treats it like an empty plan (planless, idle) and
+/// keeps ticking without wedging or panicking, retrying at the `PlanEvery`
+/// cadence when one is present.
+#[test]
+fn unsolvable_domain_leaves_the_agent_planless_not_wedged() {
+    #[derive(Component, Clone, Default, Debug, PartialEq)]
+    struct Locked(bool);
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(impossible);
+    }
+    fn impossible(task: &mut TaskBuilder) {
+        task.precondition(|l: &Locked| l.0);
+    }
+    let domain = HtnDomain::from_root(root).build().unwrap();
+
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain));
+    let entity = world
+        .spawn((Locked(false), HtnAgent::default(), PlanEvery(2)))
+        .id();
+
+    for _ in 0..6 {
+        htn_ai_system(&mut world);
+    }
+    let agent = world.get::<HtnAgent>(entity).unwrap();
+    assert!(agent.plan.is_none(), "no plan is ever stored");
+    assert_eq!(agent.cursor, 0);
 }

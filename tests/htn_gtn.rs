@@ -13,7 +13,7 @@ use bevy_ecs::prelude::Component;
 /// `HtnPlanner::plan` with the root fn-item type inferred from the fn value
 /// (fn-item types cannot be named directly in turbofish).
 fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
-    planner.plan(_root, state)
+    planner.plan(_root, state).expect("plan")
 }
 
 // ---------------------------------------------------------------------------
@@ -163,12 +163,15 @@ mod repair_tasks {
 fn insertion_repairs_a_plan_that_would_otherwise_fail() {
     use repair_tasks::*;
     // Without insertion the chain is unsatisfiable: nothing sets `HasKey`.
+    // That is a genuine dead end — reported as `NoPlan`, never as an empty
+    // `Complete` plan (the legibility contract).
     let plain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&plain.components).finish();
     let mut planner = HtnPlanner::new(&plain);
-    let plan = plan_root(&mut planner, root, &state);
-    assert!(plan.is_complete());
-    assert!(plan.is_empty(), "no decomposition exists without insertion");
+    assert!(
+        matches!(planner.plan(root, &state), Err(bevy_bhtn::HtnError::NoPlan)),
+        "no decomposition exists without insertion"
+    );
 
     // With insertion (and `pick_key` registered as insertable) the search
     // backtracks into a gap and repairs with `pick_key` — which no method

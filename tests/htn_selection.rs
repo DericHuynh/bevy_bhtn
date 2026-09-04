@@ -21,7 +21,7 @@ use bevy_ecs::prelude::*;
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 fn task_index_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<usize> {
@@ -34,7 +34,7 @@ fn plan_traced_of<F: TaskFn>(
     state: &PlanState,
     trace: &mut Vec<DecompositionTrace>,
 ) -> Plan {
-    planner.plan_traced(_f, state, trace)
+    planner.plan_traced(_f, state, trace).expect("plan")
 }
 
 #[derive(Component, Clone, Default, Debug, PartialEq)]

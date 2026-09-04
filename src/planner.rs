@@ -34,6 +34,7 @@ use std::any::TypeId;
 use ustr::Ustr;
 
 use crate::domain::SelectionPolicy;
+use crate::error::{HtnError, HtnResult};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, LookaheadMode, TraceOutcome};
 use crate::tasks::TaskFn;
 
@@ -49,8 +50,11 @@ use crate::state::{PlanState, Slot};
 /// decomposition, or the best prefix cut out of a search that stopped early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlanStatus {
-    /// The search ran to completion: the plan is final — it either reaches a
-    /// terminal state or no decomposition exists (possibly empty).
+    /// The search ran to completion: the plan is final and reaches a terminal
+    /// state of the decomposition (possibly empty — a root whose only methods
+    /// are empty terminal branches). A root with *no* valid decomposition is
+    /// reported as [`HtnError::NoPlan`] by the planner, never as an empty
+    /// `Complete` plan.
     #[default]
     Complete,
     /// The search stopped early (sanity budget exhausted or fail-fast): this
@@ -75,15 +79,16 @@ const ADAPTIVE_SWEEP_TRIALS: u32 = 2;
 /// which have no function type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanRoot {
-    /// Start from this task function (resolved by `TypeId`).
-    Fn(TypeId),
+    /// Start from this task function (resolved by `TypeId`). The function's
+    /// `type_name` travels along for error diagnostics only.
+    Fn(TypeId, &'static str),
     /// Start from this task index directly.
     Index(usize),
 }
 
 impl<F: TaskFn> From<F> for PlanRoot {
     fn from(f: F) -> Self {
-        Self::Fn(f.task_type_id())
+        Self::Fn(f.task_type_id(), std::any::type_name::<F>())
     }
 }
 
@@ -504,11 +509,21 @@ impl<'a> HtnPlanner<'a> {
     /// ([`lookahead`]) proves the remaining sequence can possibly succeed;
     /// doomed methods are skipped at the frame and inevitable refinements
     /// (unique surviving methods) are pinned for when the planner reaches them.
-    pub fn plan(&mut self, root: impl Into<PlanRoot>, state: &PlanState) -> Plan {
-        match self.resolve_root(root) {
-            Some(idx) => self.plan_inner(idx, state, None),
-            None => Plan::default(),
-        }
+    ///
+    /// # Errors
+    ///
+    /// - [`HtnError::UnregisteredTask`] — the root function was never recorded
+    ///   in this domain (or the index is out of bounds).
+    /// - [`HtnError::NoPlan`] — the search space was exhausted with no
+    ///   complete decomposition: the domain genuinely cannot solve this root
+    ///   in this state. Symmetric with [`BackPlanner`](crate::back_planner)'s
+    ///   error. (An empty *successful* plan — a root whose decomposition is
+    ///   legitimately empty — is `Ok` with an empty `Complete` plan; the two
+    ///   are never conflated.) Budget truncation is *not* an error: a
+    ///   sanity-limited search returns `Ok` with a `Partial` plan.
+    pub fn plan(&mut self, root: impl Into<PlanRoot>, state: &PlanState) -> HtnResult<Plan> {
+        let idx = self.resolve_root(root)?;
+        self.plan_inner(idx, state, None)
     }
 
     /// Decompose `root` into a [`Plan`], appending one [`DecompositionTrace`]
@@ -523,19 +538,26 @@ impl<'a> HtnPlanner<'a> {
         root: impl Into<PlanRoot>,
         state: &PlanState,
         trace: &mut Vec<DecompositionTrace>,
-    ) -> Plan {
-        match self.resolve_root(root) {
-            Some(idx) => self.plan_inner(idx, state, Some(trace)),
-            None => Plan::default(),
-        }
+    ) -> HtnResult<Plan> {
+        let idx = self.resolve_root(root)?;
+        self.plan_inner(idx, state, Some(trace))
     }
 
-    /// Resolve a plan root to a task index (`None` = unregistered function or
-    /// out-of-bounds index — both yield the empty plan, never a panic).
-    fn resolve_root(&self, root: impl Into<PlanRoot>) -> Option<usize> {
+    /// Resolve a plan root to a task index. Errors carry the fn's `type_name`
+    /// (captured at conversion) or the offending index for diagnosis.
+    fn resolve_root(&self, root: impl Into<PlanRoot>) -> HtnResult<usize> {
         match root.into() {
-            PlanRoot::Fn(tid) => self.domain.task_index_by_type(tid),
-            PlanRoot::Index(idx) => (idx < self.domain.tasks.len()).then_some(idx),
+            PlanRoot::Fn(tid, name) => {
+                self.domain
+                    .task_index_by_type(tid)
+                    .ok_or(HtnError::UnregisteredTask {
+                        type_name: name.to_string(),
+                    })
+            }
+            PlanRoot::Index(idx) if idx < self.domain.tasks.len() => Ok(idx),
+            PlanRoot::Index(idx) => Err(HtnError::UnregisteredTask {
+                type_name: format!("<task index {idx}>"),
+            }),
         }
     }
 
@@ -545,11 +567,11 @@ impl<'a> HtnPlanner<'a> {
         root: usize,
         state: &PlanState,
         mut trace: Option<&mut Vec<DecompositionTrace>>,
-    ) -> Plan {
+    ) -> HtnResult<Plan> {
         // Custom searchers bypass the built-in machinery entirely: they own
         // their search (and their statistics); lookahead/sanity do not apply.
         if let HtnSearchStrategy::Custom(searcher) = &self.strategy {
-            return searcher.search(self.domain, state).unwrap_or_default();
+            return searcher.search(self.domain, state).ok_or(HtnError::NoPlan);
         }
         // Adaptive sweep streaks are per-plan: gating decisions are
         // deterministic for a given (domain, state) and re-learn on replan.
@@ -583,6 +605,11 @@ impl<'a> HtnPlanner<'a> {
         // `Complete` unless the search stops early (fail-fast or a defensive
         // exit); the sanity-limit return sets its own status.
         let mut status = PlanStatus::Complete;
+        // Set when the search backtracks past the root: the space is provably
+        // exhausted with no complete decomposition (an empty `Complete` plan
+        // from a legitimate empty decomposition is the drain-exit below, and
+        // the two must never be conflated — see `plan`'s error docs).
+        let mut exhausted = false;
         let mut stack: VecDeque<Step> = VecDeque::with_capacity(16);
         let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
@@ -657,11 +684,12 @@ impl<'a> HtnPlanner<'a> {
             count += 1;
             if count > sanity_limit {
                 // Budget exhausted: the recorded best (a complete plan, if any)
-                // or the current prefix — the search was cut short.
-                return match best {
+                // or the current prefix — the search was cut short, not
+                // exhausted, so this stays a `Partial` `Ok` (not `NoPlan`).
+                return Ok(match best {
                     Some(b) => b,
                     None => materialize(tasks, &plan, mtr.clone(), PlanStatus::Partial),
-                };
+                });
             }
 
             // A pending linearization retry: re-commit the same partial-order
@@ -705,6 +733,7 @@ impl<'a> HtnPlanner<'a> {
                             tasks,
                             &mut trace,
                         ) {
+                            exhausted = true;
                             break 'search;
                         }
                         continue 'search;
@@ -813,6 +842,7 @@ impl<'a> HtnPlanner<'a> {
                                 tasks,
                                 &mut trace,
                             ) {
+                                exhausted = true;
                                 break 'search;
                             }
                             continue 'search;
@@ -1089,6 +1119,7 @@ impl<'a> HtnPlanner<'a> {
                                 tasks,
                                 &mut trace,
                             ) {
+                                exhausted = true;
                                 break 'search;
                             }
                             continue;
@@ -1128,6 +1159,7 @@ impl<'a> HtnPlanner<'a> {
                         tasks,
                         &mut trace,
                     ) {
+                        exhausted = true;
                         break 'search;
                     }
                     continue;
@@ -1139,8 +1171,12 @@ impl<'a> HtnPlanner<'a> {
         }
 
         match best {
-            Some(b) => b,
-            None => materialize(tasks, &plan, mtr, status),
+            Some(b) => Ok(b),
+            // Backtracked past the root: no complete decomposition exists.
+            // Anything else breaking out early already set `Partial` and
+            // carries the best prefix as a non-error result.
+            None if exhausted => Err(HtnError::NoPlan),
+            None => Ok(materialize(tasks, &plan, mtr, status)),
         }
     }
 }

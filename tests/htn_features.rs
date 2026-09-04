@@ -738,7 +738,7 @@ fn closure_subtasks_record_unique_identities() {
     // Both closure steps execute.
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan(root, &state);
+    let plan = planner.plan(root, &state).expect("plan");
     assert_eq!(plan.task_names().len(), 2);
     let mut executed = state.clone();
     for &step in &plan.steps {
@@ -771,7 +771,7 @@ fn same_closure_value_dedupes_to_one_recorded_task() {
 
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan(root, &state);
+    let plan = planner.plan(root, &state).expect("plan");
     assert_eq!(plan.task_names().len(), 3, "each edge still executes");
     let mut executed = state.clone();
     for &step in &plan.steps {
@@ -865,7 +865,7 @@ fn fn_pointer_coercion_collapses_identity() {
     let domain = HtnDomain::from_root(root).build().expect("bakes");
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan(root, &state);
+    let plan = planner.plan(root, &state).expect("plan");
     assert_eq!(
         plan.task_names().len(),
         2,
@@ -1041,7 +1041,7 @@ fn expected_effects_do_not_apply_on_execution() {
         .set(Count(0))
         .finish();
     let mut planner = HtnPlanner::new(&domain);
-    let plan = planner.plan(travel_root, &state);
+    let plan = planner.plan(travel_root, &state).expect("plan");
     assert_eq!(plan.task_names(), ["approach", "arrive"]);
 
     // Execution applies `effects` only: arrive's real Count write lands, but

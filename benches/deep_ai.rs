@@ -39,7 +39,7 @@ use common::{
 /// Plan from `root` — `F` is inferred from the function item, so the lookup
 /// uses the same `TypeId` the domain recorded at bake time.
 fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
-    planner.plan(_root, state)
+    planner.plan(_root, state).expect("plan")
 }
 
 /// The supply cache a colonist draws from. Owned by the *cache* entity; read by

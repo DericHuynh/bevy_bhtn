@@ -15,7 +15,7 @@ use std::any::TypeId;
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {
@@ -193,10 +193,11 @@ fn duplicate_goal_fn_registration_is_a_bake_error() {
 }
 
 /// Planning from a task function that was never recorded in the domain yields
-/// an empty plan (never a panic) — the type-addressed analogue of the old
-/// unknown-name behavior, now keyed by the fn item's `TypeId`.
+/// An unregistered root function is a legible error (never a panic, never a
+/// silent empty plan) — the type-addressed analogue of the old unknown-name
+/// behavior, now keyed by the fn item's `TypeId`.
 #[test]
-fn unregistered_root_yields_an_empty_plan() {
+fn unregistered_root_yields_an_error() {
     fn root(task: &mut TaskBuilder) {
         task.branch().then(leaf);
     }
@@ -211,7 +212,12 @@ fn unregistered_root_yields_an_empty_plan() {
     assert_eq!(domain.task_index(never_registered), None);
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert!(plan_of(&mut planner, never_registered, &state).is_empty());
+    let err = planner.plan(never_registered, &state).unwrap_err();
+    assert!(
+        matches!(err, HtnError::UnregisteredTask { .. }),
+        "error names the offending fn: {err}"
+    );
+    assert!(err.to_string().contains("htn_builder"));
 }
 
 /// A task mixing compound (`branch`) and primitive (`effect`) declarations is

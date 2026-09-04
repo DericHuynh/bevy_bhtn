@@ -166,7 +166,7 @@ mod bhtn_side {
     /// Plan from `root` — `F` is inferred from the function item, so the
     /// lookup uses the same `TypeId` the domain recorded at bake time.
     fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
-        planner.plan(_root, state)
+        planner.plan(_root, state).expect("plan")
     }
 
     /// Single-actor episode: one plan, then execute every step.
@@ -228,7 +228,9 @@ mod bhtn_side {
             }
             let mut planner = HtnPlanner::new(&domain.0);
             planner.set_sanity_limit(DEEP_SANITY_LIMIT);
-            let plan = planner.plan(domain.0.root, &scratch.0);
+            let plan = planner
+                .plan(domain.0.root, &scratch.0)
+                .expect("deep chain plan");
             agent.plan = plan.steps;
             agent.cursor = 0;
         });

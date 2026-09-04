@@ -313,8 +313,14 @@ impl DomainBuilder {
         let wrapped = crate::gtn::apply_sharing(&mut self.rec)?;
         crate::gtn::apply_insertion(&mut self.rec, &wrapped)?;
 
-        if let Some(err) = self.rec.errors.first() {
-            return Err(HtnError::builder(err.clone()));
+        // Soft-collected recording errors (e.g. an effect closure taking the
+        // same component type twice) join the builder's validation errors, so
+        // one `build()` call reports every authoring bug at once instead of
+        // panicking on the first.
+        self.rec.errors.extend(self.rec.registry.take_errors());
+
+        if !self.rec.errors.is_empty() {
+            return Err(HtnError::builder(self.rec.errors.join("; ")));
         }
 
         // Extra roots (adversarial planning) must be compound tasks.

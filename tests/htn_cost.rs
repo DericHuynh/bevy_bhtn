@@ -33,7 +33,7 @@ use bevy_ecs::prelude::*;
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {

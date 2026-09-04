@@ -24,6 +24,7 @@ fn plan_of<F: TaskFn>(domain: &bevy_bhtn::HtnDomain, _root: F, state: &PlanState
     let mut planner = HtnPlanner::new(domain);
     planner
         .plan(_root, state)
+        .expect("plan")
         .task_names()
         .iter()
         .map(|n| n.to_string())
@@ -34,6 +35,7 @@ fn plan_of<F: TaskFn>(domain: &bevy_bhtn::HtnDomain, _root: F, state: &PlanState
 fn plan_of_with<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Vec<String> {
     planner
         .plan(_root, state)
+        .expect("plan")
         .task_names()
         .iter()
         .map(|n| n.to_string())
@@ -374,7 +376,7 @@ fn run_replan_cycle<F: TaskFn + Copy>(
     let mut planner = HtnPlanner::new(domain);
     let mut plans = Vec::with_capacity(cycles);
     for _ in 0..cycles {
-        let plan = planner.plan(_root, &state);
+        let plan = planner.plan(_root, &state).expect("replan cycle");
         plans.push(plan.task_names().iter().map(|n| n.to_string()).collect());
         execute_plan_step(domain, &mut state, &plan);
     }

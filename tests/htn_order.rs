@@ -24,17 +24,17 @@ use bevy_bhtn::domain::Task;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::order::SubtaskOrder;
 use bevy_bhtn::planner::{HtnPlanner, Plan};
+use bevy_bhtn::selection::HtnSearchStrategy;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::{TaskBuilder, TaskFn};
 use bevy_bhtn::{HtnDomain, TaskSummary};
-use bevy_bhtn::selection::HtnSearchStrategy;
 use bevy_ecs::prelude::*;
 
 /// A task fn's item type cannot be named directly, so the lookup-by-type API
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 fn summary_of<F: TaskFn>(domain: &HtnDomain, _f: F) -> Option<&TaskSummary> {

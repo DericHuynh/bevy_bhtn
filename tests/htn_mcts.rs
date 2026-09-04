@@ -102,7 +102,7 @@ fn execute(domain: &HtnDomain, state: &PlanState, plan: &[u32]) -> PlanState {
 /// `HtnPlanner::plan` with the root fn-item type inferred from the fn value
 /// (fn-item types cannot be named directly in turbofish).
 fn plan_root<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Plan {
-    planner.plan(_root, state)
+    planner.plan(_root, state).expect("plan")
 }
 
 // ---------------------------------------------------------------------------

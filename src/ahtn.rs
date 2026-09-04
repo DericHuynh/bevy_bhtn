@@ -235,14 +235,6 @@ impl<'a> Ahtn<'a> {
             Task::Primitive(p) => {
                 // Consistency: an already-planned primitive that cannot
                 // execute loses the branch for its player (γ(s, a) = ⊥).
-                if std::env::var("AHTN_DEBUG").is_ok() {
-                    println!(
-                        "  exec {} for {:?}: met={}",
-                        self.domain.tasks[head].name(),
-                        side,
-                        p.preconditions_met(state)
-                    );
-                }
                 if !p.preconditions_met(state) {
                     return (side.worst(), Vec::new());
                 }

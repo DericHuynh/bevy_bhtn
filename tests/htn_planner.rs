@@ -26,7 +26,9 @@ use ustr::Ustr;
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner
+        .plan(_f, state)
+        .unwrap_or_else(|e| panic!("plan of {} failed: {e}", std::any::type_name::<F>()))
 }
 
 fn bed_backward<F: GoalFn>(bed: &HtnTestBed, _f: F, state: &PlanState) -> HtnResult<Vec<Ustr>> {
@@ -689,14 +691,21 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
 /// `Plan::status` tells a finished decomposition from one the search cut
 /// short: terminating domains plan `Complete`; a decomposition that exceeds
 /// the sanity budget returns the best `Partial` prefix; a search that
-/// exhausts every method is `Complete` (and empty).
+/// exhausts every method is the `NoPlan` error — never an empty `Complete`
+/// plan (the legibility contract).
 #[test]
 fn plan_status_reports_complete_vs_partial() {
-    // Terminating domain: the plan is final.
+    // Terminating domain: the plan is final. (The state must be one a plan
+    // actually exists for — the bench's canonical scratchpad. An all-default
+    // scratchpad has Energy(0), and this domain genuinely has no decomposition
+    // there: that case is the `NoPlan` error pinned below, not an empty
+    // `Complete` plan.)
     let miner = common::miner_domain();
-    let state = PlanState::build(&miner.components).finish();
+    let state = common::bench_common::miner_scratch(&miner, 0);
     let mut planner = HtnPlanner::new(&miner);
-    assert!(plan_of(&mut planner, earn_gold, &state).is_complete());
+    let plan = plan_of(&mut planner, earn_gold, &state);
+    assert!(plan.is_complete());
+    assert!(!plan.is_empty(), "the miner actually mines");
 
     // Budget-truncated: with the look-ahead off, the gate domain's doomed
     // method must enumerate 2^12 gate combinations — the default sanity
@@ -720,8 +729,9 @@ fn plan_status_reports_complete_vs_partial() {
     assert!(done.is_complete());
     assert_eq!(done.task_names(), ["strike", "gate_final"]);
 
-    // Exhausted search: no method can ever apply — the empty result is
-    // final, not truncated.
+    // Exhausted search: no method can ever apply — an error, never an
+    // empty `Complete` plan (an empty *success* is a root whose decomposition
+    // legitimately has zero steps; this domain has no decomposition at all).
     #[derive(Component, Clone, Default, Debug)]
     struct Wall(bool);
     fn impossible(task: &mut TaskBuilder) {
@@ -733,9 +743,21 @@ fn plan_status_reports_complete_vs_partial() {
     let dead = HtnDomain::from_root(impossible).build().unwrap();
     let state = PlanState::build(&dead.components).finish();
     let mut planner = HtnPlanner::new(&dead);
-    let plan = plan_of(&mut planner, impossible, &state);
-    assert!(plan.is_complete());
-    assert!(plan.is_empty());
+    assert!(matches!(
+        planner.plan(impossible, &state),
+        Err(HtnError::NoPlan)
+    ));
+
+    // The contrast case: a root whose decomposition legitimately produces
+    // zero steps plans to an empty `Complete` `Ok`.
+    fn nothing_to_do(task: &mut TaskBuilder) {
+        task.branch();
+    }
+    let trivial = HtnDomain::from_root(nothing_to_do).build().unwrap();
+    let state = PlanState::build(&trivial.components).finish();
+    let mut planner = HtnPlanner::new(&trivial);
+    let plan = plan_of(&mut planner, nothing_to_do, &state);
+    assert!(plan.is_complete() && plan.is_empty());
 }
 
 /// The plan entrypoints are consolidated: one `plan`/`plan_traced` pair that
@@ -758,11 +780,22 @@ fn plan_roots_accept_functions_and_indices_alike() {
 
     // Function form and index form address the same task.
     assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["leaf"]);
-    assert_eq!(planner.plan(domain.root, &state).task_names(), ["leaf"]);
+    assert_eq!(
+        planner
+            .plan(domain.root, &state)
+            .expect("plan")
+            .task_names(),
+        ["leaf"]
+    );
 
-    // An out-of-bounds index yields the empty plan instead of panicking.
-    assert!(planner.plan(999, &state).is_empty());
-    assert!(planner.plan(usize::MAX, &state).is_empty());
+    // An unregistered root is an error, not a silent empty plan: the fn form
+    // carries its `type_name`, the index form the offending index.
+    let err = planner.plan(999, &state).unwrap_err();
+    assert!(matches!(err, HtnError::UnregisteredTask { .. }));
+    assert_eq!(
+        planner.plan(usize::MAX, &state).unwrap_err().to_string(),
+        "Task function `<task index 18446744073709551615>` was never recorded in this domain"
+    );
 }
 
 /// `LookaheadMode::Adaptive` gating: the sweep is skipped exactly where it
@@ -786,7 +819,11 @@ fn adaptive_lookahead_keeps_multi_step_refutations_and_the_budget() {
     let mut always = HtnPlanner::new(&domain);
     always.set_lookahead_mode(LookaheadMode::Always);
     let always_plan = plan_of(&mut always, doomed_tasks::act, &state);
-    assert_eq!(always_plan.task_names(), ["safe"], "Always refutes the doomed branch");
+    assert_eq!(
+        always_plan.task_names(),
+        ["safe"],
+        "Always refutes the doomed branch"
+    );
     assert!(always_plan.is_complete());
 
     let mut adaptive = HtnPlanner::new(&domain);
@@ -838,8 +875,10 @@ fn adaptive_lookahead_skips_single_step_sweeps_safely() {
 
     let mut adaptive = HtnPlanner::new(&domain);
     adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
-    let plan = plan_of(&mut adaptive, root, &state);
-    assert!(plan.is_complete() && plan.is_empty(), "backtracking finds the same empty plan");
+    assert!(
+        matches!(adaptive.plan(root, &state), Err(HtnError::NoPlan)),
+        "backtracking exhausts the same dead end (now as NoPlan)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -876,9 +915,15 @@ fn regression_adaptive_skipped_sweeps_do_not_attach_stale_pins() {
     }
     // The selector whose branch depends on the current depth.
     fn gate(task: &mut TaskBuilder) {
-        task.branch().precondition(|d: &Depth| d.0 == 0).then(advance0);
-        task.branch().precondition(|d: &Depth| d.0 == 1).then(advance1);
-        task.branch().precondition(|d: &Depth| d.0 == 2).then(advance2);
+        task.branch()
+            .precondition(|d: &Depth| d.0 == 0)
+            .then(advance0);
+        task.branch()
+            .precondition(|d: &Depth| d.0 == 1)
+            .then(advance1);
+        task.branch()
+            .precondition(|d: &Depth| d.0 == 2)
+            .then(advance2);
     }
     // A single-subtask method over a COMPOUND: shape-skipped under Adaptive,
     // so its subtask occurrence would (pre-fix) inherit the stale pin of
@@ -940,7 +985,10 @@ fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
     }
     fn root2(task: &mut TaskBuilder) {
         // Dead-ends at depth 2 (gate's precondition definitely fails).
-        task.branch().precondition(|d: &Depth| d.0 <= 2).then(gate).then(root2);
+        task.branch()
+            .precondition(|d: &Depth| d.0 <= 2)
+            .then(gate)
+            .then(root2);
         // Terminal at depth 2.
         task.branch().precondition(|d: &Depth| d.0 == 2);
     }
@@ -960,7 +1008,9 @@ fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
         let mut planner = HtnPlanner::new(&domain);
         planner.set_lookahead_mode(mode);
         let mut trace = Vec::new();
-        let plan = planner.plan_traced(root2, &state, &mut trace);
+        let plan = planner
+            .plan_traced(root2, &state, &mut trace)
+            .expect("plan");
         assert_eq!(
             plan.task_names(),
             ["gate", "gate"],
@@ -973,3 +1023,4 @@ fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
         );
     }
 }
+

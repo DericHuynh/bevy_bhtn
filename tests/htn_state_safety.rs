@@ -20,7 +20,7 @@ use bevy_ecs::prelude::*;
 /// is reached through these inference helpers: the fn value pins `F` to the
 /// fn item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 fn plan_goal<F: GoalFn>(back: &mut BackPlanner<'_>, _f: F, state: &PlanState) -> HtnResult<Plan> {
@@ -96,6 +96,9 @@ impl Drop for Name {
 
 #[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
 struct Gold(pub i32);
+
+#[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
+struct Ore(pub i32);
 
 // ---------------------------------------------------------------------------
 // Pool lifetime
@@ -381,9 +384,10 @@ fn high_alignment_slot_is_placed_correctly() {
 // ---------------------------------------------------------------------------
 
 /// An effect closure taking `&mut` to the same component type twice would
-/// alias one slot — rejected when the effect is compiled (during recording).
+/// alias one slot. Rejection is **soft-collected** during recording and
+/// reported by `build()` as a `Builder` error — never a panic — so one build
+/// call can report every authoring bug at once.
 #[test]
-#[should_panic(expected = "same component type twice")]
 fn duplicate_mut_params_are_rejected_at_build() {
     fn root(task: &mut TaskBuilder) {
         task.branch().then(broken);
@@ -394,7 +398,43 @@ fn duplicate_mut_params_are_rejected_at_build() {
             b.0 = 2;
         });
     }
-    let _ = HtnDomain::from_root(root).build();
+    let err = HtnDomain::from_root(root)
+        .build()
+        .expect_err("aliased effect slots are a builder error");
+    assert!(
+        err.to_string().contains("same component type twice"),
+        "error names the aliasing problem: {err}"
+    );
+}
+
+/// Regression: recording must survive multiple bad closures (and unrelated
+/// good ones) and report **every** authoring bug in one `build()` — the old
+/// `assert!` aborted on the first.
+#[test]
+fn build_reports_every_authoring_error_at_once() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().then(broken_a).then(good).then(broken_b);
+    }
+    fn broken_a(task: &mut TaskBuilder) {
+        task.effect(|a: &mut Gold, b: &mut Gold| {
+            let _ = (a, b);
+        });
+    }
+    fn good(task: &mut TaskBuilder) {
+        task.effect(|g: &mut Gold| g.0 += 1);
+    }
+    fn broken_b(task: &mut TaskBuilder) {
+        task.effect(|a: &mut Ore, b: &mut Ore| {
+            let _ = (a, b);
+        });
+    }
+    let err = HtnDomain::from_root(root).build().unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(
+        msg.matches("same component type twice").count(),
+        2,
+        "both aliased closures are reported together: {msg}"
+    );
 }
 
 /// Repeated `&mut` parameters are fine on preconditions (shared references
@@ -798,7 +838,10 @@ fn frozen_registry_resolves_the_builder_slot_map() {
     assert_eq!(frozen.get::<Name>(), Some(name_idx));
     assert_eq!(frozen.get::<Energy2>(), Some(energy_idx));
     struct NeverRegistered;
-    assert!(!frozen.contains::<NeverRegistered>(), "unregistered types miss");
+    assert!(
+        !frozen.contains::<NeverRegistered>(),
+        "unregistered types miss"
+    );
 }
 
 /// `PlanState::get_by_type`/`get_mut_by_type` resolve through the same map:
@@ -820,5 +863,9 @@ fn plan_state_type_addressed_reads_roundtrip() {
     // The raw slot-index path sees the type-addressed write (one pool, one slot).
     let energy_slot = frozen.get::<Energy2>().unwrap();
     assert_eq!(state.get::<Energy2>(energy_slot), &Energy2(9));
-    assert_eq!(state.get_by_type::<Gold>(), Some(&Gold(7)), "adjacent slot untouched");
+    assert_eq!(
+        state.get_by_type::<Gold>(),
+        Some(&Gold(7)),
+        "adjacent slot untouched"
+    );
 }

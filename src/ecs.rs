@@ -128,6 +128,8 @@ use bevy_ecs::world::World;
 
 use crate::domain::HtnDomain;
 use crate::domain::Task;
+/// Used by the hot-reload rebuild closure; inert without the feature.
+#[cfg_attr(not(feature = "hotpatching"), allow(unused_imports))]
 use crate::error::HtnResult;
 use crate::planner::{HtnPlanner, Plan};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, LookaheadMode, SearchOverride};
@@ -144,7 +146,24 @@ pub struct HtnAgent {
     pub plan: Option<Plan>,
     /// Index into [`Self::plan`]'s task list of the next step to execute.
     pub cursor: usize,
+    /// LOD bookkeeping for [`PlanEvery`]: how many more driver runs this
+    /// agent must sit planless before it may plan again. Internal state —
+    /// not part of the agent's game-facing data.
+    pub plan_deferral: u32,
 }
+
+/// Level-of-detail throttle: an agent carrying this component plans **at most
+/// once every `n` runs** of [`htn_ai_system`] while it sits planless — the
+/// driver's answer to "far away NPCs should think less often". Execution of an
+/// already-planned plan is never delayed; only (re)planning is paced. Agents
+/// with an active plan or without this component are unaffected (`n <= 1`
+/// disables the throttle).
+///
+/// A planning attempt (successful or not) resets the deferral to `n - 1`, so
+/// an agent whose domain genuinely has no plan retries at the same reduced
+/// cadence instead of burning a replan every tick.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct PlanEvery(pub u32);
 
 /// The planner's world-side configuration: domain and planner tuning.
 #[derive(Resource)]
@@ -348,6 +367,26 @@ pub fn htn_ai_system(world: &mut World) {
                 .get::<HtnAgent>(entity)
                 .is_some_and(|a| a.plan.is_none())
             {
+                // LOD throttle: [`PlanEvery`] paces (re)planning to once every
+                // `n` runs while the agent sits planless. Execution of an
+                // existing plan is never delayed.
+                let every = world
+                    .get::<PlanEvery>(entity)
+                    .map(|p| p.0.max(1))
+                    .unwrap_or(1);
+                if every > 1 {
+                    let deferred = world.get_mut::<HtnAgent>(entity).is_some_and(|mut a| {
+                        if a.plan_deferral > 0 {
+                            a.plan_deferral -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if deferred {
+                        return;
+                    }
+                }
                 let root = config.domain.root;
                 let registry = &config.domain.components;
                 // One scratchpad, refreshed in place: planning, validation,
@@ -374,11 +413,17 @@ pub fn htn_ai_system(world: &mut World) {
                     .set_sanity_limit(sanity)
                     .set_strategy(strategy.clone());
                 let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
-                let plan = if config.debug_trace {
+                // A planning error (unregistered root or a genuinely
+                // unsolvable state) is treated like an empty plan: the agent
+                // stays planless and idles — it never wedges on a bad plan,
+                // and under a [`PlanEvery`] throttle it retries at the
+                // reduced cadence instead of every tick.
+                let plan = (if config.debug_trace {
                     planner.plan_traced(root, state, &mut trace_buf)
                 } else {
                     planner.plan(root, state)
-                };
+                })
+                .unwrap_or_default();
                 if !trace_buf.is_empty() {
                     world
                         .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
@@ -391,6 +436,7 @@ pub fn htn_ai_system(world: &mut World) {
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.plan = plan;
                     agent.cursor = 0;
+                    agent.plan_deferral = every.saturating_sub(1);
                 }
             }
 

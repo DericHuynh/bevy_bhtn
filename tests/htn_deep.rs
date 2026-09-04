@@ -26,7 +26,7 @@ use common::{
 /// is reached through this inference helper: the fn value pins `F` to the fn
 /// item's unique type, resolved through the baked `TypeId` index.
 fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) -> Plan {
-    planner.plan(_f, state)
+    planner.plan(_f, state).expect("plan")
 }
 
 #[test]

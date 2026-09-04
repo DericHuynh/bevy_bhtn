@@ -48,6 +48,7 @@ impl HtnTestBed {
         let mut planner = HtnPlanner::new(&self.domain);
         planner
             .plan(self.domain.root, state)
+            .expect("forward plan")
             .task_names()
             .to_vec()
     }
@@ -58,6 +59,7 @@ impl HtnTestBed {
         planner.set_lookahead(lookahead);
         planner
             .plan(self.domain.root, state)
+            .expect("forward plan")
             .task_names()
             .to_vec()
     }

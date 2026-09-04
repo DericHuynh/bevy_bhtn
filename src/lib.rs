@@ -52,11 +52,72 @@
 //! let domain = HtnDomain::from_root(engage).build().unwrap();
 //! # let _ = domain;
 //! ```
+//!
+//! # Planning failures are values, not surprises
+//!
+//! Both planners return [`Result`](HtnResult). A search space exhausted with
+//! no valid decomposition is [`HtnError::NoPlan`] — the forward planner never
+//! reports a genuine dead end as an empty `Complete` plan (an empty *success*
+//! — a root whose decomposition is legitimately empty — is `Ok` and
+//! distinguishable). Budget truncation is not an error: it comes back as an
+//! `Ok` [`Plan`] with [`PlanStatus::Partial`]. Domain-authoring mistakes
+//! (mixed task declarations, aliased effect slots, ...) are collected during
+//! recording and reported together by `build()` as one `HtnError::Builder` —
+//! one build call surfaces every bug at once.
+//!
+//! # Generic tasks: one function, many identities
+//!
+//! Because a task's identity is its function's type, **each monomorphization
+//! of a generic function is a distinct task** — `gather::<Wood>` and
+//! `gather::<Stone>` are separate, valid tasks with separate preconditions,
+//! effects, and summaries, with zero copy-pasted near-identical branches per
+//! resource type. This is the idiomatic way to keep a large domain (a
+//! CDDA-style long tail of repetitive content) compact:
+//!
+//! ```
+//! use bevy_bhtn::prelude::*;
+//! use bevy_ecs::prelude::*;
+//!
+//! #[derive(Component, Clone, Default, Debug)] struct Wood(pub u32);
+//! #[derive(Component, Clone, Default, Debug)] struct Stone(pub u32);
+//!
+//! /// The per-resource behavior the generic task needs.
+//! trait Deplete { fn deplete(&mut self) -> bool; }
+//! impl Deplete for Wood { fn deplete(&mut self) -> bool { self.0 = self.0.saturating_sub(1); true } }
+//! impl Deplete for Stone { fn deplete(&mut self) -> bool { self.0 = self.0.saturating_sub(1); true } }
+//!
+//! // One generic task function — every `T` it is instantiated with bakes
+//! // as its own task with its own `TypeId`, name, and summaries.
+//! fn gather<T: PlanComponent + Deplete>(task: &mut TaskBuilder) {
+//!     task.effect(|res: &mut T| { res.deplete(); });
+//! }
+//!
+//! fn build_supplies(task: &mut TaskBuilder) {
+//!     task.branch()
+//!         .precondition(|w: &Wood| w.0 > 0)
+//!         .then(gather::<Wood>);
+//!     task.branch()
+//!         .precondition(|s: &Stone| s.0 > 0)
+//!         .then(gather::<Stone>);
+//! }
+//!
+//! let domain = HtnDomain::from_root(build_supplies).build().unwrap();
+//! // The two monomorphizations are distinct, individually addressable tasks:
+//! assert_ne!(domain.task_index(gather::<Wood>), domain.task_index(gather::<Stone>));
+//! ```
+//!
+//! Domains that mix compiled behaviors with data-driven content (mods,
+//! JSON-defined recipes) can use this as a task-factory seam: data describes
+//! the shape (preconditions as predicates over known fields, an effect as a
+//! verb + resource pair), and a startup pass records the matching
+//! monomorphizations into the same flat graph — mods get planner-backed
+//! behavior without touching Rust.
 
 #![deny(missing_docs)]
 
 pub mod ahtn;
 pub mod back_planner;
+pub mod considerations;
 pub mod domain;
 pub mod ecs;
 pub mod error;
@@ -82,6 +143,7 @@ pub use tasks::*;
 pub mod prelude {
     pub use crate::ahtn::*;
     pub use crate::back_planner::*;
+    pub use crate::considerations::*;
     pub use crate::domain::*;
     pub use crate::ecs::*;
     pub use crate::error::*;

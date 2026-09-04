@@ -24,8 +24,13 @@ pub enum HtnError {
         type_name: String,
     },
 
-    /// A back-plan could not reach the goal state.
-    #[error("No plan reaches the goal state from the initial state")]
+    /// Planning failed: the search space was exhausted with no complete
+    /// decomposition. For [`BackPlanner`](crate::back_planner) this means no
+    /// chain of primitives reaches the goal; for the forward planner it means
+    /// the domain genuinely cannot solve the root task in this state (an
+    /// empty *successful* plan is `Ok`, never this error). Distinct from
+    /// budget truncation, which is a `Partial` [`Plan`](crate::planner::Plan).
+    #[error("No plan could be found: the search space was exhausted with no valid decomposition")]
     NoPlan,
 
     /// The planner exceeded its internal step budget (defensive).
