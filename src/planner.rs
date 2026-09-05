@@ -574,7 +574,7 @@ struct SearchCtx<'a> {
 /// cheaply across turns.
 pub struct HtnPlanner<'a> {
     domain: &'a HtnDomain,
-    /// The look-ahead gating mode (default: [`Always`](LookaheadMode::Always)).
+    /// The look-ahead gating mode (default: [`Adaptive`](LookaheadMode::Adaptive)).
     lookahead: LookaheadMode,
     /// Decomposition-step budget before the best partial plan is returned
     /// (default: 100).
@@ -614,7 +614,8 @@ impl<'a> HtnPlanner<'a> {
     }
 
     /// Set the look-ahead gating mode (see [`LookaheadMode`]; the default is
-    /// [`Always`](LookaheadMode::Always) — [`Off`](LookaheadMode::Off) falls
+    /// [`Adaptive`](LookaheadMode::Adaptive) — [`Always`](LookaheadMode::Always)
+    /// sweeps every commitment, [`Off`](LookaheadMode::Off) falls
     /// back to plain MTR backtracking, useful for A/B benchmarking and for
     /// domains where the sweep's per-commitment cost outweighs its pruning).
     pub fn set_lookahead_mode(&mut self, mode: LookaheadMode) -> &mut Self {

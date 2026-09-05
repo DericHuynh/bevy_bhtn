@@ -71,11 +71,12 @@ pub trait Searcher: Send + Sync {
 /// check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LookaheadMode {
-    /// Sweep before every method commitment (the default; full refutation
-    /// and pin coverage).
-    #[default]
+    /// Sweep before every method commitment (full refutation and pin
+    /// coverage).
     Always,
-    /// Sweep only where it pays for itself, in three tiers per commitment:
+    /// Sweep only where it pays for itself, in three tiers per commitment
+    /// (the default — on wide/deep selector domains it plans in about half
+    /// the time of [`Always`](Self::Always) at plan-identical quality):
     ///
     /// 1. **Skip** — single-subtask, totally-ordered methods with a
     ///    terminating step (finite `min_yield`): the next queue pop performs
@@ -97,6 +98,7 @@ pub enum LookaheadMode {
     /// refutation or pin would have fired at a downgraded/skipped site: the
     /// search descends and discovers the dead end instead, so under a tight
     /// sanity budget a refuted `Complete` can become a truncated `Partial`.
+    #[default]
     Adaptive,
     /// Never sweep (plain MTR backtracking).
     Off,

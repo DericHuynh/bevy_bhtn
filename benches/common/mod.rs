@@ -51,25 +51,36 @@ pub enum Location {
 
 /// The bench's deterministic per-entity initial components (`i`-th entity of
 /// the spawn batch).
+///
+/// The residue classes must stay inside the domain's **solvable envelope**:
+/// the canonical miner has no wired-in `eat`/`sleep` (they are defined but
+/// unreferenced by `earn_gold`), so every earning step's `hunger < 75` makes
+/// a seed with `i % 60 ∈ 55..60` genuinely unplannable (`Err(NoPlan)`) — that
+/// span is why the modulus is 55 (hunger 20..74), not 60. The full-envelope
+/// solvability pin in `tests/htn_bench_plans.rs` enforces this for every
+/// residue class of the spawn batch.
 pub fn miner_components(i: usize) -> impl Bundle {
     (
         Gold((i % 5) as i32),
         HasOre(i.is_multiple_of(3)),
         HasMetal(i.is_multiple_of(7)),
         Energy(80 - (i % 40) as i32),
-        Hunger(20 + (i % 60) as i32),
+        Hunger(20 + (i % 55) as i32),
         Location::Outside,
     )
 }
 
 /// The bench's deterministic initial scratchpad for the `i`-th actor.
+///
+/// Same solvable-envelope contract as [`miner_components`] (hunger stays
+/// below the 75 work threshold).
 pub fn miner_scratch(domain: &HtnDomain, i: usize) -> PlanState {
     let (gold, has_ore, has_metal, energy, hunger) = (
         (i % 5) as i32,
         i.is_multiple_of(3),
         i.is_multiple_of(7),
         80 - (i % 40) as i32,
-        20 + (i % 60) as i32,
+        20 + (i % 55) as i32,
     );
     PlanState::build(&domain.components)
         .set(Gold(gold))

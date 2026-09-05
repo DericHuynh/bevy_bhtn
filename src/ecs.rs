@@ -305,7 +305,7 @@ pub struct HtnConfig {
     /// [`DepthFirst`]: HtnSearchStrategy::DepthFirst
     pub strategy: HtnSearchStrategy,
     /// The forward planner's look-ahead gating mode (default
-    /// [`LookaheadMode::Always`]).
+    /// [`LookaheadMode::Adaptive`]).
     pub lookahead: LookaheadMode,
     /// The forward planner's decomposition-step budget (default `100`).
     pub sanity_limit: usize,

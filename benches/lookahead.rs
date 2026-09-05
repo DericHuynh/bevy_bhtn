@@ -2,8 +2,8 @@
 //!
 //! Measures what the look-ahead sweep (`src/lookahead.rs`, Olz & Bercher SoCS
 //! 2023) buys — and what it costs — by planning the **same domains** (the
-//! shared function-defined fixtures) with [`HtnPlanner::set_lookahead`] on vs
-//! off, each running the same **plan → execute-the-full-plan** episode per
+//! shared function-defined fixtures) with [`HtnPlanner::set_lookahead_mode`] across
+//! the Off / Adaptive / Always modes, each running the same **plan → execute-the-full-plan** episode per
 //! measured iteration (state reset per iteration, so every iteration does
 //! identical work):
 //!

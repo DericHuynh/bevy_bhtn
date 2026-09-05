@@ -74,7 +74,7 @@ fn miner_bench_states_plan_exactly() {
 
     // Representative entities of the bench's spawn batch (`i`-th entity):
     // every residue class of gold (i%5), ore (i%3), metal (i%7), energy
-    // (i%40), hunger (i%60).
+    // (i%40), hunger (i%55 — the solvable envelope; see `miner_scratch`).
     let expected: &[(usize, &[&str])] = &[
         // Starts holding metal (i%7==0): sells it, then mines to top up.
         (
@@ -227,6 +227,52 @@ fn miner_bench_states_plan_exactly() {
                 "go_to_outside",
             ],
         ),
+        // Seeds 55+ were the *unplannable* classes under the old i%60 hunger
+        // span (hunger 75..79 — too hungry for every work step, no eat task
+        // wired in): gold 0, empty-handed (55 % 3 = 1 is not a multiple of 3)
+        // → the full mine → smelt → sell loop, three times.
+        (
+            55,
+            &[
+                "go_to_ore",
+                "mine_ore",
+                "go_to_smelter",
+                "smelt_ore",
+                "go_to_outside",
+                "go_to_merchant",
+                "sell_metal",
+                "go_to_outside",
+                "go_to_ore",
+                "mine_ore",
+                "go_to_smelter",
+                "smelt_ore",
+                "go_to_outside",
+                "go_to_merchant",
+                "sell_metal",
+                "go_to_outside",
+                "go_to_ore",
+                "mine_ore",
+                "go_to_smelter",
+                "smelt_ore",
+                "go_to_outside",
+                "go_to_merchant",
+                "sell_metal",
+                "go_to_outside",
+            ],
+        ),
+        // Two gold short, already holding ore (57 % 3 == 0): smelt and sell
+        // once — no mining needed.
+        (
+            57,
+            &[
+                "go_to_smelter",
+                "smelt_ore",
+                "go_to_outside",
+                "go_to_merchant",
+                "sell_metal",
+                "go_to_outside",
+            ],
+        ),
     ];
 
     for (i, want) in expected {
@@ -250,6 +296,25 @@ fn miner_bench_plans_identical_without_lookahead() {
             with, without,
             "miner entity {i}: look-ahead changed the plan"
         );
+    }
+}
+
+/// **Every** seed of the bench's spawn batch must plan — not just the
+/// representative classes pinned above. The bench panics per agent on
+/// `Err(NoPlan)`, so a seed formula that leaves the domain's solvable
+/// envelope (e.g. hunger past the 75 work threshold with no wired-in eat)
+/// fails here first, in `cargo test`, instead of mid-benchmark. 9240 =
+/// lcm(5, 3, 7, 40, 55) covers every combined residue class.
+#[test]
+fn every_miner_bench_seed_class_plans() {
+    let domain = miner_domain();
+    let mut planner = HtnPlanner::new(&domain);
+    for i in 0..9240usize {
+        let state = miner_scratch(&domain, i);
+        let plan = planner
+            .plan(miner_tasks::earn_gold, &state)
+            .unwrap_or_else(|e| panic!("miner entity {i} (hunger class {}): {e:?}", i % 55));
+        assert!(plan.is_complete(), "miner entity {i} planned a partial plan");
     }
 }
 
