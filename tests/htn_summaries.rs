@@ -20,7 +20,7 @@
 //! functions in a sibling `*_tasks` module so tests can name them for
 //! type-based lookup; the parameterized gate/chain generators are baked as
 //! macro-generated static graphs). Summaries range over component slot
-//! indices, resolved via `domain.components.get::<T>()`.
+//! indices, resolved via `domain.components.slot_of::<T>()`.
 //!
 //! Domains whose forward plans are exercised always plan their domain root
 //! (resolved by task index, like [`common::HtnTestBed::plan_forward`]).
@@ -29,6 +29,7 @@ mod common;
 use common::{Food, Fuel, Gold, Noise};
 
 use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::{FieldSet, HtnDomain, Task, TaskBuilder, TaskFn, TaskSummary};
 use bevy_ecs::prelude::*;
@@ -88,7 +89,7 @@ fn slot_names(domain: &HtnDomain, set: &FieldSet) -> Vec<&'static str> {
 fn slot_of<T: 'static>(domain: &HtnDomain) -> usize {
     domain
         .components
-        .get::<T>()
+        .slot_of::<T>()
         .unwrap_or_else(|| panic!("component not registered in domain"))
 }
 
@@ -506,12 +507,12 @@ fn backtracking_restores_queue_after_mid_sequence_failure() {
     // gold > 100 and nothing in its sequence writes gold) — plan goes straight
     // to rescue.
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(true);
+    planner.set_lookahead_mode(LookaheadMode::Always);
     assert_eq!(
         planner
             .plan(domain.root, &state)
             .expect("plan")
-            .task_names(),
+            .task_names(&domain),
         ["rescue"],
         "look-ahead should refute the broken branch without entering it"
     );
@@ -520,9 +521,9 @@ fn backtracking_restores_queue_after_mid_sequence_failure() {
     // cleanly — the abandoned branch's collateral must NOT leak into the
     // plan, and the fallback method must be reached.
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
+    planner.set_lookahead_mode(LookaheadMode::Off);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["rescue"],
         "plain backtracking must discard the abandoned branch and fall through"
     );
@@ -571,7 +572,7 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
     // gold > 100 and nothing in the sequence writes gold).
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["ok"],
         "look-ahead should refute the doomed branch without entering it"
     );
@@ -579,9 +580,9 @@ fn backtracking_restores_ancestor_suffix_after_tail_failure() {
     // Look-ahead off: the search must enumerate gate.a, gate.b, then unwind
     // past the consumed `final` and still reach `direct`.
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
+    planner.set_lookahead_mode(LookaheadMode::Off);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["ok"],
         "backtracking must restore the ancestor suffix consumed by the failed tail"
     );
@@ -642,13 +643,13 @@ fn terminating_flag_refutes_pure_infinite_recursion() {
     // Look-ahead on: the doomed branch is refuted at the frame without
     // recursing.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(), ["ok"]);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain), ["ok"]);
 
     // Look-ahead off: plain backtracking burns the sanity budget and returns
     // the partial plan (the documented fallback semantics).
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(), ["prime"]);
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain), ["prime"]);
 }
 
 /// The non-terminating task is buried one level deep: the sweep must refute
@@ -696,13 +697,13 @@ fn terminating_flag_refutes_through_nested_compounds() {
     );
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(), ["ok"]);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain), ["ok"]);
 
     // Off: the doomed branch is entered; no primitive ever executes before
     // the budget burns, so the partial plan is empty.
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
-    assert!(planner.plan(domain.root, &state).expect("plan").task_names().is_empty());
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert!(planner.plan(domain.root, &state).expect("plan").task_names(&domain).is_empty());
 }
 
 /// A non-terminating *method alternative*: the risky method is tried first,
@@ -742,11 +743,11 @@ fn non_terminating_method_skipped_among_viable_ones() {
     let state = default_state(&domain);
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(), ["ok"]);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain), ["ok"]);
 
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
-    assert!(planner.plan(domain.root, &state).expect("plan").task_names().is_empty());
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert!(planner.plan(domain.root, &state).expect("plan").task_names(&domain).is_empty());
 }
 
 /// Over-refutation guard: *terminating* recursion must keep its flag and keep
@@ -786,7 +787,7 @@ fn terminating_recursion_not_flagged() {
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["tick", "check"]
     );
 }
@@ -894,13 +895,13 @@ fn per_condition_reads_prune_despite_unknown_sibling_field() {
     // On: `y == 5` is definitely false (y known 0) even though `x == 1` is
     // maybe — the doomed method is refuted at the frame.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(), ["ok"]);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain), ["ok"]);
 
     // Off: the doomed method is entered (first task set_x) and burns the
     // budget on the gate enumeration.
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
-    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names()[0], "set_x");
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert_eq!(planner.plan(domain.root, &state).expect("plan").task_names(&domain)[0], "set_x");
 }
 
 /// An identifier condition (`a == b`) with one unknown operand must be
@@ -937,7 +938,7 @@ fn identifier_condition_with_unknown_field_is_maybe() {
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["set_a", "cmp"]
     );
 }
@@ -974,7 +975,7 @@ fn notted_condition_on_unknown_field_is_maybe() {
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        planner.plan(domain.root, &state).expect("plan").task_names(),
+        planner.plan(domain.root, &state).expect("plan").task_names(&domain),
         ["set_a", "cmp"]
     );
 }
@@ -1042,9 +1043,9 @@ fn pins_apply_per_occurrence_not_per_task_index() {
     // must find the same plan.
     let domain = occurrence_pin_domain();
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
+    planner.set_lookahead_mode(LookaheadMode::Off);
     assert_eq!(
-        planner.plan(domain.root, &start).expect("plan").task_names(),
+        planner.plan(domain.root, &start).expect("plan").task_names(&domain),
         ["step0", "bump", "step1", "verify"],
         "plain backtracking must agree with the pinned plan"
     );

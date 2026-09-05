@@ -67,23 +67,23 @@ fn shared_task_appears_once_in_the_plan() {
     let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
     // First occurrence runs `do`; the second takes the empty `done` method.
-    assert_eq!(plan.task_names(), ["equip", "hike", "climb"]);
+    assert_eq!(plan.task_names(&domain), ["equip", "hike", "climb"]);
 
     // Execution: only the user's own `effects` are committed (the driver's
     // contract); the marker is an expected effect — never committed — so the
     // executed state is exactly what the user's own effects produced.
     let mut executed = state.clone();
-    for &s in &plan.steps {
+    for &s in plan.steps() {
         if let bevy_bhtn::Task::Primitive(p) = &domain.tasks[s as usize] {
             for e in &p.effects {
                 e.apply(&mut executed);
             }
         }
     }
-    let equipped = domain.components.get::<Equipped>().unwrap();
-    assert!(executed.get::<Equipped>(equipped).0);
-    let marks = domain.components.get::<SharedMarks>().unwrap();
-    assert!(executed.get::<SharedMarks>(marks).0.is_empty());
+    let equipped = domain.components.slot_of::<Equipped>().unwrap();
+    assert!(executed.get_slot::<Equipped>(equipped).0);
+    let marks = domain.components.slot_of::<SharedMarks>().unwrap();
+    assert!(executed.get_slot::<SharedMarks>(marks).0.is_empty());
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn distinct_shared_tasks_track_distinct_markers() {
     assert!(plan.is_complete());
     // The shared tasks are deduped independently; the unshared `climb` still
     // appears once per occurrence.
-    assert_eq!(plan.task_names(), ["equip", "hike", "climb", "climb"]);
+    assert_eq!(plan.task_names(&domain), ["equip", "hike", "climb", "climb"]);
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn insertion_repairs_a_plan_that_would_otherwise_fail() {
     let mut planner = HtnPlanner::new(&repaired);
     let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
-    assert_eq!(plan.task_names(), ["travel", "pick_key", "escape"]);
+    assert_eq!(plan.task_names(&repaired), ["travel", "pick_key", "escape"]);
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn insertion_leaves_clean_plans_clean() {
         let mut planner = HtnPlanner::new(domain);
         let plan = plan_root(&mut planner, plain_root, &state);
         assert!(plan.is_complete());
-        assert_eq!(plan.task_names(), ["pick_key", "escape"]);
+        assert_eq!(plan.task_names(domain), ["pick_key", "escape"]);
     }
 }
 
@@ -242,5 +242,5 @@ fn insertion_respects_sharing() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_root(&mut planner, root, &state);
     assert!(plan.is_complete());
-    assert_eq!(plan.task_names(), ["equip", "climb2"]);
+    assert_eq!(plan.task_names(&domain), ["equip", "climb2"]);
 }

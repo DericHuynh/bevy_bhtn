@@ -15,7 +15,6 @@ use bevy_bhtn::tasks::TaskBuilder;
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
 use std::sync::Arc;
-use ustr::Ustr;
 
 #[derive(Component, Clone, Default, Debug, PartialEq)]
 struct Gold(i32);
@@ -69,12 +68,12 @@ fn pause_marker_truncates_the_plan_and_records_the_resume_point() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(domain.root, &state).expect("paused plan");
 
-    assert_eq!(plan.status, PlanStatus::Paused);
+    assert_eq!(plan.status(), PlanStatus::Paused);
     assert!(plan.is_paused());
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a")]);
+    assert_eq!(plan.task_names(&domain), vec!["take_a"]);
     let b = domain.task_index(take_b).unwrap() as u32;
     let c = domain.task_index(take_c).unwrap() as u32;
-    let resume = plan.resume.as_ref().expect("resume point");
+    let resume = plan.resume().expect("resume point");
     // The still-queued work, in execution order, chained pause included.
     assert_eq!(
         resume.tasks,
@@ -95,23 +94,23 @@ fn chained_pauses_plan_one_leg_per_resume() {
     // covers its shape); resume into leg 2.
     let plan = planner.plan(domain.root, &state).expect("paused plan");
     let resumed = planner
-        .resume(plan.resume.as_ref().expect("resume point"), &state)
+        .resume(plan.resume().as_ref().expect("resume point"), &state)
         .expect("second leg");
-    assert_eq!(resumed.status, PlanStatus::Paused);
-    assert_eq!(resumed.task_names().to_vec(), vec![Ustr::from("take_b")]);
+    assert_eq!(resumed.status(), PlanStatus::Paused);
+    assert_eq!(resumed.task_names(&domain), vec!["take_b"]);
     let c = domain.task_index(take_c).unwrap() as u32;
     assert_eq!(
-        resumed.resume.as_ref().expect("resume point").tasks,
+        resumed.resume().as_ref().expect("resume point").tasks,
         vec![ResumeStep::Task(c)]
     );
 
     // And into leg 3, which completes.
     let last_leg = planner
-        .resume(resumed.resume.as_ref().expect("resume point"), &state)
+        .resume(resumed.resume().as_ref().expect("resume point"), &state)
         .expect("final leg");
-    assert_eq!(last_leg.status, PlanStatus::Complete);
-    assert!(last_leg.resume.is_none());
-    assert_eq!(last_leg.task_names().to_vec(), vec![Ustr::from("take_c")]);
+    assert_eq!(last_leg.status(), PlanStatus::Complete);
+    assert!(last_leg.resume().is_none());
+    assert_eq!(last_leg.task_names(&domain), vec!["take_c"]);
 }
 
 /// A pause after a method's last member defers everything still queued
@@ -130,21 +129,21 @@ fn pause_after_the_last_member_defers_the_ancestor_suffix() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(domain.root, &state).expect("paused plan");
 
-    assert_eq!(plan.status, PlanStatus::Paused);
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a")]);
+    assert_eq!(plan.status(), PlanStatus::Paused);
+    assert_eq!(plan.task_names(&domain), vec!["take_a"]);
     let c = domain.task_index(take_c).unwrap() as u32;
     assert_eq!(
-        plan.resume.as_ref().expect("resume point").tasks,
+        plan.resume().as_ref().expect("resume point").tasks,
         vec![ResumeStep::Task(c)]
     );
     // Both method commitments (outer's and leg's) are in the recorded chain.
     assert_eq!(plan.mtr(), vec![0usize, 0]);
 
     let resumed = planner
-        .resume(plan.resume.as_ref().unwrap(), &state)
+        .resume(plan.resume().as_ref().unwrap(), &state)
         .expect("suffix");
-    assert_eq!(resumed.status, PlanStatus::Complete);
-    assert_eq!(resumed.task_names().to_vec(), vec![Ustr::from("take_c")]);
+    assert_eq!(resumed.status(), PlanStatus::Complete);
+    assert_eq!(resumed.task_names(&domain), vec!["take_c"]);
     // The committed chain is seeded into the resumed plan's MTR.
     assert_eq!(resumed.mtr(), vec![0usize, 0]);
 }
@@ -170,20 +169,20 @@ fn resume_replans_the_suffix_against_the_state_it_is_given() {
         .plan(domain.root, &state_with(&domain, 0))
         .expect("paused plan");
     // Paused with the chooser unexamined (it is behind the marker).
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a")]);
+    assert_eq!(plan.task_names(&domain), vec!["take_a"]);
 
     // Resume in the poor world: the chooser's rich branch fails, the plain
     // branch runs.
     let poor = planner
-        .resume(plan.resume.as_ref().unwrap(), &state_with(&domain, 0))
+        .resume(plan.resume().as_ref().unwrap(), &state_with(&domain, 0))
         .expect("poor suffix");
-    assert_eq!(poor.task_names().to_vec(), vec![Ustr::from("take_b")]);
+    assert_eq!(poor.task_names(&domain), vec!["take_b"]);
 
     // Resume in the rich world: the chooser's rich branch applies.
     let rich = planner
-        .resume(plan.resume.as_ref().unwrap(), &state_with(&domain, 15))
+        .resume(plan.resume().as_ref().unwrap(), &state_with(&domain, 15))
         .expect("rich suffix");
-    assert_eq!(rich.task_names().to_vec(), vec![Ustr::from("take_c")]);
+    assert_eq!(rich.task_names(&domain), vec!["take_c"]);
 }
 
 /// The remaining work has no decomposition in the resume state: `NoPlan` —
@@ -199,10 +198,10 @@ fn resume_fails_with_no_plan_when_the_suffix_cannot_decompose() {
     let plan = planner
         .plan(domain.root, &state_with(&domain, 0))
         .expect("paused plan");
-    assert_eq!(plan.status, PlanStatus::Paused);
+    assert_eq!(plan.status(), PlanStatus::Paused);
 
     let err = planner
-        .resume(plan.resume.as_ref().unwrap(), &state_with(&domain, 0))
+        .resume(plan.resume().as_ref().unwrap(), &state_with(&domain, 0))
         .unwrap_err();
     assert!(
         matches!(err, bevy_bhtn::HtnError::NoPlan),
@@ -258,9 +257,9 @@ fn vacuous_pause_with_no_work_after_it_completes() {
     let domain = HtnDomain::from_root(tail_pause).build().unwrap();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(domain.root, &empty_state(&domain)).expect("plan");
-    assert_eq!(plan.status, PlanStatus::Complete);
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a"), Ustr::from("take_b")]);
-    assert!(plan.resume.is_none());
+    assert_eq!(plan.status(), PlanStatus::Complete);
+    assert_eq!(plan.task_names(&domain), vec!["take_a", "take_b"]);
+    assert!(plan.resume().is_none());
 }
 
 /// The look-ahead sweep proves only the PRE-pause prefix: a doomed step
@@ -281,8 +280,8 @@ fn lookahead_sweep_stops_at_the_pause_marker() {
     let domain = HtnDomain::from_root(doomed_suffix).build().unwrap();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(domain.root, &state_with(&domain, 0)).expect("plan");
-    assert_eq!(plan.status, PlanStatus::Paused);
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a")]);
+    assert_eq!(plan.status(), PlanStatus::Paused);
+    assert_eq!(plan.task_names(&domain), vec!["take_a"]);
 
     // Pre-pause doom refuted: the sweep skips the marked method entirely.
     fn doomed_prefix(task: &mut TaskBuilder) {
@@ -295,8 +294,8 @@ fn lookahead_sweep_stops_at_the_pause_marker() {
     let domain = HtnDomain::from_root(doomed_prefix).build().unwrap();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(domain.root, &state_with(&domain, 0)).expect("plan");
-    assert_eq!(plan.status, PlanStatus::Complete);
-    assert_eq!(plan.task_names().to_vec(), vec![Ustr::from("take_a")]);
+    assert_eq!(plan.status(), PlanStatus::Complete);
+    assert_eq!(plan.task_names(&domain), vec!["take_a"]);
     assert_eq!(plan.mtr(), vec![1usize], "the marked method was skipped");
 }
 
@@ -309,10 +308,10 @@ fn custom_searcher_plans_through_pause_markers() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::Custom(Arc::new(MctsSearcher::new(64))));
     let plan = planner.plan(domain.root, &state).expect("mcts plan");
-    assert_eq!(plan.status, PlanStatus::Complete);
+    assert_eq!(plan.status(), PlanStatus::Complete);
     assert_eq!(
-        plan.task_names().to_vec(),
-        vec![Ustr::from("take_a"), Ustr::from("take_b"), Ustr::from("take_c")]
+        plan.task_names(&domain),
+        vec!["take_a", "take_b", "take_c"]
     );
 }
 
@@ -348,9 +347,9 @@ fn driver_executes_prefix_then_resumes_from_the_pause() {
     // exhausted paused plan is KEPT (not dropped like a finished Complete).
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    let plan = agent.plan.as_ref().expect("paused plan survives the tick");
-    assert_eq!(plan.status, PlanStatus::Paused);
-    assert_eq!(agent.cursor, 1, "the prefix's single step executed");
+    let plan = agent.plan().expect("paused plan survives the tick");
+    assert_eq!(plan.status(), PlanStatus::Paused);
+    assert_eq!(agent.cursor(), 1, "the prefix's single step executed");
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 1);
 
     // Tick 2: the driver resumes decomposition from the pause (same committed
@@ -358,22 +357,22 @@ fn driver_executes_prefix_then_resumes_from_the_pause() {
     // step.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    let plan = agent.plan.as_ref().expect("resumed plan running");
-    assert_eq!(plan.status, PlanStatus::Complete);
+    let plan = agent.plan().expect("resumed plan running");
+    assert_eq!(plan.status(), PlanStatus::Complete);
     assert_eq!(plan.len(), 2, "the remaining leg was planned");
-    assert_eq!(agent.cursor, 1);
+    assert_eq!(agent.cursor(), 1);
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 2);
 
     // Tick 3: the resumed plan's last step completes it and the plan drops.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert!(agent.plan.is_none(), "completed plan is dropped");
+    assert!(agent.plan().is_none(), "completed plan is dropped");
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 3);
 
     // Tick 4: replans from the root — the terminal branch matches and the
     // agent rests (the pause never re-executes completed work).
     htn_ai_system(&mut world);
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_none());
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 3);
 }
 
@@ -412,7 +411,7 @@ fn driver_resume_selects_the_suffix_against_reality() {
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Gold>(entity).unwrap().0, 1);
     assert_eq!(
-        world.get::<HtnAgent>(entity).unwrap().plan.as_ref().map(|p| p.status),
+        world.get::<HtnAgent>(entity).unwrap().plan().map(|p| p.status()),
         Some(PlanStatus::Paused)
     );
 

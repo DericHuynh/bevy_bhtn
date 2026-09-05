@@ -100,7 +100,7 @@ fn highest_utility_selects_the_best_valid_branch() {
     // Both branches valid: "big" (100) beats "small" (40).
     let rich = PlanState::build(&domain.components).set(Gold(10)).finish();
     assert_eq!(
-        plan_of(&mut planner, utility_root, &rich).task_names(),
+        plan_of(&mut planner, utility_root, &rich).task_names(&domain),
         ["win"]
     );
     let mtr = plan_of(&mut planner, utility_root, &rich);
@@ -109,7 +109,7 @@ fn highest_utility_selects_the_best_valid_branch() {
     // "big" invalid (gold < 5): "small" is the only valid branch.
     let poor = PlanState::build(&domain.components).set(Gold(0)).finish();
     let plan = plan_of(&mut planner, utility_root, &poor);
-    assert_eq!(plan.task_names(), ["win"]);
+    assert_eq!(plan.task_names(&domain), ["win"]);
     assert_eq!(plan.mtr(), [1], "branch 1 (small) selected");
 }
 
@@ -230,7 +230,7 @@ fn weighted_random_exhausts_sampled_order_on_backtrack() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["safe"],
         "the fallback is reached after the sampled branch fails"
     );
@@ -273,6 +273,43 @@ fn custom_ranker_orders_branches_and_is_sanitized() {
     assert_eq!(plan_of(&mut planner, root, &state).mtr(), [1]);
 }
 
+/// Custom rankers see each valid branch's declared static utility
+/// (`BranchCandidate.utility`) — evaluated against the node's state, the same
+/// value [`HighestUtility`](bevy_bhtn::domain::SelectionPolicy::HighestUtility)
+/// ranks by.
+#[test]
+fn custom_rankers_see_declared_utilities() {
+    struct UtilityRanker;
+
+    impl BranchRanker for UtilityRanker {
+        fn rank(&self, candidates: &[BranchCandidate<'_>], _state: &PlanState, out: &mut Vec<u32>) {
+            let mut ranked: Vec<(u32, f32)> = candidates
+                .iter()
+                .map(|c| (c.index, c.utility.unwrap_or(0.0)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.extend(ranked.into_iter().map(|(i, _)| i));
+        }
+    }
+
+    fn root(task: &mut TaskBuilder) {
+        task.select(SelectionPolicy::Custom(Arc::new(UtilityRanker)));
+        task.branch().named("meh").utility(0.2).then(win);
+        task.branch().named("best").utility(0.9).then(win);
+        task.branch().named("default").then(win);
+    }
+    fn win(task: &mut TaskBuilder) {
+        task.effect(|gold: &mut Gold| gold.0 += 1);
+    }
+
+    let domain = HtnDomain::from_root(root).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    // The ranker orders by declared utility: branch 1 (0.9) beats branch 0
+    // (0.2) and branch 2 (no utility declared → 0.0).
+    assert_eq!(plan_of(&mut planner, root, &state).mtr(), [1]);
+}
+
 /// A misbehaving ranker (dropping candidates) cannot make branches
 /// unreachable: omitted valid branches are appended in declaration order.
 #[test]
@@ -308,7 +345,7 @@ fn ranker_omissions_fall_back_to_declaration_order() {
     let mut planner = HtnPlanner::new(&domain);
     // The ranker only offered branch 0; the sanitizer appends branch 1, so
     // the search still reaches the safe plan.
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +359,7 @@ fn cost_is_recorded_on_primitives() {
     }
     fn cheap(task: &mut TaskBuilder) {
         task.cost(0.5)
-            .cost_fn(|state: &PlanState| state.get::<Gold>(0).0.min(0).abs() as f32)
+            .cost_fn(|state: &PlanState| state.get_slot::<Gold>(0).0.min(0).abs() as f32)
             .effect(|gold: &mut Gold| gold.0 += 1);
     }
 
@@ -335,7 +372,7 @@ fn cost_is_recorded_on_primitives() {
     // Inert under DepthFirst: the plan is unaffected.
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["cheap"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["cheap"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +406,7 @@ fn depth_first_backtracks_to_the_second_branch() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(&domain),
         ["works"]
     );
 }
@@ -383,7 +420,7 @@ fn fail_fast_returns_partial_plan_on_first_failure() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::DepthFirstFailFast);
     assert_eq!(
-        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(&domain),
         ["prime"],
         "fail-fast keeps the partial plan instead of backtracking"
     );
@@ -403,7 +440,7 @@ fn planner_level_custom_strategy_bypasses_the_builtin_search() {
     )));
     let plan = plan_of(&mut planner, fail_fast_root, &state);
     assert_eq!(
-        plan.task_names(),
+        plan.task_names(&domain),
         ["works"],
         "the searcher's plan, verbatim"
     );
@@ -424,14 +461,14 @@ fn strategy_replacement_last_call_wins() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::DepthFirst);
     assert_eq!(
-        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(&domain),
         ["works"]
     );
 
     // Switching to FailFast mid-lifetime changes the behavior...
     planner.set_strategy(HtnSearchStrategy::DepthFirstFailFast);
     assert_eq!(
-        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(&domain),
         ["prime"],
         "fail-fast keeps the partial plan"
     );
@@ -439,7 +476,7 @@ fn strategy_replacement_last_call_wins() {
     // ...and switching back restores DepthFirst exactly.
     planner.set_strategy(HtnSearchStrategy::DepthFirst);
     assert_eq!(
-        plan_of(&mut planner, fail_fast_root, &state).task_names(),
+        plan_of(&mut planner, fail_fast_root, &state).task_names(&domain),
         ["works"],
         "no stale mode flags survive a strategy replacement"
     );
@@ -456,7 +493,7 @@ fn mtr_after_backtrack_records_only_the_chosen_method() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, fail_fast_root, &state);
-    assert_eq!(plan.task_names(), ["works"]);
+    assert_eq!(plan.task_names(&domain), ["works"]);
     assert_eq!(
         plan.mtr(),
         [1],
@@ -493,7 +530,7 @@ fn mtr_after_nested_backtrack_records_only_chosen_methods() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["works"]);
+    assert_eq!(plan.task_names(&domain), ["works"]);
     assert_eq!(
         plan.mtr(),
         [0, 1],
@@ -508,13 +545,12 @@ impl Searcher for FixedSearcher {
     fn search(&self, domain: &HtnDomain, _state: &PlanState) -> Option<Plan> {
         // A "strategy" that always picks the second branch's single step.
         let idx = task_index_of(domain, works)?;
-        Some(Plan {
-            steps: vec![idx as u32],
-            names: vec!["works".into()],
-            mtr: vec![1],
-            status: bevy_bhtn::planner::PlanStatus::Complete,
-            resume: None,
-        })
+        Some(Plan::compiled(
+            vec![idx as u32],
+            vec![1],
+            bevy_bhtn::planner::PlanStatus::Complete,
+            None,
+        ))
     }
 }
 
@@ -547,14 +583,14 @@ fn custom_strategy_and_per_agent_override() {
     // completed within the tick (plan already dropped), observable through
     // the committed effect.
     assert_eq!(world.get::<Gold>(global).unwrap().0, 1);
-    assert!(world.get::<HtnAgent>(global).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(global).unwrap().plan().is_none());
 
     // The overridden agent's zero sanity budget yields an empty (planless)
     // plan: it stays idle while the global agent works — the override
     // demonstrably took effect.
     let agent = world.get::<HtnAgent>(overridden).unwrap();
-    assert!(agent.plan.is_none());
-    assert_eq!(agent.cursor, 0);
+    assert!(agent.plan().is_none());
+    assert_eq!(agent.cursor(), 0);
     assert_eq!(world.get::<Gold>(overridden).unwrap().0, 0);
 }
 
@@ -585,7 +621,7 @@ fn plan_traced_reports_selection_decisions() {
     let mut trace = Vec::new();
     let plan = plan_traced_of(&mut planner, root, &state, &mut trace);
 
-    assert_eq!(plan.task_names(), ["safe"]);
+    assert_eq!(plan.task_names(&domain), ["safe"]);
     assert!(
         trace
             .iter()
@@ -605,9 +641,9 @@ fn plan_traced_reports_selection_decisions() {
 }
 
 /// The driver bridges traces into `Messages<DecompositionTrace>` when
-/// `debug_trace` is enabled.
+/// `trace_events` is enabled.
 #[test]
-fn driver_forwards_traces_when_debug_trace_is_enabled() {
+fn driver_forwards_traces_when_trace_events_is_enabled() {
     fn root(task: &mut TaskBuilder) {
         task.branch().named("charge_cycle").then(gather);
     }
@@ -621,7 +657,7 @@ fn driver_forwards_traces_when_debug_trace_is_enabled() {
 
     let mut world = World::new();
     world.insert_resource(
-        HtnConfig::new(HtnDomain::from_root(root).build().unwrap()).with_debug_trace(true),
+        HtnConfig::new(HtnDomain::from_root(root).build().unwrap()).with_trace_events(true),
     );
     let entity = world.spawn((Battery(0), HtnAgent::default())).id();
 

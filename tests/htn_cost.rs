@@ -21,6 +21,7 @@
 //!   count 0, so CostBounded degenerates to exactly DepthFirst's choice.
 
 use bevy_bhtn::domain::SelectionPolicy;
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::planner::{HtnPlanner, Plan};
 use bevy_bhtn::selection::{HtnSearchStrategy, SearchOverride};
@@ -165,7 +166,7 @@ fn stale_static_cost_cannot_prune_the_dynamic_optimum() {
     planner.set_strategy(HtnSearchStrategy::CostBounded);
     let plan = plan_of(&mut planner, root, &state);
     assert_eq!(
-        plan.task_names(),
+        plan.task_names(&domain),
         ["mislabeled"],
         "the dynamic cost (1.0) beats the static price (3.0)"
     );
@@ -197,13 +198,13 @@ fn cost_bounded_finds_the_cheaper_complete_plan() {
 
     let mut dfs = HtnPlanner::new(&domain);
     let dfs_plan = plan_of(&mut dfs, root, &state);
-    assert_eq!(dfs_plan.task_names(), ["expensive"], "first complete plan");
+    assert_eq!(dfs_plan.task_names(&domain), ["expensive"], "first complete plan");
     assert_eq!(dfs_plan.mtr(), [0]);
 
     let mut bnb = HtnPlanner::new(&domain);
     bnb.set_strategy(HtnSearchStrategy::CostBounded);
     let bnb_plan = plan_of(&mut bnb, root, &state);
-    assert_eq!(bnb_plan.task_names(), ["cheap"], "cheapest complete plan");
+    assert_eq!(bnb_plan.task_names(&domain), ["cheap"], "cheapest complete plan");
     assert_eq!(bnb_plan.mtr(), [1], "the second branch was taken");
 }
 
@@ -231,7 +232,7 @@ fn cost_bounded_selects_the_optimum_among_three_branches() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::CostBounded);
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["c1"]);
+    assert_eq!(plan.task_names(&domain), ["c1"]);
     assert_eq!(plan.mtr(), [2]);
 }
 
@@ -252,7 +253,7 @@ fn cost_fn_dynamic_costs_drive_the_choice() {
         // register nothing themselves.
         task.precondition(|_: &CheapMode| true)
             .cost_fn(|state: &PlanState| {
-                if state.get::<CheapMode>(0).0 {
+                if state.get_slot::<CheapMode>(0).0 {
                     2.0
                 } else {
                     20.0
@@ -274,14 +275,14 @@ fn cost_fn_dynamic_costs_drive_the_choice() {
     let cheap = PlanState::build(&domain.components)
         .set(CheapMode(true))
         .finish();
-    assert_eq!(plan_of(&mut planner, root, &cheap).task_names(), ["solo"]);
+    assert_eq!(plan_of(&mut planner, root, &cheap).task_names(&domain), ["solo"]);
 
     // Expensive mode: the duo (10) beats solo (20).
     let pricey = PlanState::build(&domain.components)
         .set(CheapMode(false))
         .finish();
     assert_eq!(
-        plan_of(&mut planner, root, &pricey).task_names(),
+        plan_of(&mut planner, root, &pricey).task_names(&domain),
         ["duo_a", "duo_b"]
     );
 }
@@ -309,8 +310,8 @@ fn unannotated_primitives_degenerate_to_depth_first() {
     let mut bnb = HtnPlanner::new(&domain);
     bnb.set_strategy(HtnSearchStrategy::CostBounded);
     assert_eq!(
-        plan_of(&mut bnb, root, &state).task_names(),
-        plan_of(&mut dfs, root, &state).task_names(),
+        plan_of(&mut bnb, root, &state).task_names(&domain),
+        plan_of(&mut dfs, root, &state).task_names(&domain),
         "no costs → no bound → first complete plan wins"
     );
 }
@@ -359,9 +360,9 @@ fn cost_bounded_prunes_subtrees_that_cannot_beat_the_best() {
     // Plain DFS: the first complete plan (the 10×5 branch) is the answer —
     // it never even looks at the later branches.
     let mut dfs = HtnPlanner::new(&domain);
-    dfs.set_lookahead(false).set_sanity_limit(20);
+    dfs.set_lookahead_mode(LookaheadMode::Off).set_sanity_limit(20);
     assert_eq!(
-        plan_of(&mut dfs, root, &state).task_names(),
+        plan_of(&mut dfs, root, &state).task_names(&domain),
         ["expensive"; 10]
     );
 
@@ -370,11 +371,11 @@ fn cost_bounded_prunes_subtrees_that_cannot_beat_the_best() {
     // so the cheap branch is still reached and wins.
     let mut bnb = HtnPlanner::new(&domain);
     bnb.set_strategy(HtnSearchStrategy::CostBounded)
-        .set_lookahead(false)
+        .set_lookahead_mode(LookaheadMode::Off)
         .set_sanity_limit(20);
     let plan = plan_of(&mut bnb, root, &state);
     assert_eq!(
-        plan.task_names(),
+        plan.task_names(&domain),
         ["cheap"],
         "the 40-step branch was pruned, not explored"
     );
@@ -409,7 +410,7 @@ fn cost_bounded_returns_the_best_complete_plan_within_the_budget() {
     let mut tight = HtnPlanner::new(&domain);
     tight.set_strategy(HtnSearchStrategy::CostBounded).set_sanity_limit(4);
     assert_eq!(
-        plan_of(&mut tight, root, &state).task_names(),
+        plan_of(&mut tight, root, &state).task_names(&domain),
         ["solo"],
         "anytime: best complete plan within the budget"
     );
@@ -418,7 +419,7 @@ fn cost_bounded_returns_the_best_complete_plan_within_the_budget() {
     let mut roomy = HtnPlanner::new(&domain);
     roomy.set_strategy(HtnSearchStrategy::CostBounded).set_sanity_limit(10);
     assert_eq!(
-        plan_of(&mut roomy, root, &state).task_names(),
+        plan_of(&mut roomy, root, &state).task_names(&domain),
         ["duo_a", "duo_b"]
     );
 }
@@ -451,7 +452,7 @@ fn cost_bounded_rolls_state_back_between_complete_plans() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::CostBounded);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["bump", "gate"],
         "the second branch was evaluated against rolled-back state, not the first plan's effects"
     );
@@ -480,7 +481,7 @@ fn cost_bounded_composes_with_ranked_selection() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::CostBounded);
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["cheap"]);
+    assert_eq!(plan.task_names(&domain), ["cheap"]);
     assert_eq!(plan.mtr(), [1], "the dull branch won on cost");
 }
 
@@ -532,7 +533,7 @@ fn driver_runs_the_cost_bounded_strategy() {
         1,
         "the cheap branch was planned and executed"
     );
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_none());
 }
 
 /// A per-agent `SearchOverride` can opt one agent into CostBounded while the

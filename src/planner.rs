@@ -31,8 +31,10 @@
 //!
 //! The hot loop works on **`usize` task indices**, never names. The working
 //! stack and the backtracking frames hold `usize` indices into
-//! [`HtnDomain::tasks`]. Task names are interned as [`Ustr`] keys in a
-//! precomputed `name -> index` map, so root resolution is O(1).
+//! [`HtnDomain::tasks`]. Task names are interned as `Ustr` keys in a
+//! precomputed `name -> index` map, so root resolution is O(1); the compiled
+//! plan stores no names at all — display names resolve against the domain on
+//! demand.
 //!
 //! `plan` and `mtr` are **append-only**, so backtracking frames store only the
 //! two **lengths** (not cloned `Vec`s) — on backtrack a `truncate` restores
@@ -40,16 +42,13 @@
 //! avoids ~2 heap allocations + O(n) copies per recursion level. State
 //! rollback is similarly allocation-light: before a primitive's effects run,
 //! only the slots they write are snapshotted onto a pre-allocated rollback
-//! stack; backtracking pops and restores exactly those. Task names are only
-//! materialized as [`Ustr`]s when the final [`Plan`] is constructed.
+//! stack; backtracking pops and restores exactly those.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
 
 use smallvec::SmallVec;
 use std::any::TypeId;
-
-use ustr::Ustr;
 
 use crate::domain::SelectionPolicy;
 use crate::error::{HtnError, HtnResult};
@@ -67,6 +66,7 @@ use crate::state::{PlanState, Slot};
 /// Whether a compiled [`Plan`] is the finished product of a completed
 /// decomposition, or the best prefix cut out of a search that stopped early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PlanStatus {
     /// The search ran to completion: the plan is final and reaches a terminal
     /// state of the decomposition (possibly empty — a root whose only methods
@@ -93,6 +93,7 @@ pub enum PlanStatus {
 /// One entry of a paused plan's resume queue: a task still to decompose, or
 /// a pause marker that re-truncates the resumed plan (chained legs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResumeStep {
     /// A task occurrence queued behind the pause, to be decomposed when
     /// decomposition resumes. Look-ahead occurrence pins are deliberately not
@@ -113,6 +114,7 @@ pub enum ResumeStep {
 /// the world is in *then*, without re-decomposing (or being able to
 /// backtrack past) the already-executed prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResumePoint {
     /// The remaining decomposition work in execution order: task occurrences
     /// still queued behind the pause, interleaved with any chained pause
@@ -129,6 +131,14 @@ pub struct ResumePoint {
 /// [`LookaheadMode::Adaptive`] before its sweep is disabled for the rest of
 /// the plan (a refutation resets the streak immediately).
 const ADAPTIVE_SWEEP_TRIALS: u32 = 2;
+
+/// The default decomposition-step budget before the best partial plan is
+/// returned (a single source of truth shared by [`HtnPlanner`] and the ECS
+/// driver's [`HtnConfig`](crate::ecs::HtnConfig)). Raise it with
+/// [`HtnPlanner::set_sanity_limit`] /
+/// [`HtnConfig::with_sanity_limit`](crate::ecs::HtnConfig::with_sanity_limit)
+/// for domains that legitimately need deep searches.
+pub const DEFAULT_SANITY_LIMIT: usize = 100;
 
 /// What a planning call starts from: a task function (its `TypeId` resolves
 /// through the baked type index) or a task index into
@@ -174,33 +184,52 @@ enum Start<'a> {
 /// `steps` holds task indices into [`HtnDomain::tasks`](crate::domain::HtnDomain)
 /// in execution order, so executing a plan is a flat array walk — the driver
 /// indexes the baked task array directly, with no name lookups and no string
-/// comparisons on the hot path. The interned names are kept in parallel for
-/// display and introspection.
+/// comparisons on the hot path. Display names are *not* stored on the plan
+/// (a CDDA-scale population replaces plans every few ticks; the parallel
+/// name vector was pure overhead) — resolve them against the domain on
+/// demand via [`Self::task_names`].
+///
+/// Construct plans through the planners; the [`Self::compiled`] constructor
+/// exists for custom [`Searcher`](crate::selection::Searcher) implementations,
+/// which own their search.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Plan {
-    /// Baked step program: task indices, in execution order.
-    pub steps: Vec<u32>,
-    /// Interned task names, parallel to [`Self::steps`] (display/introspection;
-    /// execution reads [`Self::steps`] only).
-    pub names: Vec<Ustr>,
+    /// The step program: task indices into the domain's task array, in
+    /// execution order.
+    steps: Vec<u32>,
     /// The MTR (Method Traversal Record): the index of the chosen method at
-    /// each decomposition level. Used to compare plans by priority (lower
-    /// index = higher priority) and for debugging; exposed as a slice by
-    /// [`Self::mtr`].
-    pub mtr: Vec<usize>,
-    /// Whether the search finished (`Complete`) or was cut short (`Partial`).
-    pub status: PlanStatus,
+    /// each decomposition level.
+    mtr: Vec<usize>,
+    /// Whether the search finished, was cut short, or paused.
+    status: PlanStatus,
     /// The remaining decomposition work when the plan was truncated by a
-    /// pause marker ([`PlanStatus::Paused`]): pass it to
-    /// [`HtnPlanner::resume`] once the compiled steps have executed.
-    /// `None` on `Complete` and `Partial` plans.
-    pub resume: Option<ResumePoint>,
+    /// pause marker ([`PlanStatus::Paused`]).
+    resume: Option<ResumePoint>,
 }
 
 impl Plan {
-    /// The ordered primitive task names (interned handles; deref to `&str`).
-    pub fn task_names(&self) -> &[Ustr] {
-        &self.names
+    /// The constructor for custom searchers (the planners build plans
+    /// internally): a compiled step program over the domain's task indices
+    /// plus its MTR, status, and optional resume point.
+    pub fn compiled(
+        steps: Vec<u32>,
+        mtr: Vec<usize>,
+        status: PlanStatus,
+        resume: Option<ResumePoint>,
+    ) -> Self {
+        Self {
+            steps,
+            mtr,
+            status,
+            resume,
+        }
+    }
+
+    /// The compiled step program: task indices into
+    /// [`HtnDomain::tasks`](crate::domain::HtnDomain), in execution order.
+    pub fn steps(&self) -> &[u32] {
+        &self.steps
     }
 
     /// Whether the search ran to completion — the plan is final. `false`
@@ -223,6 +252,16 @@ impl Plan {
         self.status == PlanStatus::Paused
     }
 
+    /// The plan's status (see [`PlanStatus`]).
+    pub fn status(&self) -> PlanStatus {
+        self.status
+    }
+
+    /// The plan's resume point, if it was truncated by a pause marker.
+    pub fn resume(&self) -> Option<&ResumePoint> {
+        self.resume.as_ref()
+    }
+
     /// The domain task index of the step at `cursor` (the compiled program
     /// entry the executor jumps to).
     pub fn step_task(&self, cursor: usize) -> Option<usize> {
@@ -237,6 +276,15 @@ impl Plan {
     /// Whether the program has no steps.
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
+    }
+
+    /// The ordered primitive task names, resolved against the domain
+    /// (display/introspection; execution reads [`Self::steps`] only).
+    pub fn task_names<'d>(&self, domain: &'d HtnDomain) -> Vec<&'d str> {
+        self.steps
+            .iter()
+            .map(|&i| domain.tasks[i as usize].name())
+            .collect()
     }
 
     /// The MTR: the index of the chosen method at each decomposition level
@@ -486,6 +534,39 @@ struct DecompositionFrame {
     lin_total: u32,
 }
 
+/// The search's mutable working state: the task queue, the decomposition
+/// frames, the append-only plan/MTR, the rollback journal, and the
+/// choice-point/cost bookkeeping. Grouping them lets the backtrack helper —
+/// and every loop arm — thread one context instead of ten aliased arguments,
+/// and makes the "restore these ten things on unwind" invariant structural.
+struct SearchCtx<'a> {
+    /// The task queue: task occurrences (with optional look-ahead pins),
+    /// pause markers, and pending linearization retries.
+    stack: VecDeque<Step>,
+    /// One frame per committed method (the backtracking ladder).
+    decomp_stack: Vec<DecompositionFrame>,
+    /// The compiled plan: primitive task indices, append-only within one
+    /// `plan()` call (backtracking truncates to a frame's `plan_len`).
+    plan: Vec<usize>,
+    /// The MTR: the chosen method index per decomposition level,
+    /// append-only (frames snapshot their length).
+    mtr: Vec<usize>,
+    /// The rollback journal: restores the scratchpad down to a frame's
+    /// snapshot length on unwind.
+    rollback: Rollback<'a>,
+    /// The index of the method to skip at the current choice point
+    /// (declaration order; reset on every descent).
+    skip: usize,
+    /// The current choice point's ranked branch order + resume position
+    /// (re-derived deterministically on revisit; see `DecompositionFrame`).
+    rank_order: SmallVec<[u32; 4]>,
+    rank_pos: usize,
+    /// The accumulated primitive cost (branch-and-bound only; otherwise 0).
+    g: f32,
+    /// The working scratchpad: effects mutate it, backtracking restores it.
+    state: PlanState,
+}
+
 /// A forward planner over a baked [`HtnDomain`].
 ///
 /// Planning mutates no external state: it works on its own clone of the
@@ -520,7 +601,7 @@ impl<'a> HtnPlanner<'a> {
         Self {
             domain,
             lookahead: LookaheadMode::default(),
-            sanity_limit: 100,
+            sanity_limit: DEFAULT_SANITY_LIMIT,
             strategy: HtnSearchStrategy::default(),
             method_base: Vec::new(),
             sweep_streaks: Vec::new(),
@@ -532,20 +613,10 @@ impl<'a> HtnPlanner<'a> {
         self.domain
     }
 
-    /// Enable or disable look-ahead pruning (default: enabled). Disabling
-    /// falls back to plain MTR backtracking; useful for A/B benchmarking and
-    /// for domains where the sweep's per-commitment cost outweighs its
-    /// pruning (e.g. shallow domains with no dead ends).
-    pub fn set_lookahead(&mut self, enabled: bool) -> &mut Self {
-        self.lookahead = if enabled {
-            LookaheadMode::Always
-        } else {
-            LookaheadMode::Off
-        };
-        self
-    }
-
-    /// Set the look-ahead gating mode (see [`LookaheadMode`]).
+    /// Set the look-ahead gating mode (see [`LookaheadMode`]; the default is
+    /// [`Always`](LookaheadMode::Always) — [`Off`](LookaheadMode::Off) falls
+    /// back to plain MTR backtracking, useful for A/B benchmarking and for
+    /// domains where the sweep's per-commitment cost outweighs its pruning).
     pub fn set_lookahead_mode(&mut self, mode: LookaheadMode) -> &mut Self {
         self.lookahead = mode;
         self
@@ -657,6 +728,28 @@ impl<'a> HtnPlanner<'a> {
     /// - [`HtnError::NoPlan`] — the remaining work has no valid
     ///   decomposition in `state`.
     pub fn resume(&mut self, point: &ResumePoint, state: &PlanState) -> HtnResult<Plan> {
+        self.validate_resume(point)?;
+        self.plan_inner(Start::Resume(point), state, None)
+    }
+
+    /// Resume a pause-truncated decomposition, appending one
+    /// [`DecompositionTrace`] per branch commitment made *after* the pause to
+    /// `trace` (see [`Self::resume`] and [`Self::plan_traced`]). The
+    /// committed prefix is history, not a decision this call re-derives, so
+    /// it emits nothing.
+    pub fn resume_traced(
+        &mut self,
+        point: &ResumePoint,
+        state: &PlanState,
+        trace: &mut Vec<DecompositionTrace>,
+    ) -> HtnResult<Plan> {
+        self.validate_resume(point)?;
+        self.plan_inner(Start::Resume(point), state, Some(trace))
+    }
+
+    /// The resume-point validation shared by [`Self::resume`] and
+    /// [`Self::resume_traced`].
+    fn validate_resume(&self, point: &ResumePoint) -> HtnResult<()> {
         for step in &point.tasks {
             if let ResumeStep::Task(idx) = *step {
                 if idx as usize >= self.domain.tasks.len() {
@@ -666,7 +759,7 @@ impl<'a> HtnPlanner<'a> {
                 }
             }
         }
-        self.plan_inner(Start::Resume(point), state, None)
+        Ok(())
     }
 
     /// Resolve a plan root to a task index. Errors carry the fn's `type_name`
@@ -745,10 +838,6 @@ impl<'a> HtnPlanner<'a> {
         // The resume point recorded when a pause marker pops (the pause exit
         // below materializes it). `None` everywhere else.
         let mut paused_resume: Option<ResumePoint> = None;
-        let mut stack: VecDeque<Step> = VecDeque::with_capacity(16);
-        let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
-        let mut mtr: Vec<usize> = Vec::with_capacity(8);
-        let mut plan: Vec<usize> = Vec::with_capacity(8);
         // Reusable look-ahead scratch: the sweep's "unknown components" overlay
         // and its inevitable-refinement output, cleared per sweep.
         let mut sweep_unknown = crate::state::FieldSet::new(self.domain.components.len());
@@ -759,30 +848,32 @@ impl<'a> HtnPlanner<'a> {
         // sweep's sequence view of it.
         let mut resolved_buf: Vec<(usize, usize)> = Vec::with_capacity(8);
         let mut seq_buf: Vec<usize> = Vec::with_capacity(8);
-        // Rollback journal: snapshotted (deep-cloned) slot values + ops,
-        // restored on backtrack down to the frame's length.
-        let mut rollback = Rollback::new(
-            self.domain.components.max_align(),
-            self.domain.components.slots(),
-        );
         // Reusable look-ahead state clone: the sweep's lazily-created private
         // copy, reused across sweeps (`copy_from`, no re-allocation).
         let mut sweep_owned: Option<PlanState> = None;
-        let mut skip = 0;
-        // Cost-bounded branch-and-bound state: the accumulated cost of the
-        // committed primitives (`g`), and the best complete plan found so far
-        // with its cost. Both stay inert unless the strategy is CostBounded.
-        let mut g = 0.0f32;
+        // Cost-bounded branch-and-bound state: the best complete plan found
+        // so far with its cost. Stays inert unless the strategy is
+        // CostBounded (the accumulated cost lives on the context).
         let mut best: Option<Plan> = None;
         let mut best_cost = f32::INFINITY;
-        // Per-choice-point ranked branch order + resume position. The order
-        // is computed once per node visit (precondition validity is constant
-        // there) and snapshotted into the frame on commit, so backtracking
-        // resumes down the ranked list without re-ranking — required for
-        // WeightedRandom soundness.
-        let mut rank_order: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut rank_pos: usize = 0;
-        let mut state = state.clone();
+        // The search's mutable working state — queue, frames, plan, MTR,
+        // rollback journal, choice-point and cost bookkeeping, and the
+        // working clone of the extracted scratchpad (the input is only read).
+        let mut ctx = SearchCtx {
+            stack: VecDeque::with_capacity(16),
+            decomp_stack: Vec::with_capacity(8),
+            mtr: Vec::with_capacity(8),
+            plan: Vec::with_capacity(8),
+            rollback: Rollback::new(
+                self.domain.components.max_align(),
+                self.domain.components.slots(),
+            ),
+            skip: 0,
+            rank_order: SmallVec::new(),
+            rank_pos: 0,
+            g: 0.0f32,
+            state: state.clone(),
+        };
 
         let tasks = &self.domain.tasks;
 
@@ -791,47 +882,28 @@ impl<'a> HtnPlanner<'a> {
         // markers re-enter the queue with it), with the committed MTR prefix
         // already recorded.
         match start {
-            Start::Root(root) => stack.push_front(Step::Task(root, None)),
+            Start::Root(root) => ctx.stack.push_front(Step::Task(root, None)),
             Start::Resume(point) => {
                 for step in point.tasks.iter().rev() {
-                    stack.push_front(match step {
+                    ctx.stack.push_front(match step {
                         ResumeStep::Task(idx) => Step::Task(*idx as usize, None),
                         ResumeStep::Pause => Step::Pause,
                     });
                 }
-                mtr.extend_from_slice(&point.mtr);
+                ctx.mtr.extend_from_slice(&point.mtr);
             }
         }
 
         'search: loop {
-            let Some(step) = stack.pop_front() else {
+            let Some(step) = ctx.stack.pop_front() else {
                 // The task queue drained: the current partial plan is
                 // *complete*. Under branch-and-bound, record it when it
                 // strictly beats the best so far and keep searching; the
                 // first complete plan is the answer otherwise.
-                if cost_bounded && g < best_cost {
-                    best = Some(materialize(
-                        tasks,
-                        &plan,
-                        mtr.clone(),
-                        PlanStatus::Complete,
-                        None,
-                    ));
-                    best_cost = g;
-                    if backtrack(
-                        &mut decomp_stack,
-                        &mut plan,
-                        &mut mtr,
-                        &mut stack,
-                        &mut rollback,
-                        &mut skip,
-                        &mut rank_order,
-                        &mut rank_pos,
-                        &mut g,
-                        &mut state,
-                        tasks,
-                        &mut trace,
-                    ) {
+                if cost_bounded && ctx.g < best_cost {
+                    best = Some(materialize(&ctx.plan, ctx.mtr.clone(), PlanStatus::Complete, None));
+                    best_cost = ctx.g;
+                    if backtrack(&mut ctx, tasks, &mut trace) {
                         continue 'search;
                     }
                 }
@@ -844,7 +916,7 @@ impl<'a> HtnPlanner<'a> {
                 // exhausted, so this stays a `Partial` `Ok` (not `NoPlan`).
                 return Ok(match best {
                     Some(b) => b,
-                    None => materialize(tasks, &plan, mtr.clone(), PlanStatus::Partial, None),
+                    None => materialize(&ctx.plan, ctx.mtr.clone(), PlanStatus::Partial, None),
                 });
             }
 
@@ -859,29 +931,11 @@ impl<'a> HtnPlanner<'a> {
                     // A pause marker popped: the compiled plan ends here.
                     // Everything still queued is the resume point's work —
                     // front-to-back, chained pause markers included (the
-                    // resumed search re-truncates at them). A `Linearize`
-                    // entry cannot sit behind a pause (each is pushed by
-                    // `backtrack` and popped back-to-back, before anything
-                    // else can leave the queue), so the queue holds only
-                    // Task/Pause entries here.
-                    let mut left: Vec<ResumeStep> = Vec::with_capacity(stack.len());
-                    let mut live = true;
-                    for entry in &stack {
-                        match entry {
-                            Step::Task(idx, _) => left.push(ResumeStep::Task(*idx as u32)),
-                            Step::Pause => left.push(ResumeStep::Pause),
-                            // Unreachable by construction (see above):
-                            // degrade to a budget-style partial — the driver
-                            // replans from the root — rather than trusting
-                            // an impossible queue shape.
-                            Step::Linearize { .. } => {
-                                live = false;
-                                status = PlanStatus::Partial;
-                                break;
-                            }
-                        }
-                    }
-                    let has_work = live && left.iter().any(|s| matches!(s, ResumeStep::Task(_)));
+                    // resumed search re-truncates at them).
+                    let left = collect_resume_queue(&ctx.stack);
+                    let has_work = left
+                        .as_ref()
+                        .is_some_and(|l| l.iter().any(|s| matches!(s, ResumeStep::Task(_))));
                     if has_work {
                         if cost_bounded && best.is_some() {
                             // Branch-and-bound already holds a complete
@@ -891,8 +945,8 @@ impl<'a> HtnPlanner<'a> {
                         }
                         status = PlanStatus::Paused;
                         paused_resume = Some(ResumePoint {
-                            tasks: left,
-                            mtr: mtr.clone(),
+                            tasks: left.expect("has_work implies a collected queue"),
+                            mtr: ctx.mtr.clone(),
                         });
                     }
                     // No work queued behind the pause (or a complete plan is
@@ -920,47 +974,25 @@ impl<'a> HtnPlanner<'a> {
                         // Unreachable when the baked order count is consistent
                         // with the enumeration; recover through the normal
                         // backtrack path (which exhausts cleanly).
-                        if !backtrack(
-                            &mut decomp_stack,
-                            &mut plan,
-                            &mut mtr,
-                            &mut stack,
-                            &mut rollback,
-                            &mut skip,
-                            &mut rank_order,
-                            &mut rank_pos,
-                            &mut g,
-                            &mut state,
-                            tasks,
-                            &mut trace,
-                        ) {
+                        if !backtrack(&mut ctx, tasks, &mut trace) {
                             exhausted = true;
                             break 'search;
                         }
                         continue 'search;
                     };
                     // Re-commit: the method's MTR entry was removed by the
-                    // backtrack, so re-record it.
-                    mtr.push(method as usize);
-                    if let Some(t) = trace.as_deref_mut() {
-                        t.push(DecompositionTrace {
-                            compound: task,
-                            branch: method,
-                            branch_name: m.name,
-                            outcome: TraceOutcome::Selected,
-                        });
-                    }
-                    // Push the linearized member sequence, without occurrence
-                    // pins — the sweep's pins were derived for the first
-                    // order; retries run unpinned (an optimization, never a
-                    // soundness requirement).
-                    for &pos in order.iter().rev() {
-                        let sub_idx = m.subtasks[pos as usize] as usize;
-                        stack.push_front(Step::Task(sub_idx, None));
-                    }
-                    skip = 0;
-                    rank_order.clear();
-                    rank_pos = 0;
+                    // backtrack, so re-record it and push the linearized
+                    // member sequence (unpinned — retries run unpinned; an
+                    // optimization, never a soundness requirement).
+                    recommit_linearized(
+                        &mut ctx,
+                        &mut trace,
+                        task,
+                        method,
+                        m.name,
+                        &m.subtasks,
+                        &order,
+                    );
                     continue 'search;
                 }
             };
@@ -975,10 +1007,10 @@ impl<'a> HtnPlanner<'a> {
                     let pin = occurrence_pin;
                     loop {
                         let eligible = match pin {
-                            Some(pm) if pm as usize >= skip => compound
+                            Some(pm) if pm as usize >= ctx.skip => compound
                                 .methods
                                 .get(pm as usize)
-                                .filter(|m| m.preconditions.iter().all(|c| c.evaluate(&state)))
+                                .filter(|m| m.applicable(&ctx.state))
                                 .map(|m| (m, pm as usize)),
                             // The pinned method was already tried and failed;
                             // every other method was proven infeasible at pin
@@ -987,23 +1019,23 @@ impl<'a> HtnPlanner<'a> {
                             None => match &compound.policy {
                                 // Fast path: the default declaration-order
                                 // policy scans directly, no ranking setup.
-                                SelectionPolicy::FirstMatch => compound.find_method(&state, skip),
+                                SelectionPolicy::FirstMatch => compound.find_method(&ctx.state, ctx.skip),
                                 // Rank once per node visit (precondition
                                 // validity is constant there — the state
                                 // only changes deeper down, and backtracking
                                 // restores it), then walk the ranked list.
                                 _ => {
-                                    if rank_order.is_empty() {
+                                    if ctx.rank_order.is_empty() {
                                         compound.rank_valid_methods(
-                                            &state,
-                                            plan.len() as u64,
-                                            &mut rank_order,
+                                            &ctx.state,
+                                            ctx.plan.len() as u64,
+                                            &mut ctx.rank_order,
                                         );
                                         if let Some(t) = trace.as_deref_mut() {
                                             // Every method NOT in the ranked order
                                             // failed its preconditions.
                                             let ranked: std::collections::HashSet<u32> =
-                                                rank_order.iter().copied().collect();
+                                                ctx.rank_order.iter().copied().collect();
                                             for (mi, m) in compound.methods.iter().enumerate() {
                                                 if !ranked.contains(&(mi as u32)) {
                                                     t.push(DecompositionTrace {
@@ -1016,8 +1048,8 @@ impl<'a> HtnPlanner<'a> {
                                             }
                                         }
                                     }
-                                    rank_order
-                                        .get(rank_pos)
+                                    ctx.rank_order
+                                        .get(ctx.rank_pos)
                                         .map(|&mi| (&compound.methods[mi as usize], mi as usize))
                                 }
                             },
@@ -1029,20 +1061,7 @@ impl<'a> HtnPlanner<'a> {
                                 status = PlanStatus::Partial;
                                 break 'search;
                             }
-                            if !backtrack(
-                                &mut decomp_stack,
-                                &mut plan,
-                                &mut mtr,
-                                &mut stack,
-                                &mut rollback,
-                                &mut skip,
-                                &mut rank_order,
-                                &mut rank_pos,
-                                &mut g,
-                                &mut state,
-                                tasks,
-                                &mut trace,
-                            ) {
+                            if !backtrack(&mut ctx, tasks, &mut trace) {
                                 exhausted = true;
                                 break 'search;
                             }
@@ -1053,13 +1072,13 @@ impl<'a> HtnPlanner<'a> {
                         // bound (accumulated cost + the method's bake-time
                         // sequence minimum) cannot strictly beat the best
                         // complete plan is pruned without recursing.
-                        if cost_bounded && best.is_some() && g + method.min_cost >= best_cost {
+                        if cost_bounded && best.is_some() && ctx.g + method.min_cost >= best_cost {
                             if pin.is_some()
                                 || matches!(compound.policy, SelectionPolicy::FirstMatch)
                             {
-                                skip = idx + 1;
+                                ctx.skip = idx + 1;
                             } else {
-                                rank_pos += 1;
+                                ctx.rank_pos += 1;
                             }
                             continue;
                         }
@@ -1101,16 +1120,10 @@ impl<'a> HtnPlanner<'a> {
                         } else {
                             None
                         };
-                        // Adaptive tiers: Full sweeps (with pins) until a
+                        // Adaptive tiers: full sweeps (with pins) until a
                         // method proves sweep-useless, cheap refutation-only
                         // sweeps while it is on probation, no sweep where the
                         // sweep provably duplicates the next queue pop.
-                        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-                        enum SweepTier {
-                            Full,
-                            RefutationOnly,
-                            Skip,
-                        }
                         let sweep_tier = if sweep_end == 0 {
                             // The pause sits before every member: this
                             // method contributes nothing to the compiled
@@ -1151,12 +1164,22 @@ impl<'a> HtnPlanner<'a> {
                         };
                         let verdict = match sweep_tier {
                             SweepTier::Skip => Lookahead::Refine,
-                            SweepTier::RefutationOnly => {
+                            tier => {
                                 seq_buf.clear();
-                                seq_buf.extend(resolved_buf[..sweep_end].iter().map(|&(_, idx)| idx));
+                                seq_buf
+                                    .extend(resolved_buf[..sweep_end].iter().map(|&(_, idx)| idx));
+                                // Refutation-only shares the full sweep's
+                                // mechanics with the compound-survivor
+                                // analysis switched off (see SweepDepth).
+                                let depth = match tier {
+                                    SweepTier::RefutationOnly => {
+                                        lookahead::SweepDepth::RefutationOnly
+                                    }
+                                    _ => lookahead::SweepDepth::Full,
+                                };
                                 lookahead::sweep(
                                     self.domain,
-                                    &state,
+                                    &ctx.state,
                                     &mut sweep_owned,
                                     &seq_buf,
                                     sanity_limit.saturating_sub(count),
@@ -1164,23 +1187,7 @@ impl<'a> HtnPlanner<'a> {
                                     &mut sweep_pins,
                                     &mut sweep_surviving,
                                     method.order.is_partial(),
-                                    lookahead::SweepDepth::RefutationOnly,
-                                )
-                            }
-                            SweepTier::Full => {
-                                seq_buf.clear();
-                                seq_buf.extend(resolved_buf[..sweep_end].iter().map(|&(_, idx)| idx));
-                                lookahead::sweep(
-                                    self.domain,
-                                    &state,
-                                    &mut sweep_owned,
-                                    &seq_buf,
-                                    sanity_limit.saturating_sub(count),
-                                    &mut sweep_unknown,
-                                    &mut sweep_pins,
-                                    &mut sweep_surviving,
-                                    method.order.is_partial(),
-                                    lookahead::SweepDepth::Full,
+                                    depth,
                                 )
                             }
                         };
@@ -1196,9 +1203,9 @@ impl<'a> HtnPlanner<'a> {
                                 if pin.is_some()
                                     || matches!(compound.policy, SelectionPolicy::FirstMatch)
                                 {
-                                    skip = idx + 1;
+                                    ctx.skip = idx + 1;
                                 } else {
-                                    rank_pos += 1;
+                                    ctx.rank_pos += 1;
                                 }
                                 continue;
                             }
@@ -1214,8 +1221,8 @@ impl<'a> HtnPlanner<'a> {
                                 // the node's retry replaces it instead of
                                 // appending (a stale entry would corrupt the
                                 // MTR of every plan found after a backtrack).
-                                let mtr_len = mtr.len();
-                                mtr.push(idx);
+                                let mtr_len = ctx.mtr.len();
+                                ctx.mtr.push(idx);
                                 if let Some(t) = trace.as_deref_mut() {
                                     t.push(DecompositionTrace {
                                         compound: current as u32,
@@ -1226,17 +1233,17 @@ impl<'a> HtnPlanner<'a> {
                                 }
                                 let frame = DecompositionFrame {
                                     task: current,
-                                    plan_len: plan.len(),
+                                    plan_len: ctx.plan.len(),
                                     skip_next: idx + 1,
                                     mtr_len,
                                     pinned: pin,
-                                    stack: stack.iter().copied().collect(),
-                                    rollback_len: rollback.len(),
+                                    stack: ctx.stack.iter().copied().collect(),
+                                    rollback_len: ctx.rollback.len(),
                                     // Resume position in the node's ranked
                                     // order (the order is re-derived
                                     // deterministically on revisit).
-                                    rank_resume: rank_pos + 1,
-                                    g_commit: g,
+                                    rank_resume: ctx.rank_pos + 1,
+                                    g_commit: ctx.g,
                                     // Partially-ordered methods retry their
                                     // next topological order (starting at 1;
                                     // order 0 is pushed below) before other
@@ -1247,7 +1254,7 @@ impl<'a> HtnPlanner<'a> {
                                         SubtaskOrder::Total => 0,
                                     },
                                 };
-                                decomp_stack.push(frame);
+                                ctx.decomp_stack.push(frame);
                                 // Push subtask occurrences in reverse so the
                                 // first pops first, attaching each one's
                                 // inevitable-refinement pin (if the sweep
@@ -1271,7 +1278,7 @@ impl<'a> HtnPlanner<'a> {
                                         // stack pops last-pushed-first).
                                         let pauses = &method.pause_positions;
                                         if pauses.contains(&(method.subtasks.len() as u32)) {
-                                            stack.push_front(Step::Pause);
+                                            ctx.stack.push_front(Step::Pause);
                                         }
                                         for pos in (0..method.subtasks.len()).rev() {
                                             let sub_idx = method.subtasks[pos] as usize;
@@ -1291,13 +1298,13 @@ impl<'a> HtnPlanner<'a> {
                                                     .find(|(p, _)| *p == pos)
                                                     .map(|&(_, m)| m as u32)
                                             };
-                                            stack.push_front(Step::Task(sub_idx, sub_pin));
+                                            ctx.stack.push_front(Step::Task(sub_idx, sub_pin));
                                             // Pushed after the member, so it pops
                                             // *before* it: the pause before
                                             // member `pos` pops right after
                                             // member `pos - 1`.
                                             if pauses.contains(&(pos as u32)) {
-                                                stack.push_front(Step::Pause);
+                                                ctx.stack.push_front(Step::Pause);
                                             }
                                         }
                                     }
@@ -1312,20 +1319,20 @@ impl<'a> HtnPlanner<'a> {
                                                     .find(|(p, _)| *p == pos as usize)
                                                     .map(|&(_, m)| m as u32)
                                             };
-                                            stack.push_front(Step::Task(sub_idx, sub_pin));
+                                            ctx.stack.push_front(Step::Task(sub_idx, sub_pin));
                                         }
                                     }
                                 }
-                                skip = 0;
-                                rank_order.clear();
-                                rank_pos = 0;
+                                ctx.skip = 0;
+                                ctx.rank_order.clear();
+                                ctx.rank_pos = 0;
                                 continue 'search;
                             }
                         }
                     }
                 }
                 Task::Primitive(primitive) => {
-                    if primitive.preconditions_met(&state) {
+                    if primitive.preconditions_met(&ctx.state) {
                         // Branch-and-bound: evaluate the step cost and prune
                         // the step when no completion through it can strictly
                         // beat the best complete plan (every remaining step
@@ -1334,38 +1341,25 @@ impl<'a> HtnPlanner<'a> {
                             primitive
                                 .cost
                                 .as_ref()
-                                .map(|f| f(&state))
+                                .map(|f| f(&ctx.state))
                                 .unwrap_or(0.0)
                                 .max(0.0)
                         } else {
                             0.0
                         };
-                        if cost_bounded && best.is_some() && g + step_cost >= best_cost {
+                        if cost_bounded && best.is_some() && ctx.g + step_cost >= best_cost {
                             if fail_fast {
                                 status = PlanStatus::Partial;
                                 break 'search;
                             }
-                            if !backtrack(
-                                &mut decomp_stack,
-                                &mut plan,
-                                &mut mtr,
-                                &mut stack,
-                                &mut rollback,
-                                &mut skip,
-                                &mut rank_order,
-                                &mut rank_pos,
-                                &mut g,
-                                &mut state,
-                                tasks,
-                                &mut trace,
-                            ) {
+                            if !backtrack(&mut ctx, tasks, &mut trace) {
                                 exhausted = true;
                                 break 'search;
                             }
                             continue;
                         }
-                        plan.push(current);
-                        g += step_cost;
+                        ctx.plan.push(current);
+                        ctx.g += step_cost;
                         // Snapshot every slot the effects write before the
                         // first write, so backtracking can restore them.
                         for e in primitive
@@ -1374,37 +1368,31 @@ impl<'a> HtnPlanner<'a> {
                             .chain(primitive.expected_effects.iter())
                         {
                             for &w in e.writes() {
-                                rollback.snapshot(&state, w);
+                                ctx.rollback.snapshot(&ctx.state, w);
                             }
-                            e.apply(&mut state);
+                            e.apply(&mut ctx.state);
                         }
-                        skip = 0;
+                        ctx.skip = 0;
                         continue;
                     }
                     if fail_fast {
                         status = PlanStatus::Partial;
                         break 'search;
                     }
-                    if !backtrack(
-                        &mut decomp_stack,
-                        &mut plan,
-                        &mut mtr,
-                        &mut stack,
-                        &mut rollback,
-                        &mut skip,
-                        &mut rank_order,
-                        &mut rank_pos,
-                        &mut g,
-                        &mut state,
-                        tasks,
-                        &mut trace,
-                    ) {
+                    if !backtrack(&mut ctx, tasks, &mut trace) {
                         exhausted = true;
                         break 'search;
                     }
                     continue;
                 }
                 Task::Goal(_) => {
+                    // Goal tasks are back-planning targets, never forward
+                    // steps — no recording path can put one in the queue (a
+                    // method body references task functions, not goal
+                    // functions). The only way to reach this arm is a raw
+                    // `PlanRoot::Index` aimed at a goal's task index, and the
+                    // honest answer to "plan this goal task forward" is the
+                    // empty `Complete` plan it decomposes to — not an error.
                     break;
                 }
             }
@@ -1416,49 +1404,103 @@ impl<'a> HtnPlanner<'a> {
             // Anything else breaking out early already set `Partial` and
             // carries the best prefix as a non-error result.
             None if exhausted => Err(HtnError::NoPlan),
-            None => Ok(materialize(tasks, &plan, mtr, status, paused_resume.take())),
+            None => Ok(materialize(&ctx.plan, std::mem::take(&mut ctx.mtr), status, paused_resume.take())),
         }
     }
+}
+
+/// How much analysis one commitment's look-ahead sweep performs (the
+/// adaptive tiers; `Always` is always [`SweepTier::Full`], `Off` always
+/// [`SweepTier::Skip`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SweepTier {
+    /// Full analysis: refutation + pins + optimistic propagation.
+    Full,
+    /// Budget refutation + primitive-precondition checks only.
+    RefutationOnly,
+    /// No sweep (provably duplicates the next queue pop, or the pause
+    /// leaves nothing to sweep).
+    Skip,
+}
+
+/// Collect the still-queued work behind a popped pause marker: the resume
+/// queue in execution order, chained pause markers included. `None` means an
+/// impossible queue shape (a `Linearize` entry behind a pause — unreachable
+/// by construction, since each is pushed by `backtrack` and popped
+/// back-to-back before anything else can leave the queue); the caller
+/// degrades to a budget-style partial rather than trusting it.
+fn collect_resume_queue(stack: &VecDeque<Step>) -> Option<Vec<ResumeStep>> {
+    let mut left = Vec::with_capacity(stack.len());
+    for entry in stack {
+        match entry {
+            Step::Task(idx, _) => left.push(ResumeStep::Task(*idx as u32)),
+            Step::Pause => left.push(ResumeStep::Pause),
+            Step::Linearize { .. } => return None,
+        }
+    }
+    Some(left)
+}
+
+/// Re-commit a retried partial-order method with its next topological order:
+/// re-record the MTR entry the backtrack removed, trace the re-commitment,
+/// and push the linearized member sequence (unpinned — retries run
+/// unpinned; an optimization, never a soundness requirement). Resets the
+/// choice-point bookkeeping so the retried method's site starts fresh.
+fn recommit_linearized(
+    ctx: &mut SearchCtx,
+    trace: &mut Option<&mut Vec<DecompositionTrace>>,
+    task: u32,
+    method: u32,
+    branch_name: Option<&'static str>,
+    subtasks: &[u32],
+    order: &[u8],
+) {
+    ctx.mtr.push(method as usize);
+    if let Some(t) = trace.as_deref_mut() {
+        t.push(DecompositionTrace {
+            compound: task,
+            branch: method,
+            branch_name,
+            outcome: TraceOutcome::Selected,
+        });
+    }
+    for &pos in order.iter().rev() {
+        let sub_idx = subtasks[pos as usize] as usize;
+        ctx.stack.push_front(Step::Task(sub_idx, None));
+    }
+    ctx.skip = 0;
+    ctx.rank_order.clear();
+    ctx.rank_pos = 0;
 }
 
 /// Unwind one decomposition frame (or, for a pinned task whose only viable
 /// method failed, keep unwinding past it). Restores the append-only prefixes
 /// by truncation, the scratchpad by rollback, and re-queues the frame's task
 /// for its next method choice. Returns `false` when the search is exhausted.
-#[allow(clippy::too_many_arguments)]
 fn backtrack(
-    decomp_stack: &mut Vec<DecompositionFrame>,
-    plan: &mut Vec<usize>,
-    mtr: &mut Vec<usize>,
-    stack: &mut VecDeque<Step>,
-    rollback: &mut Rollback,
-    skip: &mut usize,
-    rank_order: &mut SmallVec<[u32; 4]>,
-    rank_pos: &mut usize,
-    g: &mut f32,
-    state: &mut PlanState,
+    ctx: &mut SearchCtx,
     tasks: &[Task],
     trace: &mut Option<&mut Vec<DecompositionTrace>>,
 ) -> bool {
     loop {
-        match decomp_stack.pop() {
+        match ctx.decomp_stack.pop() {
             Some(frame) => {
-                plan.truncate(frame.plan_len);
-                mtr.truncate(frame.mtr_len);
+                ctx.plan.truncate(frame.plan_len);
+                ctx.mtr.truncate(frame.mtr_len);
                 // Restore the scratchpad: undo every effect applied since the
                 // frame committed (newest first).
-                rollback.restore_to(frame.rollback_len, state);
+                ctx.rollback.restore_to(frame.rollback_len, &mut ctx.state);
                 // Restore the accumulated cost to its commitment value (the
                 // truncated primitives are exactly the ones added since).
-                *g = frame.g_commit;
+                ctx.g = frame.g_commit;
                 // Restore the queue to its state at commitment time: the
                 // failed subtree's remnants go, the suffix (with its
                 // occurrence pins) comes back. The snapshot copy is load-
                 // bearing: a completed subtree's frame can be backtracked
                 // into after the search consumed part of the suffix, and a
                 // bare length cannot restore what was already popped.
-                stack.clear();
-                stack.extend(frame.stack.iter().copied());
+                ctx.stack.clear();
+                ctx.stack.extend(frame.stack.iter().copied());
                 // Partially-ordered method with pending linearizations: retry
                 // the SAME method with its next topological order before other
                 // methods are offered. The state/plan/mtr/queue above were
@@ -1485,11 +1527,11 @@ fn backtrack(
                     let lin_try = frame.lin;
                     // The replacement frame covers the next attempt: identical
                     // restore points, one linearization further.
-                    decomp_stack.push(DecompositionFrame {
+                    ctx.decomp_stack.push(DecompositionFrame {
                         lin: lin_try + 1,
                         ..frame
                     });
-                    stack.push_front(Step::Linearize {
+                    ctx.stack.push_front(Step::Linearize {
                         task: lin_task,
                         method: lin_method,
                         lin: lin_try,
@@ -1502,14 +1544,14 @@ fn backtrack(
                     // keep unwinding instead of retrying them.
                     continue;
                 }
-                *skip = frame.skip_next;
+                ctx.skip = frame.skip_next;
                 // Resume this node's ranked list past the committed choice:
                 // the order is re-derived on the node's next visit (all
                 // policies are deterministic per (state, nonce), and the
                 // nonce — the restored plan length — matches the original
                 // visit, so the resumed order is identical).
-                rank_order.clear();
-                *rank_pos = frame.rank_resume;
+                ctx.rank_order.clear();
+                ctx.rank_pos = frame.rank_resume;
                 if let Some(t) = trace.as_deref_mut() {
                     // The branch the unwound frame was committed to.
                     let branch = frame.skip_next.saturating_sub(1);
@@ -1524,7 +1566,7 @@ fn backtrack(
                         outcome: TraceOutcome::Backtracked,
                     });
                 }
-                stack.push_front(Step::Task(frame.task, frame.pinned));
+                ctx.stack.push_front(Step::Task(frame.task, frame.pinned));
                 return true;
             }
             None => return false,
@@ -1533,19 +1575,18 @@ fn backtrack(
 }
 
 /// Convert a plan of (narrow) task indices into the compiled step program:
-/// contiguous `u32` task indices plus the parallel interned-name list.
+/// contiguous `u32` task indices (display names resolve against the domain
+/// on demand — see [`Plan::task_names`]).
 fn materialize(
-    tasks: &[Task],
     plan: &[usize],
     mtr: Vec<usize>,
     status: PlanStatus,
     resume: Option<ResumePoint>,
 ) -> Plan {
-    Plan {
-        steps: plan.iter().map(|&i| i as u32).collect(),
-        names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
+    Plan::compiled(
+        plan.iter().map(|&i| i as u32).collect(),
         mtr,
         status,
         resume,
-    }
+    )
 }

@@ -84,7 +84,7 @@ fn run_ai(
         let mut planner = HtnPlanner::new(domain);
         let planned = plan_root(&mut planner, earn_gold, &scratch.0);
         execute_plan(domain, &mut scratch.0, &planned);
-        output.0 = planned.task_names().to_vec();
+        output.0 = planned.task_names(domain).into_iter().map(Ustr::from).collect();
         processed.0.fetch_add(1, Ordering::Relaxed);
     });
 }
@@ -109,15 +109,15 @@ fn miner_bundle(
 ) -> (Gold, HasOre, HasMetal, Energy, Hunger, Location) {
     let reg = &domain.components;
     (
-        state.get::<Gold>(reg.get::<Gold>().unwrap()).clone(),
-        state.get::<HasOre>(reg.get::<HasOre>().unwrap()).clone(),
+        state.get_slot::<Gold>(reg.slot_of::<Gold>().unwrap()).clone(),
+        state.get_slot::<HasOre>(reg.slot_of::<HasOre>().unwrap()).clone(),
         state
-            .get::<HasMetal>(reg.get::<HasMetal>().unwrap())
+            .get_slot::<HasMetal>(reg.slot_of::<HasMetal>().unwrap())
             .clone(),
-        state.get::<Energy>(reg.get::<Energy>().unwrap()).clone(),
-        state.get::<Hunger>(reg.get::<Hunger>().unwrap()).clone(),
+        state.get_slot::<Energy>(reg.slot_of::<Energy>().unwrap()).clone(),
+        state.get_slot::<Hunger>(reg.slot_of::<Hunger>().unwrap()).clone(),
         state
-            .get::<Location>(reg.get::<Location>().unwrap())
+            .get_slot::<Location>(reg.slot_of::<Location>().unwrap())
             .clone(),
     )
 }

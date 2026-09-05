@@ -60,8 +60,8 @@ fn idle(task: &mut TaskBuilder) {
 /// Max's payoff: gold minus the bribe's cost.
 fn invasion_eval(gold: usize, bribed: usize) -> impl Fn(&PlanState) -> f32 {
     move |s: &PlanState| {
-        let g = s.get::<Gold>(gold).0 as f32;
-        let b = if s.get::<Bribed>(bribed).0 { 10.0 } else { 0.0 };
+        let g = s.get_slot::<Gold>(gold).0 as f32;
+        let b = if s.get_slot::<Bribed>(bribed).0 { 10.0 } else { 0.0 };
         g - b
     }
 }
@@ -93,10 +93,10 @@ fn search<MaxRoot: TaskFn, MinRoot: TaskFn>(
 /// value 5 (the bribe's -5 is dominated).
 #[test]
 fn ahtn_solves_when_opponent_passive() {
-    let domain = HtnDomain::from_root(invade).root(idle).build().unwrap();
+    let domain = HtnDomain::from_root(invade).add_root(idle).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
 
     let outcome = search(
         &domain,
@@ -120,10 +120,10 @@ fn ahtn_solves_when_opponent_passive() {
 /// wall. Minimax changes the decision; a single-agent planner cannot.
 #[test]
 fn ahtn_picks_the_branch_that_survives_best_defense() {
-    let domain = HtnDomain::from_root(invade).root(defend).build().unwrap();
+    let domain = HtnDomain::from_root(invade).add_root(defend).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
 
     let outcome = search(
         &domain,
@@ -168,12 +168,12 @@ fn ahtn_interleaves_execution_in_exact_order() {
     struct TicksB(pub i32);
 
     let domain = HtnDomain::from_root(max_root)
-        .root(min_root)
+        .add_root(min_root)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let a = domain.components.get::<TicksA>().unwrap();
-    let b = domain.components.get::<TicksB>().unwrap();
+    let a = domain.components.slot_of::<TicksA>().unwrap();
+    let b = domain.components.slot_of::<TicksB>().unwrap();
 
     let outcome = search(
         &domain,
@@ -181,7 +181,7 @@ fn ahtn_interleaves_execution_in_exact_order() {
         max_root,
         min_root,
         &state,
-        |s| (s.get::<TicksA>(a).0 * 10 + s.get::<TicksB>(b).0) as f32,
+        |s| (s.get_slot::<TicksA>(a).0 * 10 + s.get_slot::<TicksB>(b).0) as f32,
         10,
     )
     .expect("search ok")
@@ -204,12 +204,12 @@ fn ahtn_stuck_opponent_loses_the_branch() {
         task.branch().then(impossible);
     }
     let domain = HtnDomain::from_root(invade)
-        .root(dead_defense)
+        .add_root(dead_defense)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
 
     let outcome = search(
         &domain,
@@ -236,9 +236,9 @@ fn ahtn_no_viable_plan_returns_none() {
     fn doomed(task: &mut TaskBuilder) {
         task.branch().then(wait).then(ram); // min always walls first
     }
-    let domain = HtnDomain::from_root(doomed).root(defend).build().unwrap();
+    let domain = HtnDomain::from_root(doomed).add_root(defend).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
 
     // This domain never registers `Bribed` (no closure touches it), so the
     // eval reads only gold.
@@ -248,7 +248,7 @@ fn ahtn_no_viable_plan_returns_none() {
         doomed,
         defend,
         &state,
-        |s| s.get::<Gold>(gold).0 as f32,
+        |s| s.get_slot::<Gold>(gold).0 as f32,
         10,
     );
     assert!(matches!(outcome, Ok(None)), "every branch is stuck");
@@ -281,9 +281,9 @@ fn ahtn_wait_method_fallback_survives_until_the_gate_opens() {
         task.branch().then(open_gate);
     }
 
-    let domain = HtnDomain::from_root(go).root(gatekeeper).build().unwrap();
+    let domain = HtnDomain::from_root(go).add_root(gatekeeper).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let won = domain.components.get::<Won>().unwrap();
+    let won = domain.components.slot_of::<Won>().unwrap();
 
     let outcome = search(
         &domain,
@@ -292,7 +292,7 @@ fn ahtn_wait_method_fallback_survives_until_the_gate_opens() {
         gatekeeper,
         &state,
         |s| {
-            if s.get::<Won>(won).0 {
+            if s.get_slot::<Won>(won).0 {
                 1.0
             } else {
                 0.0
@@ -333,11 +333,11 @@ fn ahtn_depth_caps_the_lookahead() {
     struct TicksA(pub i32);
 
     let domain = HtnDomain::from_root(max_root)
-        .root(idle_min)
+        .add_root(idle_min)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let a = domain.components.get::<TicksA>().unwrap();
+    let a = domain.components.slot_of::<TicksA>().unwrap();
 
     let outcome = search(
         &domain,
@@ -345,7 +345,7 @@ fn ahtn_depth_caps_the_lookahead() {
         max_root,
         idle_min,
         &state,
-        |s| s.get::<TicksA>(a).0 as f32,
+        |s| s.get_slot::<TicksA>(a).0 as f32,
         2,
     )
     .expect("search ok")
@@ -371,7 +371,7 @@ fn ahtn_decomposition_budget_terminates_recursion() {
     }
 
     let domain = HtnDomain::from_root(spiral)
-        .root(simple_max)
+        .add_root(simple_max)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
@@ -395,10 +395,10 @@ fn ahtn_decomposition_budget_terminates_recursion() {
 /// the budget is shared across both players and the whole search.
 #[test]
 fn ahtn_decomposition_budget_is_shared_and_enforceable() {
-    let domain = HtnDomain::from_root(invade).root(defend).build().unwrap();
+    let domain = HtnDomain::from_root(invade).add_root(defend).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
 
     // Budget 1: the first method application (max's invade) consumes it;
     // min's defend then cannot decompose → min stuck → +∞ for max.
@@ -445,11 +445,11 @@ fn ahtn_schedules_the_first_topological_order() {
     }
 
     let domain = HtnDomain::from_root(max_root)
-        .root(idle_min)
+        .add_root(idle_min)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let seq_slot = domain.components.get::<Seq>().unwrap();
+    let seq_slot = domain.components.slot_of::<Seq>().unwrap();
 
     let outcome = search(&domain, None, max_root, idle_min, &state, |_| 0.0, 10)
         .expect("search ok")
@@ -465,7 +465,7 @@ fn ahtn_schedules_the_first_topological_order() {
                 }
             }
         }
-        s.get::<Seq>(seq_slot).0.clone()
+        s.get_slot::<Seq>(seq_slot).0.clone()
     };
     assert_eq!(
         executed,
@@ -481,10 +481,10 @@ fn ahtn_schedules_the_first_topological_order() {
 fn ahtn_rejects_bad_roots() {
     fn never_registered(_task: &mut TaskBuilder) {}
 
-    let domain = HtnDomain::from_root(invade).root(defend).build().unwrap();
+    let domain = HtnDomain::from_root(invade).add_root(defend).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
     let eval = invasion_eval(gold, bribed);
 
     let err = search(&domain, None, never_registered, defend, &state, &eval, 10).unwrap_err();
@@ -498,10 +498,10 @@ fn ahtn_rejects_bad_roots() {
 /// Zero depth evaluates the initial state immediately (empty plan).
 #[test]
 fn ahtn_zero_depth_evaluates_immediately() {
-    let domain = HtnDomain::from_root(invade).root(idle).build().unwrap();
+    let domain = HtnDomain::from_root(invade).add_root(idle).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
-    let bribed = domain.components.get::<Bribed>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let bribed = domain.components.slot_of::<Bribed>().unwrap();
 
     let outcome = search(
         &domain,
@@ -727,15 +727,15 @@ fn dungeon_setup(
     min_root: impl bevy_bhtn::tasks::TaskFn,
 ) -> (HtnDomain, PlanState, impl Fn(&PlanState) -> f32) {
     let domain = HtnDomain::from_root(dungeon::raid)
-        .root(min_root)
+        .add_root(min_root)
         .build()
         .unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let hoard = domain.components.get::<dungeon::HoardTaken>().unwrap();
-    let sewers = domain.components.get::<dungeon::SewersUsed>().unwrap();
+    let hoard = domain.components.slot_of::<dungeon::HoardTaken>().unwrap();
+    let sewers = domain.components.slot_of::<dungeon::SewersUsed>().unwrap();
     let eval = move |s: &PlanState| {
-        if s.get::<dungeon::HoardTaken>(hoard).0 {
-            if s.get::<dungeon::SewersUsed>(sewers).0 {
+        if s.get_slot::<dungeon::HoardTaken>(hoard).0 {
+            if s.get_slot::<dungeon::SewersUsed>(sewers).0 {
                 50.0
             } else {
                 100.0

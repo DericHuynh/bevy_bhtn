@@ -171,6 +171,11 @@ pub struct RegistryLayout {
 }
 
 impl RegistryLayout {
+    /// The slot index registered for `TypeId`, if any (O(1)).
+    fn slot_of(&self, tid: &TypeId) -> Option<usize> {
+        self.by_type.get(tid).copied()
+    }
+
     /// Append a slot for `T` (alignment-correct), returning its index.
     fn push_slot<T: PlanComponent>(&mut self, name: &'static str) -> usize {
         let align = std::mem::align_of::<T>();
@@ -214,7 +219,6 @@ impl std::fmt::Debug for RegistryLayout {
 #[derive(Default)]
 pub struct RegistryBuilder {
     layout: RegistryLayout,
-    by_type: HashMap<TypeId, usize>,
     /// Collected domain-authoring errors (e.g. an effect closure taking the
     /// same component type twice). Recording soft-collects instead of
     /// panicking; `HtnDomain::build` drains these into its `Builder` error.
@@ -223,14 +227,13 @@ pub struct RegistryBuilder {
 
 impl RegistryBuilder {
     /// The slot index of component `T`, registering it (with its byte region
-    /// and monomorphized access fns) on first use.
+    /// and monomorphized access fns) on first use. The layout owns the
+    /// `TypeId -> slot` map for both the recording and frozen phases.
     pub fn index<T: PlanComponent>(&mut self) -> usize {
-        if let Some(&idx) = self.by_type.get(&TypeId::of::<T>()) {
+        if let Some(idx) = self.layout.slot_of(&TypeId::of::<T>()) {
             return idx;
         }
-        let idx = self.layout.push_slot::<T>(std::any::type_name::<T>());
-        self.by_type.insert(TypeId::of::<T>(), idx);
-        idx
+        self.layout.push_slot::<T>(std::any::type_name::<T>())
     }
 
     /// Soft-collect a domain-authoring error during recording. Baking turns
@@ -277,12 +280,13 @@ pub struct ComponentRegistry {
 impl ComponentRegistry {
     /// Whether component `T` is registered.
     pub fn contains<T: 'static>(&self) -> bool {
-        self.get::<T>().is_some()
+        self.slot_of::<T>().is_some()
     }
 
     /// The slot index of component `T`, if registered (O(1) via the frozen
-    /// `TypeId` map).
-    pub fn get<T: 'static>(&self) -> Option<usize> {
+    /// `TypeId` map). The planning-side counterpart of
+    /// [`RegistryBuilder::index`](RegistryBuilder::index).
+    pub fn slot_of<T: 'static>(&self) -> Option<usize> {
         self.layout.by_type.get(&TypeId::of::<T>()).copied()
     }
 
@@ -545,35 +549,39 @@ impl PlanState {
         }
     }
 
-    /// Read component `T` at slot `idx`.
+    /// Read component `T` at raw slot `idx` — the planner's hot path, where
+    /// the slot index was captured at closure-build time. The typed,
+    /// lookup-by-name counterpart is [`Self::get`].
     ///
-    /// Panics if `idx` is not `T`'s registered slot — closures capture their
-    /// offsets from the same registry that sized the scratchpad, so this can
-    /// only fail on a caller bug.
-    pub fn get<T: PlanComponent>(&self, idx: usize) -> &T {
+    /// # Panics
+    /// If `idx` is out of bounds. Calling it with a slot belonging to
+    /// another component type is a caller bug with undefined behavior (the
+    /// pointer is cast to `T` unchecked) — the same contract the compiled
+    /// closures rely on.
+    pub fn get_slot<T: PlanComponent>(&self, idx: usize) -> &T {
         debug_assert_eq!(self.layout.slots[idx].size, std::mem::size_of::<T>());
         unsafe { &*self.slot_ptr::<T>(idx) }
     }
 
-    /// Mutably read component `T` at slot `idx` (same contract as [`Self::get`]).
-    pub fn get_mut<T: PlanComponent>(&mut self, idx: usize) -> &mut T {
+    /// Mutably read component `T` at raw slot `idx` (see [`Self::get_slot`]).
+    pub fn get_mut_slot<T: PlanComponent>(&mut self, idx: usize) -> &mut T {
         debug_assert_eq!(self.layout.slots[idx].size, std::mem::size_of::<T>());
         unsafe { &mut *self.slot_ptr::<T>(idx) }
     }
 
     /// Read component `T` by type, resolving its slot through the frozen
     /// registry's `TypeId` map. `None` if `T` was never registered — the
-    /// ergonomic counterpart to the raw slot-index [`Self::get`] the hot
+    /// typed counterpart to the raw slot-index [`Self::get_slot`] the hot
     /// loop uses.
-    pub fn get_by_type<T: PlanComponent>(&self) -> Option<&T> {
-        let idx = *self.layout.by_type.get(&TypeId::of::<T>())?;
-        Some(self.get::<T>(idx))
+    pub fn get<T: PlanComponent>(&self) -> Option<&T> {
+        let idx = self.layout.by_type.get(&TypeId::of::<T>()).copied()?;
+        Some(self.get_slot::<T>(idx))
     }
 
-    /// Mutably read component `T` by type (see [`Self::get_by_type`]).
-    pub fn get_mut_by_type<T: PlanComponent>(&mut self) -> Option<&mut T> {
-        let idx = *self.layout.by_type.get(&TypeId::of::<T>())?;
-        Some(self.get_mut::<T>(idx))
+    /// Mutably read component `T` by type (see [`Self::get`]).
+    pub fn get_mut<T: PlanComponent>(&mut self) -> Option<&mut T> {
+        let idx = self.layout.by_type.get(&TypeId::of::<T>()).copied()?;
+        Some(self.get_mut_slot::<T>(idx))
     }
 
     /// Raw pointers to the given slots, proven disjoint by their distinct
@@ -776,9 +784,19 @@ pub struct PlanStateBuilder {
 }
 
 impl PlanStateBuilder {
-    /// Set component `T`'s slot to `value` (a no-op if `T` is not registered).
+    /// Set component `T`'s slot to `value`.
+    ///
+    /// # Panics (debug builds)
+    /// If `T` was never registered — a silently ignored `set` would leave
+    /// the slot at `Default` and hide the authoring bug behind a passing
+    /// test. Release builds keep the historical no-op.
     #[must_use]
     pub fn set<T: PlanComponent>(mut self, value: T) -> Self {
+        debug_assert!(
+            self.layout.by_type.contains_key(&TypeId::of::<T>()),
+            "PlanStateBuilder::set: `{}` was never registered in this registry",
+            std::any::type_name::<T>()
+        );
         if let Some(i) = self.layout.by_type.get(&TypeId::of::<T>()).copied() {
             unsafe {
                 let slot = self.pool.as_mut_ptr().add(self.layout.slots[i].offset) as *mut T;

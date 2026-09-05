@@ -730,7 +730,7 @@ pub fn doomed_recursion_domain() -> HtnDomain {
 /// scratchpad, in order. This is the *execution* semantics the integration
 /// tests pin (`effects` only — `expected_effects` are planning-only hopes).
 pub fn execute_plan(domain: &HtnDomain, state: &mut PlanState, plan: &Plan) {
-    for &step in &plan.steps {
+    for &step in plan.steps() {
         apply_step_effects(domain, state, step);
     }
 }
@@ -740,7 +740,7 @@ pub fn execute_plan(domain: &HtnDomain, state: &mut PlanState, plan: &Plan) {
 /// cycle advances the world by one action, so every replan sees real, changed
 /// state instead of a goal that was already completed by a full-plan execution.
 pub fn execute_plan_step(domain: &HtnDomain, state: &mut PlanState, plan: &Plan) {
-    if let Some(&first) = plan.steps.first() {
+    if let Some(&first) = plan.steps().first() {
         apply_step_effects(domain, state, first);
     }
 }

@@ -50,15 +50,36 @@ enum Candidate {
 /// recurse forever — the greedy expansion has no backtracking to unwind).
 const MAX_EXPANSION_DEPTH: usize = 64;
 
+/// The default total-primitive-steps budget of a back-planning run (bounds
+/// pathological compound chains; configurable via
+/// [`BackPlanner::with_budget`]).
+pub const DEFAULT_BACK_PLANNING_BUDGET: usize = 200;
+
 /// A backward planner that reaches a named goal task's effects.
 pub struct BackPlanner<'a> {
     domain: &'a HtnDomain,
+    budget: usize,
 }
 
 impl<'a> BackPlanner<'a> {
-    /// Create a back-planner over `domain`.
+    /// Create a back-planner over `domain` with the default expansion budget
+    /// ([`DEFAULT_BACK_PLANNING_BUDGET`] primitive steps).
     pub fn new(domain: &'a HtnDomain) -> Self {
-        Self { domain }
+        Self {
+            domain,
+            budget: DEFAULT_BACK_PLANNING_BUDGET,
+        }
+    }
+
+    /// Set the total-primitive-steps budget of a planning run (CDDA-scale
+    /// domains with long dependency chains legitimately need more than the
+    /// default). Exhausting the budget is reported as
+    /// [`HtnError::NoPlan`] — the same error as a genuine dead end; the
+    /// greedy expansion has no partial-prefix value to return.
+    #[must_use]
+    pub fn with_budget(mut self, budget: usize) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Plan from `initial_state` toward the effects of the goal function
@@ -84,7 +105,7 @@ impl<'a> BackPlanner<'a> {
         let mut steps: Vec<u32> = Vec::new();
         // Total primitive steps the plan may contain (bounds pathological
         // compound chains; the old loop count, widened to per-step cost).
-        let mut budget: usize = 200;
+        let mut budget: usize = self.budget;
 
         while !needed.is_empty() {
             if budget == 0 {
@@ -112,20 +133,16 @@ impl<'a> BackPlanner<'a> {
             }
         }
 
-        Ok(Plan {
-            names: steps
-                .iter()
-                .map(|&s| self.domain.tasks[s as usize].name().into())
-                .collect(),
+        Ok(Plan::compiled(
             steps,
-            mtr: Vec::new(),
+            Vec::new(),
             // Reverse chaining runs to completion or errors — never a
             // truncated prefix.
-            status: crate::planner::PlanStatus::Complete,
+            crate::planner::PlanStatus::Complete,
             // Pause markers shape forward plans only; backward chaining has
             // no method commitments to truncate.
-            resume: None,
-        })
+            None,
+        ))
     }
 
     /// Rank every applicable candidate by how many currently-needed slots it
@@ -156,7 +173,7 @@ impl<'a> BackPlanner<'a> {
                         continue;
                     }
                     for (mi, m) in c.methods.iter().enumerate() {
-                        if !m.preconditions.iter().all(|c| c.evaluate(state)) {
+                        if !m.applicable(state) {
                             continue;
                         }
                         let score = m
@@ -223,7 +240,7 @@ impl<'a> BackPlanner<'a> {
                             // covering nothing still runs — first applicable).
                             let mut best: Option<(usize, usize)> = None;
                             for (mi2, m2) in inner.methods.iter().enumerate() {
-                                if !m2.preconditions.iter().all(|c| c.evaluate(state)) {
+                                if !m2.applicable(state) {
                                     continue;
                                 }
                                 let score = m2

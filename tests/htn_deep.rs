@@ -39,10 +39,10 @@ fn fresh_actor_plan_is_deep_and_terminates() {
     // Depth >= 5: at least one leaf per objective (4 objectives) plus a
     // terminal stance. Any fresh actor that provably walks into a fixpoint must
     // produce at least 5 leaves.
-    assert!(plan.task_names().len() >= 5, "got {:?}", plan.task_names());
+    assert!(plan.task_names(&domain).len() >= 5, "got {:?}", plan.task_names(&domain));
 
     // The plan must name real tasks and each must be executable.
-    for name in plan.task_names() {
+    for name in plan.task_names(&domain) {
         assert!(domain.get_task(name).is_some(), "unknown task {name:?}");
     }
 }
@@ -59,25 +59,25 @@ fn plan_when_executed_reaches_all_objectives() {
     // Every objective must be cleared by executing the plan.
     assert!(
         state
-            .get::<Perimeter>(domain.components.get::<Perimeter>().unwrap())
+            .get_slot::<Perimeter>(domain.components.slot_of::<Perimeter>().unwrap())
             .0,
         "perimeter not secured"
     );
     assert!(
         state
-            .get::<Reinforced>(domain.components.get::<Reinforced>().unwrap())
+            .get_slot::<Reinforced>(domain.components.slot_of::<Reinforced>().unwrap())
             .0,
         "squad not reinforced"
     );
     assert!(
         state
-            .get::<Armored>(domain.components.get::<Armored>().unwrap())
+            .get_slot::<Armored>(domain.components.slot_of::<Armored>().unwrap())
             .0,
         "vehicles not armored"
     );
     assert!(
         state
-            .get::<Caches>(domain.components.get::<Caches>().unwrap())
+            .get_slot::<Caches>(domain.components.slot_of::<Caches>().unwrap())
             .0,
         "cache not secured"
     );
@@ -85,7 +85,7 @@ fn plan_when_executed_reaches_all_objectives() {
     // of morale never needs to rest, but the terminal method must be satisfiable.
     assert!(
         state
-            .get::<Morale>(domain.components.get::<Morale>().unwrap())
+            .get_slot::<Morale>(domain.components.slot_of::<Morale>().unwrap())
             .0
             >= 0
     );
@@ -103,7 +103,7 @@ fn marginal_fuel_forces_backtracking_off_drive() {
 
     // The first primitive in the plan cannot be drive: drive is not pickable,
     // so the plan must have resorted to the rations march or the collapse path.
-    let names = plan.task_names();
+    let names = plan.task_names(&domain);
     assert!(!names.is_empty(), "expected a plan");
     let first = names[0];
     assert_ne!(
@@ -127,7 +127,7 @@ fn high_fuel_agent_drives_directly() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, secure_outpost, &state);
     // The plan must begin with the vehicle run reaching the posting.
-    assert_eq!(plan.task_names()[0], Ustr::from("drive"));
+    assert_eq!(plan.task_names(&domain)[0], Ustr::from("drive"));
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn deep_plan_uses_only_primitive_tasks() {
     let state = outpost_scratch(&domain, fresh_outpost());
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, secure_outpost, &state);
-    for name in plan.task_names() {
+    for name in plan.task_names(&domain) {
         match domain.get_task(name) {
             Some(Task::Primitive(_)) => {}
             _ => panic!("non-primitive task in plan: {name:?}"),

@@ -174,7 +174,7 @@ mod bhtn_side {
         let mut state = state.clone();
         let mut planner = HtnPlanner::new(domain);
         let plan = plan_root(&mut planner, get_item, &state);
-        let steps = plan.task_names().len();
+        let steps = plan.task_names(domain).len();
         crate::common::execute_plan(domain, &mut state, &plan);
         steps
     }
@@ -231,7 +231,7 @@ mod bhtn_side {
             let plan = planner
                 .plan(domain.0.root, &scratch.0)
                 .expect("deep chain plan");
-            agent.plan = plan.steps;
+            agent.plan = plan.steps().to_vec();
             agent.cursor = 0;
         });
     }
@@ -421,14 +421,14 @@ mod bhtn_side {
             plan.is_complete(),
             "deep plan was truncated by the sanity limit"
         );
-        assert_eq!(plan.steps.len(), DEPTH as usize + 1, "deep plan truncated");
-        let steps = plan.task_names().len();
+        assert_eq!(plan.steps().len(), DEPTH as usize + 1, "deep plan truncated");
+        let steps = plan.task_names(domain).len();
         crate::common::execute_plan(domain, &mut state, &plan);
         // And it must reach the goal.
-        let progress = domain.components.get::<Progress>().unwrap();
-        let picked = domain.components.get::<ItemPickedUp>().unwrap();
-        assert_eq!(state.get::<Progress>(progress).0, DEPTH, "goal not reached");
-        assert!(state.get::<ItemPickedUp>(picked).0, "item not picked up");
+        let progress = domain.components.slot_of::<Progress>().unwrap();
+        let picked = domain.components.slot_of::<ItemPickedUp>().unwrap();
+        assert_eq!(state.get_slot::<Progress>(progress).0, DEPTH, "goal not reached");
+        assert!(state.get_slot::<ItemPickedUp>(picked).0, "item not picked up");
         steps
     }
 
@@ -489,16 +489,16 @@ mod bhtn_side {
             "deep sequence plan was truncated by the sanity limit"
         );
         assert_eq!(
-            plan.steps.len(),
+            plan.steps().len(),
             DEPTH as usize + 1,
             "deep sequence plan truncated"
         );
-        let steps = plan.task_names().len();
+        let steps = plan.task_names(domain).len();
         crate::common::execute_plan(domain, &mut state, &plan);
-        let progress = domain.components.get::<Progress>().unwrap();
-        let picked = domain.components.get::<ItemPickedUp>().unwrap();
-        assert_eq!(state.get::<Progress>(progress).0, DEPTH, "goal not reached");
-        assert!(state.get::<ItemPickedUp>(picked).0, "item not picked up");
+        let progress = domain.components.slot_of::<Progress>().unwrap();
+        let picked = domain.components.slot_of::<ItemPickedUp>().unwrap();
+        assert_eq!(state.get_slot::<Progress>(progress).0, DEPTH, "goal not reached");
+        assert!(state.get_slot::<ItemPickedUp>(picked).0, "item not picked up");
         steps
     }
 

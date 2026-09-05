@@ -22,6 +22,7 @@ pub use bench_common::{
 
 use bevy_bhtn::back_planner::BackPlanner;
 use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::{GoalFn, HtnDomain, HtnResult};
 use ustr::Ustr;
@@ -44,30 +45,28 @@ impl HtnTestBed {
     }
 
     /// Forward-plan the root task against a scratchpad state.
-    pub fn plan_forward(&self, state: &PlanState) -> Vec<Ustr> {
+    pub fn plan_forward(&self, state: &PlanState) -> Vec<&str> {
         let mut planner = HtnPlanner::new(&self.domain);
         planner
             .plan(self.domain.root, state)
             .expect("forward plan")
-            .task_names()
-            .to_vec()
+            .task_names(&self.domain)
     }
 
-    /// Forward-plan with the look-ahead sweep explicitly on or off (A/B).
-    pub fn plan_forward_lookahead(&self, state: &PlanState, lookahead: bool) -> Vec<Ustr> {
+    /// Forward-plan with the look-ahead gating mode set explicitly (A/B).
+    pub fn plan_forward_lookahead(&self, state: &PlanState, mode: LookaheadMode) -> Vec<&str> {
         let mut planner = HtnPlanner::new(&self.domain);
-        planner.set_lookahead(lookahead);
+        planner.set_lookahead_mode(mode);
         planner
             .plan(self.domain.root, state)
             .expect("forward plan")
-            .task_names()
-            .to_vec()
+            .task_names(&self.domain)
     }
 
     /// Backward-plan toward the goal function `goal` (passed by value;
     /// resolved by its `TypeId`) from a scratchpad state.
-    pub fn plan_backward<F: GoalFn>(&self, goal: F, state: &PlanState) -> HtnResult<Vec<Ustr>> {
+    pub fn plan_backward<F: GoalFn>(&self, goal: F, state: &PlanState) -> HtnResult<Vec<&str>> {
         let mut planner = BackPlanner::new(&self.domain);
-        planner.plan(goal, state).map(|p| p.task_names().to_vec())
+        planner.plan(goal, state).map(|p| p.task_names(&self.domain))
     }
 }

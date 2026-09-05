@@ -73,26 +73,30 @@ fn plan_events_stream_the_lifecycle() {
     htn_ai_system(&mut world);
     let mut log = EventLog::start(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 1, "one install event: {events:?}");
+    assert_eq!(events.len(), 2, "install + first step: {events:?}");
     match &events[0] {
         PlanEvent::PlanReplaced { entity: e, old, new } => {
             assert_eq!(*e, entity);
             assert!(old.is_none(), "the agent was planless: {old:?}");
             assert_eq!(new.len(), 3);
-            assert_eq!(new.status, PlanStatus::Complete);
+            assert_eq!(new.status(), PlanStatus::Complete);
         }
         other => panic!("expected PlanReplaced, got {other:?}"),
     }
+    assert!(matches!(&events[1], PlanEvent::StepExecuted { entity: e, .. } if *e == entity));
 
-    // Tick 2: mid-plan execution — no lifecycle events.
+    // Tick 2: mid-plan execution — only the per-step hook fires.
     htn_ai_system(&mut world);
-    assert!(log.read(&mut world).is_empty());
+    let events = log.read(&mut world);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(events[0], PlanEvent::StepExecuted { .. }));
 
     // Tick 3: the last step completes the plan.
     htn_ai_system(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 1, "one completion event: {events:?}");
-    assert!(matches!(events[0], PlanEvent::PlanCompleted { entity: e } if e == entity));
+    assert_eq!(events.len(), 2, "step + completion: {events:?}");
+    assert!(matches!(events[0], PlanEvent::StepExecuted { .. }));
+    assert!(matches!(events[1], PlanEvent::PlanCompleted { entity: e } if e == entity));
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 3);
 
     // Tick 4: replans — the terminal branch matches, nothing is installed,
@@ -119,10 +123,9 @@ fn drift_emits_step_failed_then_a_replacement_plan() {
     fn recharge(task: &mut TaskBuilder) {
         task.effect(|battery: &mut Battery| battery.0 = 5);
     }
+    let domain = HtnDomain::from_root(adaptive).build().unwrap();
     let mut world = World::new();
-    world.insert_resource(
-        HtnConfig::new(HtnDomain::from_root(adaptive).build().unwrap()).with_plan_events(true),
-    );
+    world.insert_resource(HtnConfig::new(domain).with_plan_events(true));
     let entity = world.spawn((Battery(0), HtnAgent::default())).id();
 
     // Tick 1: plans [gather, gather] and executes the first gather.
@@ -138,7 +141,11 @@ fn drift_emits_step_failed_then_a_replacement_plan() {
     // branch's recharge — is reported as a replacement of the dropped plan.
     htn_ai_system(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 3, "failure + replacement + completion: {events:?}");
+    assert_eq!(
+        events.len(),
+        4,
+        "failure + replacement + step + completion: {events:?}"
+    );
     match &events[0] {
         PlanEvent::StepFailed { entity: e, task: _, task_name } => {
             assert_eq!(*e, entity);
@@ -150,12 +157,14 @@ fn drift_emits_step_failed_then_a_replacement_plan() {
         PlanEvent::PlanReplaced { old, new, .. } => {
             let old = old.as_ref().expect("the drifted plan is the old plan");
             assert_eq!(old.len(), 2, "the interrupted two-gather plan");
-            assert_eq!(new.task_names().to_vec(), vec![ustr::Ustr::from("recharge")]);
+            let config = world.resource::<HtnConfig>();
+            assert_eq!(new.task_names(&config.domain), vec!["recharge"]);
         }
         other => panic!("expected PlanReplaced second, got {other:?}"),
     }
     // The replacement planned, executed, and completed within the same tick.
-    assert!(matches!(events[2], PlanEvent::PlanCompleted { entity: e } if e == entity));
+    assert!(matches!(&events[2], PlanEvent::StepExecuted { entity: e, task_name: "recharge", .. } if *e == entity));
+    assert!(matches!(events[3], PlanEvent::PlanCompleted { entity: e } if e == entity));
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 5);
 }
 
@@ -175,45 +184,45 @@ fn pause_resume_reports_the_paused_plan_as_the_replaced_old() {
     fn step(task: &mut TaskBuilder) {
         task.effect(|battery: &mut Battery| battery.0 += 1);
     }
+    let domain = HtnDomain::from_root(journey).build().unwrap();
     let mut world = World::new();
-    world.insert_resource(
-        HtnConfig::new(HtnDomain::from_root(journey).build().unwrap()).with_plan_events(true),
-    );
+    world.insert_resource(HtnConfig::new(domain).with_plan_events(true));
     let entity = world.spawn((Battery(0), HtnAgent::default())).id();
 
     // Tick 1: the leg is planned (paused) and its single step executes.
     htn_ai_system(&mut world);
     let mut log = EventLog::start(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2, "install + step: {events:?}");
     let PlanEvent::PlanReplaced { old, new, .. } = &events[0] else {
         panic!("expected an install, got {events:?}")
     };
     assert!(old.is_none());
-    assert_eq!(new.status, PlanStatus::Paused);
+    assert_eq!(new.status(), PlanStatus::Paused);
     assert_eq!(new.len(), 1);
 
     // Tick 2: the resume replaces the paused plan with the completed
-    // continuation.
+    // continuation (which executes its first step in the same tick).
     htn_ai_system(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 1, "one resume event: {events:?}");
+    assert_eq!(events.len(), 2, "resume + step: {events:?}");
     let PlanEvent::PlanReplaced { old, new, .. } = &events[0] else {
         panic!("expected a replacement, got {events:?}")
     };
     let old = old.as_ref().expect("the paused plan is the old plan");
-    assert_eq!(old.status, PlanStatus::Paused);
+    assert_eq!(old.status(), PlanStatus::Paused);
     assert_eq!(old.len(), 1);
-    assert!(old.resume.is_some());
-    assert_eq!(new.status, PlanStatus::Complete);
+    assert!(old.resume().is_some());
+    assert_eq!(new.status(), PlanStatus::Complete);
     assert_eq!(new.len(), 2, "the remaining leg");
-    assert!(new.resume.is_none());
+    assert!(new.resume().is_none());
 
     // Tick 3: the resumed plan completes.
     htn_ai_system(&mut world);
     let events = log.read(&mut world);
-    assert_eq!(events.len(), 1);
-    assert!(matches!(events[0], PlanEvent::PlanCompleted { .. }));
+    assert_eq!(events.len(), 2, "step + completion: {events:?}");
+    assert!(matches!(events[0], PlanEvent::StepExecuted { .. }));
+    assert!(matches!(events[1], PlanEvent::PlanCompleted { .. }));
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 3);
 }
 

@@ -137,7 +137,7 @@ fn survival_state(domain: &HtnDomain, temperature: i32) -> PlanState {
 
 /// Read component `T` out of a scratchpad (via the domain's slot registry).
 fn read<'a, T: PlanComponent>(domain: &'a HtnDomain, state: &'a PlanState) -> &'a T {
-    state.get::<T>(domain.components.get::<T>().unwrap())
+    state.get_slot::<T>(domain.components.slot_of::<T>().unwrap())
 }
 
 /// Apply a single planned primitive's effects to `state` (simulating executing
@@ -164,7 +164,7 @@ fn plan_adapts_when_world_changes_mid_execution() {
     );
 
     // Execute the shelter step (the world changes).
-    apply_effects(&bed, &plan_1[0], &mut state);
+    apply_effects(&bed, plan_1[0], &mut state);
 
     // Turn 2: still cold (warm-up not yet done) — replan should still aim to
     // warm up, now shelter is secured.
@@ -172,7 +172,7 @@ fn plan_adapts_when_world_changes_mid_execution() {
     assert_eq!(plan_2, vec![Ustr::from("warm_up")]);
 
     // Turn 3: warm up executes, temperature rises above the threshold.
-    apply_effects(&bed, &plan_2[0], &mut state);
+    apply_effects(&bed, plan_2[0], &mut state);
     assert!(read::<Temperature>(bed.domain(), &state).0 >= 15);
 
     // Turn 4: requirement changed — now it's warm, so switch to scavenging.

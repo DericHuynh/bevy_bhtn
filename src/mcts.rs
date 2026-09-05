@@ -144,7 +144,7 @@ fn advance(
                     .methods
                     .iter()
                     .enumerate()
-                    .filter(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(&state)))
+                    .filter(|(_i, m)| m.applicable(&state))
                     .map(|(i, _)| i)
                     .collect();
                 match applicable.len() {
@@ -215,7 +215,7 @@ fn dfs_rollout(
         unreachable!("rollout head is compound");
     };
     for m in c.methods.iter() {
-        if !m.preconditions.iter().all(|c| c.evaluate(&frontier.state)) {
+        if !m.applicable(&frontier.state) {
             continue;
         }
         if *fuel == 0 {
@@ -345,18 +345,14 @@ impl crate::selection::Searcher for MctsSearcher {
             &mut fuel,
         ) {
             Stop::Complete(plan, _) => {
-                return Some(Plan {
-                    names: plan
-                        .iter()
-                        .map(|&i| domain.tasks[i as usize].name().into())
-                        .collect(),
-                    steps: plan,
-                    mtr: Vec::new(),
-                    status: PlanStatus::Complete,
+                return Some(Plan::compiled(
+                    plan,
+                    Vec::new(),
+                    PlanStatus::Complete,
                     // Custom searchers own their search: pause markers do
                     // not apply to them.
-                    resume: None,
-                });
+                    None,
+                ));
             }
             // A failed or aborted root: the initial state already violates
             // something unfixable (or the budget is zero). (A non-compound
@@ -554,16 +550,12 @@ impl crate::selection::Searcher for MctsSearcher {
         }
 
         let (_, plan) = incumbent?;
-        Some(Plan {
-            names: plan
-                .iter()
-                .map(|&i| domain.tasks[i as usize].name().into())
-                .collect(),
-            steps: plan,
-            mtr: Vec::new(),
-            status: PlanStatus::Complete,
+        Some(Plan::compiled(
+            plan,
+            Vec::new(),
+            PlanStatus::Complete,
             // Custom searchers own their search: pause markers do not apply.
-            resume: None,
-        })
+            None,
+        ))
     }
 }

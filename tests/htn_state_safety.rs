@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bevy_bhtn::planner::{HtnPlanner, Plan};
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::state::{PlanState, RegistryBuilder};
 use bevy_bhtn::tasks::{GoalBuilder, GoalFn, TaskBuilder, TaskFn};
 use bevy_bhtn::{BackPlanner, FieldSet, HtnDomain, HtnResult};
@@ -118,7 +119,7 @@ fn plan_state_drop_releases_every_slot_once() {
             .set(Name::new(&counter, "held"))
             .set(Gold(1))
             .finish();
-        assert_eq!(state.get::<Name>(registry.get::<Name>().unwrap()).1, "held");
+        assert_eq!(state.get_slot::<Name>(registry.slot_of::<Name>().unwrap()).1, "held");
     } // dropped here
 
     counter.assert_balanced();
@@ -139,15 +140,15 @@ fn clone_is_deep_for_heap_owning_components() {
         .finish();
     let mut copy = original.clone();
 
-    let name_slot = registry.get::<Name>().unwrap();
-    copy.get_mut::<Name>(name_slot).1 = "mutated".into();
+    let name_slot = registry.slot_of::<Name>().unwrap();
+    copy.get_mut_slot::<Name>(name_slot).1 = "mutated".into();
 
     assert_eq!(
-        original.get::<Name>(name_slot).1,
+        original.get_slot::<Name>(name_slot).1,
         "orig",
         "clone must not alias"
     );
-    assert_eq!(copy.get::<Name>(name_slot).1, "mutated");
+    assert_eq!(copy.get_slot::<Name>(name_slot).1, "mutated");
     drop(original);
     drop(copy);
 
@@ -172,7 +173,7 @@ fn copy_from_replaces_destination_values_cleanly() {
 
     scratch.copy_from(&source);
     assert_eq!(
-        scratch.get::<Name>(registry.get::<Name>().unwrap()).1,
+        scratch.get_slot::<Name>(registry.slot_of::<Name>().unwrap()).1,
         "source"
     );
     drop(source);
@@ -226,7 +227,7 @@ fn builder_set_overwrites_dropping_old_value() {
         .finish();
 
     assert_eq!(
-        state.get::<Name>(registry.get::<Name>().unwrap()).1,
+        state.get_slot::<Name>(registry.slot_of::<Name>().unwrap()).1,
         "second"
     );
     drop(state);
@@ -249,9 +250,9 @@ fn builder_finish_materializes_defaults_for_unset_slots() {
         .set(Name::new(&counter, "only"))
         .finish();
 
-    let gold_slot = registry.get::<Gold>().unwrap();
-    assert_eq!(state.get::<Gold>(gold_slot).0, 0, "Gold defaulted");
-    assert_eq!(state.get::<Name>(registry.get::<Name>().unwrap()).1, "only");
+    let gold_slot = registry.slot_of::<Gold>().unwrap();
+    assert_eq!(state.get_slot::<Gold>(gold_slot).0, 0, "Gold defaulted");
+    assert_eq!(state.get_slot::<Name>(registry.slot_of::<Name>().unwrap()).1, "only");
     drop(state);
 
     // The default Name was built on its own fresh counter; the test counter
@@ -308,8 +309,8 @@ fn frozen_registry_resolves_builder_slot_indices() {
     let name = builder.index::<Name>();
     let registry = builder.freeze();
 
-    assert_eq!(registry.get::<Gold>(), Some(gold));
-    assert_eq!(registry.get::<Name>(), Some(name));
+    assert_eq!(registry.slot_of::<Gold>(), Some(gold));
+    assert_eq!(registry.slot_of::<Name>(), Some(name));
     assert_eq!(registry.len(), 2);
 
     let world = World::new();
@@ -343,7 +344,7 @@ fn zst_components_plan_end_to_end() {
     let state = PlanState::build(&domain.components).set(Gold(0)).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["check_flag", "act"]
     );
 }
@@ -363,16 +364,16 @@ fn high_alignment_slot_is_placed_correctly() {
     builder.index::<Small>();
     builder.index::<Big>();
     let registry = builder.freeze();
-    let small_idx = registry.get::<Small>().unwrap();
-    let big_idx = registry.get::<Big>().unwrap();
+    let small_idx = registry.slot_of::<Small>().unwrap();
+    let big_idx = registry.slot_of::<Big>().unwrap();
 
     let state = PlanState::build(&registry)
         .set(Small(0xAB))
         .set(Big(0x1234_5678_9ABC_DEF0))
         .finish();
 
-    assert_eq!(state.get::<Small>(small_idx).0, 0xAB);
-    assert_eq!(state.get::<Big>(big_idx).0, 0x1234_5678_9ABC_DEF0);
+    assert_eq!(state.get_slot::<Small>(small_idx).0, 0xAB);
+    assert_eq!(state.get_slot::<Big>(big_idx).0, 0x1234_5678_9ABC_DEF0);
 
     // The pool is sized to fit the aligned layout (at least 64 + 1 bytes,
     // rounded up to the alignment).
@@ -451,7 +452,7 @@ fn duplicate_shared_params_are_allowed() {
     let domain = HtnDomain::from_root(root).build().unwrap();
     let state = PlanState::build(&domain.components).set(Gold(3)).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["check"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["check"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +488,7 @@ fn same_slot_written_twice_rolls_back_cleanly() {
     p.apply_effects(&mut state);
     assert_eq!(
         state
-            .get::<Gold>(domain.components.get::<Gold>().unwrap())
+            .get_slot::<Gold>(domain.components.slot_of::<Gold>().unwrap())
             .0,
         6
     );
@@ -495,7 +496,7 @@ fn same_slot_written_twice_rolls_back_cleanly() {
     // And the search backtracks through the double snapshot without
     // corruption: the doomed branch is abandoned, the safe one plans.
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
 }
 
 /// Backtracking moves heap-owning values back by bytes (drop current, restore
@@ -526,7 +527,7 @@ fn rollback_moves_heap_values_without_leaks_or_double_frees() {
         .finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
     drop(state); // the planner's working clone is released inside plan()
 
     counter.assert_balanced();
@@ -557,7 +558,7 @@ fn successful_plan_releases_unrestored_journal_copies() {
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["write_name"]
     );
     drop(state); // the planner's working clone is released inside plan()
@@ -598,8 +599,8 @@ fn lookahead_scratch_reuse_balances_heap_clones() {
     // Look-ahead ON: each doomed commitment sweeps [write_name, impossible],
     // materializing/reusing the private scratch (clone + copy_from paths).
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(true);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    planner.set_lookahead_mode(LookaheadMode::Always);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
     drop(state);
 
     counter.assert_balanced();
@@ -693,8 +694,8 @@ fn rollback_of_a_replaced_heap_value_frees_everything_exactly_once() {
     let mut planner = HtnPlanner::new(&domain);
     // Look-ahead off: the sweep would refute the doomed method before any
     // primitive runs, and the rollback journal would never be exercised.
-    planner.set_lookahead(false);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
     drop(state);
 }
 
@@ -729,8 +730,8 @@ fn rollback_of_repeated_unmutated_snapshots_frees_everything_exactly_once() {
         .finish();
 
     let mut planner = HtnPlanner::new(&domain);
-    planner.set_lookahead(false);
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["safe"]);
+    planner.set_lookahead_mode(LookaheadMode::Off);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["safe"]);
     drop(state);
 }
 
@@ -805,9 +806,9 @@ fn backward_plan_is_a_compiled_program() {
     let mut back = bevy_bhtn::BackPlanner::new(&domain);
     let plan = plan_goal(&mut back, three_gold, &state).unwrap();
 
-    assert_eq!(plan.task_names(), ["earn"]);
-    assert_eq!(plan.steps.len(), 1);
-    let Task::Primitive(p) = &domain.tasks[plan.steps[0] as usize] else {
+    assert_eq!(plan.task_names(&domain), ["earn"]);
+    assert_eq!(plan.steps().len(), 1);
+    let Task::Primitive(p) = &domain.tasks[plan.steps()[0] as usize] else {
         panic!("backward plans are primitive sequences");
     };
     assert_eq!(p.name, "earn");
@@ -834,9 +835,9 @@ fn frozen_registry_resolves_the_builder_slot_map() {
     let energy_idx = reg.index::<Energy2>();
     let frozen = reg.freeze();
 
-    assert_eq!(frozen.get::<Gold>(), Some(gold_idx));
-    assert_eq!(frozen.get::<Name>(), Some(name_idx));
-    assert_eq!(frozen.get::<Energy2>(), Some(energy_idx));
+    assert_eq!(frozen.slot_of::<Gold>(), Some(gold_idx));
+    assert_eq!(frozen.slot_of::<Name>(), Some(name_idx));
+    assert_eq!(frozen.slot_of::<Energy2>(), Some(energy_idx));
     struct NeverRegistered;
     assert!(
         !frozen.contains::<NeverRegistered>(),
@@ -856,15 +857,15 @@ fn plan_state_type_addressed_reads_roundtrip() {
     let frozen = reg.freeze();
 
     let mut state = PlanState::build(&frozen).set(Gold(7)).finish();
-    assert_eq!(state.get_by_type::<Gold>(), Some(&Gold(7)));
-    assert!(state.get_by_type::<Name>().is_none(), "never registered");
+    assert_eq!(state.get::<Gold>(), Some(&Gold(7)));
+    assert!(state.get::<Name>().is_none(), "never registered");
 
-    *state.get_mut_by_type::<Energy2>().unwrap() = Energy2(9);
+    *state.get_mut::<Energy2>().unwrap() = Energy2(9);
     // The raw slot-index path sees the type-addressed write (one pool, one slot).
-    let energy_slot = frozen.get::<Energy2>().unwrap();
-    assert_eq!(state.get::<Energy2>(energy_slot), &Energy2(9));
+    let energy_slot = frozen.slot_of::<Energy2>().unwrap();
+    assert_eq!(state.get_slot::<Energy2>(energy_slot), &Energy2(9));
     assert_eq!(
-        state.get_by_type::<Gold>(),
+        state.get::<Gold>(),
         Some(&Gold(7)),
         "adjacent slot untouched"
     );

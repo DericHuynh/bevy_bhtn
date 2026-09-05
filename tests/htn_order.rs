@@ -20,6 +20,7 @@
 //!   are build errors.
 
 use bevy_bhtn::domain::SelectionPolicy;
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::domain::Task;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::order::SubtaskOrder;
@@ -76,7 +77,7 @@ fn any_order_runs_every_member_in_declaration_order_by_default() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["gather_wood", "gather_stone", "sell_spoils"],
         "order 0 is the declaration order"
     );
@@ -111,7 +112,7 @@ fn unordered_set_backtracks_to_a_valid_linearization() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, root, &state);
     assert_eq!(
-        plan.task_names(),
+        plan.task_names(&domain),
         ["find_key", "unlock_door"],
         "the reversed linearization was found by backtracking"
     );
@@ -145,7 +146,7 @@ fn before_constraints_force_the_first_topological_order() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["fetch_ingredient", "cook_meal"],
         "the constraint DAG, not declaration order, decides"
     );
@@ -176,7 +177,7 @@ fn then_tail_runs_after_the_unordered_set() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["gather_wood", "gather_stone", "sell_spoils"]
     );
 
@@ -215,7 +216,7 @@ fn compound_members_decompose_inside_unordered_sets() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["gather_wood", "gather_stone", "unlock_door"],
         "the compound member's full decomposition precedes the next member"
     );
@@ -261,8 +262,8 @@ fn partial_method_required_fields_are_conservative() {
 
     let domain = HtnDomain::from_root(root).build().unwrap();
     let required = &summary_of(&domain, root).unwrap().required_fields;
-    let gold = domain.components.get::<Gold>().unwrap();
-    let key = domain.components.get::<Key>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let key = domain.components.slot_of::<Key>().unwrap();
     assert!(
         required.contains(gold),
         "Gold is read by a member and no member can write it — required"
@@ -303,7 +304,7 @@ fn lookahead_refutes_dead_sets() {
     let mut on = HtnPlanner::new(&domain);
     on.set_sanity_limit(2);
     assert_eq!(
-        plan_of(&mut on, root, &state).task_names(),
+        plan_of(&mut on, root, &state).task_names(&domain),
         ["works"],
         "the dead set was refuted without exploring it"
     );
@@ -312,9 +313,9 @@ fn lookahead_refutes_dead_sets() {
     // linearization runs busywork before failing again — and the 4-step
     // budget dies mid-set with only busywork committed.
     let mut off = HtnPlanner::new(&domain);
-    off.set_lookahead(false).set_sanity_limit(4);
+    off.set_lookahead_mode(LookaheadMode::Off).set_sanity_limit(4);
     assert_eq!(
-        plan_of(&mut off, root, &state).task_names(),
+        plan_of(&mut off, root, &state).task_names(&domain),
         ["busywork"],
         "without the sweep, the budget is spent inside the doomed set"
     );
@@ -348,7 +349,7 @@ fn cost_bounded_prunes_partial_methods_by_their_member_sum() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_strategy(HtnSearchStrategy::CostBounded);
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["cheap"]);
+    assert_eq!(plan.task_names(&domain), ["cheap"]);
     assert_eq!(plan.mtr(), [1]);
 }
 
@@ -470,7 +471,7 @@ fn wide_set_envelope_buried_dependencies() {
     let s4 = PlanState::build(&d4.components).finish();
     let mut p4 = HtnPlanner::new(&d4);
     assert_eq!(
-        plan_of(&mut p4, wide4, &s4).task_names(),
+        plan_of(&mut p4, wide4, &s4).task_names(&d4),
         ["find_key", "locked", "gather_wood", "gather_stone"],
         "within the cap, the valid linearization is reached"
     );
@@ -489,7 +490,7 @@ fn wide_set_envelope_buried_dependencies() {
     let mut p8b = HtnPlanner::new(&d8);
     p8b.set_sanity_limit(10_000);
     assert_eq!(
-        plan_of(&mut p8b, wide8, &s8b_state(&d8)).task_names(),
+        plan_of(&mut p8b, wide8, &s8b_state(&d8)).task_names(&d8),
         ["fallback"],
         "raised budget: the cap exhausts and the fallback plans"
     );
@@ -523,11 +524,11 @@ fn driver_executes_partially_ordered_plans() {
 
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Wood>(entity).unwrap().0, 1, "first step ran");
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_some());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_some());
 
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Stone>(entity).unwrap().0, 1, "second step ran");
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +564,7 @@ fn ranked_compound_inside_unordered_set() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["find_key", "unlock_door"],
         "the compound member decomposed via its highest-utility branch"
     );
@@ -594,7 +595,7 @@ fn linearization_retry_rolls_back_partial_member_effects() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, root, &state);
     assert_eq!(
-        plan.task_names(),
+        plan.task_names(&domain),
         ["gate", "gather"],
         "the reversed linearization was retried from rolled-back state"
     );

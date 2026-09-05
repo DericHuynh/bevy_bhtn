@@ -16,7 +16,7 @@
 //! extensions — durative, simultaneous, and concurrent actions — are out of
 //! scope here). Both players plan from the **same baked domain** against the
 //! same [`PlanState`]: player max from the forward root (or any compound
-//! registered via [`DomainBuilder::root`](crate::domain::DomainBuilder::root)),
+//! registered via [`DomainBuilder::add_root`](crate::domain::DomainBuilder::add_root)),
 //! player min from an extra root.
 //!
 //! # The algorithm
@@ -105,6 +105,12 @@ impl Side {
 pub struct AhtnOutcome {
     /// Max's primitive task indices, in execution order (min's actions are
     /// interleaved between them but are not part of this plan).
+    ///
+    /// Deliberately **not** a [`Plan`](crate::planner::Plan): the principal
+    /// variation is not a driver-executable program — min's actions happen
+    /// between max's steps, and the driver's one-agent model has no
+    /// counterpart for them. A game runs the PV through its own
+    /// turn arbitration.
     pub plan: Vec<u32>,
     /// The root's minimax value (max's payoff under best play by both).
     pub value: f32,
@@ -144,7 +150,7 @@ impl<'a> Ahtn<'a> {
     /// `max_root` and `min_root` are the two players' root task functions,
     /// passed by value and resolved by their `TypeId`s through the baked type
     /// index (both must be compound tasks — register the opponent's via
-    /// [`DomainBuilder::root`](crate::domain::DomainBuilder::root)). `eval`
+    /// [`DomainBuilder::add_root`](crate::domain::DomainBuilder::add_root)). `eval`
     /// scores a state from max's perspective; `depth` bounds the number of
     /// primitive actions issued (by either player) before evaluation.
     ///
@@ -270,7 +276,7 @@ impl<'a> Ahtn<'a> {
                     .methods
                     .iter()
                     .enumerate()
-                    .filter(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(state)))
+                    .filter(|(_i, m)| m.applicable(state))
                     .map(|(i, _)| i)
                     .collect();
                 if applicable.is_empty() {
@@ -280,7 +286,7 @@ impl<'a> Ahtn<'a> {
                     Side::Max => {
                         let mut best = (f32::NEG_INFINITY, Vec::new());
                         for m in c.methods.iter() {
-                            if !m.preconditions.iter().all(|c| c.evaluate(state)) {
+                            if !m.applicable(state) {
                                 continue;
                             }
                             if *budget == 0 {
@@ -317,7 +323,7 @@ impl<'a> Ahtn<'a> {
                     Side::Min => {
                         let mut best = (f32::INFINITY, Vec::new());
                         for m in c.methods.iter() {
-                            if !m.preconditions.iter().all(|c| c.evaluate(state)) {
+                            if !m.applicable(state) {
                                 continue;
                             }
                             if *budget == 0 {

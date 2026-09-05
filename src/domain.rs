@@ -226,7 +226,7 @@ impl DomainBuilder {
     /// unaffected.
     #[must_use]
     #[track_caller]
-    pub fn root<F: TaskFn>(mut self, f: F) -> Self {
+    pub fn add_root<F: TaskFn>(mut self, f: F) -> Self {
         let tid = SubtaskRef::Fn(TypeId::of::<F>());
         if self.rec.index_of.contains_key(&tid) {
             // Already recorded (e.g. also referenced as a subtask): just mark
@@ -320,7 +320,9 @@ impl DomainBuilder {
         self.rec.errors.extend(self.rec.registry.take_errors());
 
         if !self.rec.errors.is_empty() {
-            return Err(HtnError::builder(self.rec.errors.join("; ")));
+            return Err(HtnError::Builder {
+                errors: self.rec.errors,
+            });
         }
 
         // Extra roots (adversarial planning) must be compound tasks.
@@ -649,6 +651,16 @@ pub struct Method {
     pub pause_positions: SmallVec<[u32; 2]>,
 }
 
+impl Method {
+    /// Whether every precondition of this method holds for `state` — the
+    /// applicability check every consumer (forward planner, back-planner,
+    /// AHTN, MCTS) performs before offering the method. The compound
+    /// counterpart of [`PrimitiveTask::preconditions_met`].
+    pub fn applicable(&self, state: &PlanState) -> bool {
+        self.preconditions.iter().all(|c| c.evaluate(state))
+    }
+}
+
 /// A baked compound task: on decomposition, pick the first method whose
 /// preconditions evaluate true.
 pub struct CompoundTask {
@@ -670,7 +682,7 @@ impl CompoundTask {
             .iter()
             .enumerate()
             .skip(skip)
-            .find(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(state)))
+            .find(|(_i, m)| m.applicable(state))
             .map(|(i, m)| (m, i))
     }
 
@@ -701,7 +713,7 @@ impl CompoundTask {
             .methods
             .iter()
             .enumerate()
-            .filter(|(_i, m)| m.preconditions.iter().all(|c| c.evaluate(state)))
+            .filter(|(_i, m)| m.applicable(state))
             .map(|(i, _)| i)
             .collect();
 
@@ -761,7 +773,11 @@ impl CompoundTask {
                     .map(|&i| BranchCandidate {
                         index: i as u32,
                         name: self.methods[i].name,
-                        utility: None,
+                        // The branch's declared static utility, evaluated
+                        // against the node's state — the same value
+                        // HighestUtility ranks by, so custom rankers can
+                        // mix it into their own heuristics.
+                        utility: self.methods[i].utility.as_ref().map(|f| f(state)),
                         subtasks: &self.methods[i].subtasks,
                     })
                     .collect();
@@ -928,6 +944,3 @@ impl Task {
         matches!(self, Task::Compound(_))
     }
 }
-
-/// Interned task-name handle used by [`Plan`](crate::planner::Plan).
-pub type TaskName = Ustr;

@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use bevy_bhtn::domain::SelectionPolicy;
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig};
 use bevy_bhtn::mcts::MctsSearcher;
 use bevy_bhtn::planner::PlanStatus;
@@ -118,8 +119,8 @@ fn mcts_finds_the_working_branch() {
 
     let mcts = MctsSearcher::new(500);
     let plan = mcts.search(&domain, &state).expect("a plan exists");
-    assert_eq!(plan.status, PlanStatus::Complete);
-    assert_eq!(plan.task_names(), ["safe"]);
+    assert_eq!(plan.status(), PlanStatus::Complete);
+    assert_eq!(plan.task_names(&domain), ["safe"]);
 }
 
 /// The returned plan is a finished decomposition: executing its effects in
@@ -131,9 +132,9 @@ fn mcts_plan_executes_to_goal() {
 
     let mcts = MctsSearcher::new(500);
     let plan = mcts.search(&domain, &state).expect("a plan exists");
-    let executed = execute(&domain, &state, &plan.steps);
-    let gold = domain.components.get::<Gold>().unwrap();
-    assert_eq!(executed.get::<Gold>(gold).0, 5);
+    let executed = execute(&domain, &state, plan.steps());
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    assert_eq!(executed.get_slot::<Gold>(gold).0, 5);
 }
 
 /// A satisfied terminal plans to the empty (but complete) program.
@@ -151,7 +152,7 @@ fn mcts_empty_plan_when_goal_already_met() {
         .search(&domain, &state)
         .expect("terminal plans trivially");
     assert!(plan.is_empty());
-    assert_eq!(plan.status, PlanStatus::Complete);
+    assert_eq!(plan.status(), PlanStatus::Complete);
 }
 
 /// No applicable method anywhere: the search returns `None` (no fake prefix).
@@ -178,10 +179,10 @@ fn mcts_solves_deep_choice_chains() {
     let plan = mcts.search(&domain, &state).expect("the chain plans");
     assert!(plan.is_complete());
     // One incrementing primitive per link (20) plus the tail's increment.
-    assert_eq!(plan.steps.len(), 21);
-    let executed = execute(&domain, &state, &plan.steps);
-    let gold = domain.components.get::<Gold>().unwrap();
-    assert_eq!(executed.get::<Gold>(gold).0, 21);
+    assert_eq!(plan.steps().len(), 21);
+    let executed = execute(&domain, &state, plan.steps());
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    assert_eq!(executed.get_slot::<Gold>(gold).0, 21);
 }
 
 /// Nested choice points: only one combination of method choices wins, and
@@ -206,7 +207,7 @@ fn mcts_finds_the_winning_combination() {
     let plan = mcts
         .search(&domain, &state)
         .expect("outer→inner→advance wins");
-    let names: Vec<String> = plan.task_names().iter().map(|u| u.to_string()).collect();
+    let names: Vec<String> = plan.task_names(&domain).iter().map(|u| u.to_string()).collect();
     assert_eq!(names, ["advance_two"]);
 }
 
@@ -224,11 +225,11 @@ fn mcts_is_deterministic() {
     let mcts = MctsSearcher::new(300);
     let first = mcts.search(&domain, &state).expect("a plan exists");
     let second = mcts.search(&domain, &state).expect("a plan exists");
-    assert_eq!(first.steps, second.steps, "same instance, same state");
+    assert_eq!(first.steps(), second.steps(), "same instance, same state");
 
     let mcts2 = MctsSearcher::new(300);
     let third = mcts2.search(&domain, &state).expect("a plan exists");
-    assert_eq!(first.steps, third.steps, "separate instance, same state");
+    assert_eq!(first.steps(), third.steps(), "separate instance, same state");
 }
 
 /// The input scratchpad is never mutated by a search.
@@ -236,12 +237,12 @@ fn mcts_is_deterministic() {
 fn mcts_does_not_mutate_the_input_state() {
     let domain = HtnDomain::from_root(root_two_branches).build().unwrap();
     let state = PlanState::build(&domain.components).finish();
-    let gold = domain.components.get::<Gold>().unwrap();
+    let gold = domain.components.slot_of::<Gold>().unwrap();
 
     let mcts = MctsSearcher::new(300);
     let _ = mcts.search(&domain, &state);
 
-    assert_eq!(state.get::<Gold>(gold).0, 0, "input untouched");
+    assert_eq!(state.get_slot::<Gold>(gold).0, 0, "input untouched");
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ fn mcts_iteration_budget_edges() {
     let plan = MctsSearcher::new(1)
         .search(&one_domain, &state)
         .expect("trivial");
-    assert_eq!(plan.task_names(), ["safe"]);
+    assert_eq!(plan.task_names(&one_domain), ["safe"]);
 
     // A doomed first branch costs exactly one extra iteration.
     let two_domain = HtnDomain::from_root(root_two_branches).build().unwrap();
@@ -280,7 +281,7 @@ fn mcts_iteration_budget_edges() {
     let plan = MctsSearcher::new(2)
         .search(&two_domain, &two_state)
         .expect("2 iters");
-    assert_eq!(plan.task_names(), ["safe"]);
+    assert_eq!(plan.task_names(&two_domain), ["safe"]);
     assert!(MctsSearcher::new(1)
         .search(&two_domain, &two_state)
         .is_none());
@@ -318,7 +319,7 @@ fn mcts_ignores_baked_selection_policies() {
 
     let mcts = MctsSearcher::new(500);
     let plan = mcts.search(&domain, &state).expect("a plan exists");
-    assert_eq!(plan.task_names(), ["safe"]);
+    assert_eq!(plan.task_names(&domain), ["safe"]);
 }
 
 /// The default planner's sanity limit truncates the gate domain's doomed
@@ -331,7 +332,7 @@ fn mcts_beats_the_sanity_truncation_on_gate_domain() {
 
     // DFS, look-ahead off, default budget: truncated prefix.
     let mut dfs = HtnPlanner::new(&domain);
-    dfs.set_lookahead(false);
+    dfs.set_lookahead_mode(LookaheadMode::Off);
     let partial = plan_root(&mut dfs, common::gate_tasks::gate_root, &state);
     assert!(partial.is_partial());
 
@@ -341,7 +342,7 @@ fn mcts_beats_the_sanity_truncation_on_gate_domain() {
         .search(&domain, &state)
         .expect("strike→gate_final wins");
     assert!(plan.is_complete());
-    let names: Vec<String> = plan.task_names().iter().map(|u| u.to_string()).collect();
+    let names: Vec<String> = plan.task_names(&domain).iter().map(|u| u.to_string()).collect();
     assert_eq!(names, ["strike", "gate_final"]);
 }
 
@@ -372,7 +373,7 @@ fn driver_runs_the_mcts_strategy() {
     // The planless tick plans and executes the first (only) step.
     assert!(world
         .get::<HtnAgent>(survivor)
-        .is_some_and(|h| h.plan.is_none()));
+        .is_some_and(|h| h.plan().is_none()));
 }
 
 /// A per-agent `SearchOverride` selects MCTS while the global strategy stays
@@ -435,7 +436,7 @@ fn mcts_is_shared_across_a_population() {
         schedule.run(&mut world);
     }
     for &a in &agents {
-        assert!(world.get::<HtnAgent>(a).is_some_and(|h| h.plan.is_none()));
+        assert!(world.get::<HtnAgent>(a).is_some_and(|h| h.plan().is_none()));
     }
 }
 
@@ -461,7 +462,7 @@ fn driver_replans_when_mcts_finds_nothing() {
         schedule.run(&mut world);
         let agent = world.get::<HtnAgent>(survivor).unwrap();
         assert!(
-            agent.plan.is_none() || agent.plan.as_ref().unwrap().is_empty(),
+            agent.plan().is_none() || agent.plan().unwrap().is_empty(),
             "a dead domain must not wedge the agent on a stale plan"
         );
     }

@@ -31,7 +31,11 @@ fn plan_of<F: TaskFn>(planner: &mut HtnPlanner<'_>, _f: F, state: &PlanState) ->
         .unwrap_or_else(|e| panic!("plan of {} failed: {e}", std::any::type_name::<F>()))
 }
 
-fn bed_backward<F: GoalFn>(bed: &HtnTestBed, _f: F, state: &PlanState) -> HtnResult<Vec<Ustr>> {
+fn bed_backward<'a, F: GoalFn>(
+    bed: &'a HtnTestBed,
+    _f: F,
+    state: &PlanState,
+) -> HtnResult<Vec<&'a str>> {
     bed.plan_backward(_f, state)
 }
 
@@ -150,13 +154,13 @@ fn forward_plan_is_terminal_and_executes() {
         }
     }
 
-    let my_location = bed.domain().components.get::<MyLocation>().unwrap();
-    let happy = bed.domain().components.get::<Happy>().unwrap();
-    let cash = bed.domain().components.get::<Cash>().unwrap();
+    let my_location = bed.domain().components.slot_of::<MyLocation>().unwrap();
+    let happy = bed.domain().components.slot_of::<Happy>().unwrap();
+    let cash = bed.domain().components.slot_of::<Cash>().unwrap();
     // Terminal state: at the park, happy, taxi paid for.
-    assert_eq!(state.get::<MyLocation>(my_location).0, Spot::Park);
-    assert!(state.get::<Happy>(happy).0);
-    assert_eq!(state.get::<Cash>(cash).0, 9);
+    assert_eq!(state.get_slot::<MyLocation>(my_location).0, Spot::Park);
+    assert!(state.get_slot::<Happy>(happy).0);
+    assert_eq!(state.get_slot::<Cash>(cash).0, 9);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +289,10 @@ fn task_functions_record_conditions_and_effects() {
     for e in walk.effects.iter() {
         e.apply(&mut state);
     }
-    let my_location = bed.domain().components.get::<MyLocation>().unwrap();
-    let happy = bed.domain().components.get::<Happy>().unwrap();
-    assert_eq!(state.get::<MyLocation>(my_location).0, Spot::Park);
-    assert!(state.get::<Happy>(happy).0);
+    let my_location = bed.domain().components.slot_of::<MyLocation>().unwrap();
+    let happy = bed.domain().components.slot_of::<Happy>().unwrap();
+    assert_eq!(state.get_slot::<MyLocation>(my_location).0, Spot::Park);
+    assert!(state.get_slot::<Happy>(happy).0);
 }
 
 #[test]
@@ -314,8 +318,8 @@ fn effects_apply_to_state() {
     for e in switch.effects.iter() {
         e.apply(&mut state);
     }
-    let powered = bed.domain().components.get::<Powered>().unwrap();
-    assert!(state.get::<Powered>(powered).0);
+    let powered = bed.domain().components.slot_of::<Powered>().unwrap();
+    assert!(state.get_slot::<Powered>(powered).0);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,14 +676,14 @@ fn domains_wider_than_u8_plan_on_the_u16_path() {
         plan.is_complete(),
         "the raised budget fully refutes the doomed branch"
     );
-    assert_eq!(plan.task_names(), ["strike", "leaf_check"]);
+    assert_eq!(plan.task_names(&domain), ["strike", "leaf_check"]);
 
     // And the look-ahead agrees (same plan, found without the doomed branch's
     // 300-step burn).
     let mut la = HtnPlanner::new(&domain);
-    la.set_sanity_limit(1000).set_lookahead(true);
+    la.set_sanity_limit(1000).set_lookahead_mode(LookaheadMode::Always);
     assert_eq!(
-        plan_of(&mut la, wide_root, &state).task_names(),
+        plan_of(&mut la, wide_root, &state).task_names(&domain),
         ["strike", "leaf_check"]
     );
 }
@@ -713,7 +717,7 @@ fn plan_status_reports_complete_vs_partial() {
     let gate = common::gate_domain();
     let state = PlanState::build(&gate.components).finish();
     let mut planner = HtnPlanner::new(&gate);
-    planner.set_lookahead(false);
+    planner.set_lookahead_mode(LookaheadMode::Off);
     let partial = plan_of(&mut planner, gate_root, &state);
     assert!(partial.is_partial());
     assert!(
@@ -727,7 +731,7 @@ fn plan_status_reports_complete_vs_partial() {
     let mut planner = HtnPlanner::new(&gate);
     let done = plan_of(&mut planner, gate_root, &state);
     assert!(done.is_complete());
-    assert_eq!(done.task_names(), ["strike", "gate_final"]);
+    assert_eq!(done.task_names(&gate), ["strike", "gate_final"]);
 
     // Exhausted search: no method can ever apply — an error, never an
     // empty `Complete` plan (an empty *success* is a root whose decomposition
@@ -779,12 +783,12 @@ fn plan_roots_accept_functions_and_indices_alike() {
     let mut planner = HtnPlanner::new(&domain);
 
     // Function form and index form address the same task.
-    assert_eq!(plan_of(&mut planner, root, &state).task_names(), ["leaf"]);
+    assert_eq!(plan_of(&mut planner, root, &state).task_names(&domain), ["leaf"]);
     assert_eq!(
         planner
             .plan(domain.root, &state)
             .expect("plan")
-            .task_names(),
+            .task_names(&domain),
         ["leaf"]
     );
 
@@ -820,7 +824,7 @@ fn adaptive_lookahead_keeps_multi_step_refutations_and_the_budget() {
     always.set_lookahead_mode(LookaheadMode::Always);
     let always_plan = plan_of(&mut always, doomed_tasks::act, &state);
     assert_eq!(
-        always_plan.task_names(),
+        always_plan.task_names(&domain),
         ["safe"],
         "Always refutes the doomed branch"
     );
@@ -830,7 +834,7 @@ fn adaptive_lookahead_keeps_multi_step_refutations_and_the_budget() {
     adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
     let adaptive_plan = plan_of(&mut adaptive, doomed_tasks::act, &state);
     assert_eq!(
-        adaptive_plan.task_names(),
+        adaptive_plan.task_names(&domain),
         ["safe"],
         "Adaptive keeps the sweep on multi-step methods — same refutation"
     );
@@ -843,7 +847,7 @@ fn adaptive_lookahead_keeps_multi_step_refutations_and_the_budget() {
         off_plan.is_partial(),
         "Off descends into the spiral and burns the sanity budget"
     );
-    assert_eq!(off_plan.task_names().first(), Some(&Ustr::from("prime")));
+    assert_eq!(off_plan.task_names(&domain).first(), Some(&"prime"));
 }
 
 /// The skip is keyed to the method shape, not the domain: the same
@@ -954,13 +958,13 @@ fn regression_adaptive_skipped_sweeps_do_not_attach_stale_pins() {
     let mut always = HtnPlanner::new(&domain);
     always.set_lookahead_mode(LookaheadMode::Always);
     let always_plan = plan_of(&mut always, outer_root, &state);
-    assert_eq!(always_plan.task_names(), expected, "Always: full corridor");
+    assert_eq!(always_plan.task_names(&domain), expected, "Always: full corridor");
 
     let mut adaptive = HtnPlanner::new(&domain);
     adaptive.set_lookahead_mode(LookaheadMode::Adaptive);
     let adaptive_plan = plan_of(&mut adaptive, outer_root, &state);
     assert_eq!(
-        adaptive_plan.task_names(),
+        adaptive_plan.task_names(&domain),
         expected,
         "Adaptive: skipped sweeps must not poison later commitments with stale pins"
     );
@@ -1012,7 +1016,7 @@ fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
             .plan_traced(root2, &state, &mut trace)
             .expect("plan");
         assert_eq!(
-            plan.task_names(),
+            plan.task_names(&domain),
             ["gate", "gate"],
             "{label}: same plan in every mode"
         );
@@ -1024,3 +1028,48 @@ fn regression_adaptive_downgraded_sweeps_still_refute_primitive_dead_ends() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Plan serialization (the `serde` feature — the save-game seam: an agent's
+// AI state is its `Plan`, which is plain data).
+// ---------------------------------------------------------------------------
+
+/// A compiled plan — including a pause-truncated one with its resume point —
+/// round-trips through JSON unchanged. Task indices are stable identifiers
+/// (they address the baked domain), so a persisted plan replays against the
+/// same domain version.
+#[cfg(feature = "serde")]
+#[test]
+fn plans_round_trip_through_serde() {
+    #[derive(Component, Clone, Default, Debug, PartialEq)]
+    struct PlanGold(i32);
+
+    fn legs(task: &mut TaskBuilder) {
+        task.branch()
+            .then(take)
+            .pause_plan()
+            .then(take)
+            .then(take);
+    }
+    fn take(task: &mut TaskBuilder) {
+        task.effect(|g: &mut PlanGold| g.0 += 1);
+    }
+
+    let domain = HtnDomain::from_root(legs).build().unwrap();
+    let state = PlanState::build(&domain.components).finish();
+    let mut planner = HtnPlanner::new(&domain);
+    let plan = planner.plan(domain.root, &state).expect("paused plan");
+    assert_eq!(plan.status(), PlanStatus::Paused);
+
+    let json = serde_json::to_string(&plan).expect("serialize");
+    let back: Plan = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, plan, "round-trip is lossless");
+    assert_eq!(back.steps(), plan.steps());
+    assert_eq!(back.mtr(), plan.mtr());
+    assert_eq!(back.resume(), plan.resume());
+
+    // The deserialized plan resumes against the live domain exactly like
+    // the original: the persisted AI state is executable.
+    let resumed = planner.resume(back.resume().expect("resume point"), &state);
+    assert!(resumed.is_ok(), "a persisted plan resumes: {resumed:?}");
+}

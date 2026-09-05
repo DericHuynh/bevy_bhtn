@@ -110,9 +110,9 @@ fn apply_cache(domain: &HtnDomain, state: &mut PlanState, cache: &CacheResources
     let reg = &domain.components;
     // Unwrap: every component below is touched by the outpost domain's
     // closures, so it is guaranteed registered.
-    state.get_mut::<Fuel>(reg.get::<Fuel>().unwrap()).0 += cache.fuel / 4;
-    state.get_mut::<Food>(reg.get::<Food>().unwrap()).0 += cache.food / 4;
-    state.get_mut::<Ammo>(reg.get::<Ammo>().unwrap()).0 += cache.ammo / 4;
+    state.get_mut_slot::<Fuel>(reg.slot_of::<Fuel>().unwrap()).0 += cache.fuel / 4;
+    state.get_mut_slot::<Food>(reg.slot_of::<Food>().unwrap()).0 += cache.food / 4;
+    state.get_mut_slot::<Ammo>(reg.slot_of::<Ammo>().unwrap()).0 += cache.ammo / 4;
 }
 
 /// The AI system: for each colonist, use its `ServesCache` relationship to find
@@ -141,7 +141,7 @@ fn run_ai(
             let mut planner = HtnPlanner::new(domain);
             let planned = plan_root(&mut planner, secure_outpost, &scratch.0);
             execute_plan(domain, &mut scratch.0, &planned);
-            output.0 = planned.task_names().to_vec();
+            output.0 = planned.task_names(domain).into_iter().map(Ustr::from).collect();
             processed.0.fetch_add(1, Ordering::Relaxed);
         });
 }

@@ -122,7 +122,7 @@ pub struct SearchOverride {
 /// [`HtnPlanner::plan_traced`](crate::planner::HtnPlanner::plan_traced).
 ///
 /// The driver forwards these into `Messages<DecompositionTrace>` when
-/// `HtnConfig::debug_trace` is set.
+/// `HtnConfig::trace_events` is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
 pub struct DecompositionTrace {
     /// Declaration index of the compound task.

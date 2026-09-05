@@ -182,7 +182,7 @@ macro_rules! impl_precondition {
                 let reads: SmallVec<[usize; 4]> = smallvec![$($name,)*];
                 Precondition {
                     reads,
-                    check: Arc::new(move |state| self($(state.get::<$name>($name),)*)),
+                    check: Arc::new(move |state| self($(state.get_slot::<$name>($name),)*)),
                 }
             }
         }
@@ -398,7 +398,7 @@ macro_rules! impl_utility {
             #[allow(unused_variables)]
             fn build(self, registry: &mut RegistryBuilder) -> ScoreFn {
                 $(let $name = registry.index::<$name>();)*
-                Box::new(move |state| self($(state.get::<$name>($name),)*))
+                Box::new(move |state| self($(state.get_slot::<$name>($name),)*))
             }
         }
     };
@@ -536,7 +536,7 @@ pub(crate) struct MethodProto {
     /// *before* the member at that declaration position (`subtasks.len()`
     /// means after the last member). Appended monotonically by construction
     /// (each call records the current member count).
-    pub(crate) pause_positions: Vec<u32>,
+    pub(crate) pause_positions: SmallVec<[u32; 2]>,
 }
 
 /// The identity of a referenced task in a recorded method body: a task
@@ -591,7 +591,7 @@ pub(crate) struct Recorder {
     pub(crate) insertables: Vec<SubtaskRef>,
     /// Whether task insertion is compiled in at bake time.
     pub(crate) insertion: bool,
-    /// Additional root tasks (see `DomainBuilder::root`) — e.g. an opponent's
+    /// Additional root tasks (see `DomainBuilder::add_root`) — e.g. an opponent's
     /// plan for adversarial planning. Validated compound at bake.
     pub(crate) extra_roots: Vec<SubtaskRef>,
 }

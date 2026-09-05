@@ -140,7 +140,7 @@ pub(crate) fn apply_sharing(
             expected_effects.push(Effect::new(
                 smallvec![marks_slot],
                 Box::new(move |state: &mut PlanState| {
-                    let marks = &mut state.get_mut::<SharedMarks>(marks_slot).0;
+                    let marks = &mut state.get_mut_slot::<SharedMarks>(marks_slot).0;
                     if marks.len() <= id {
                         marks.resize(id + 1, false);
                     }
@@ -178,7 +178,7 @@ pub(crate) fn apply_sharing(
             done_reads,
             std::sync::Arc::new(move |state: &PlanState| {
                 if state
-                    .get::<SharedMarks>(marks_slot)
+                    .get_slot::<SharedMarks>(marks_slot)
                     .0
                     .get(id)
                     .copied()
@@ -198,7 +198,7 @@ pub(crate) fn apply_sharing(
             subtasks: Vec::new(),
             unordered: false,
             edges: Vec::new(),
-            pause_positions: Vec::new(),
+            pause_positions: SmallVec::new(),
         };
         let moa = MethodProto {
             name: Some(leak_name("do".to_string())),
@@ -207,7 +207,7 @@ pub(crate) fn apply_sharing(
             subtasks: vec![(*req, orig_name, true)],
             unordered: false,
             edges: Vec::new(),
-            pause_positions: Vec::new(),
+            pause_positions: SmallVec::new(),
         };
         let comp = TaskProto::Compound {
             methods: vec![mom, moa],
@@ -283,7 +283,7 @@ pub(crate) fn apply_insertion(
         subtasks: Vec::new(),
         unordered: false,
         edges: Vec::new(),
-        pause_positions: Vec::new(),
+        pause_positions: SmallVec::new(),
     }];
     for (cref, cname) in candidates {
         methods.push(MethodProto {
@@ -293,7 +293,7 @@ pub(crate) fn apply_insertion(
             subtasks: vec![(cref, cname, true), (insert_ref, insert_name, true)],
             unordered: false,
             edges: Vec::new(),
-            pause_positions: Vec::new(),
+            pause_positions: SmallVec::new(),
         });
     }
     let insert = TaskProto::Compound {

@@ -75,7 +75,7 @@ fn bench_lookahead(c: &mut Criterion) {
                     let mut state = initial.clone();
                     let plan = plan_root(&mut planner, gate_root, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
-                    black_box(plan.task_names().len());
+                    black_box(plan.task_names(&domain).len());
                 })
             });
         }
@@ -101,7 +101,7 @@ fn bench_lookahead(c: &mut Criterion) {
                     let mut state = initial.clone();
                     let plan = plan_root(&mut planner, act, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
-                    black_box(plan.task_names().len());
+                    black_box(plan.task_names(&domain).len());
                 })
             });
         }
@@ -127,7 +127,7 @@ fn bench_lookahead(c: &mut Criterion) {
                     let mut state = initial.clone();
                     let plan = plan_root(&mut planner, secure_outpost, black_box(&state));
                     execute_plan(&domain, &mut state, &plan);
-                    black_box(plan.task_names().len());
+                    black_box(plan.task_names(&domain).len());
                 })
             });
         }

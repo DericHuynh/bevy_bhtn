@@ -99,7 +99,7 @@ fn recursion_and_forward_references_bake_to_edges() {
     let mut planner = HtnPlanner::new(&domain);
     // `tail` is a precondition-only primitive: pickable, executes as a no-op.
     assert_eq!(
-        plan_of(&mut planner, root, &state).task_names(),
+        plan_of(&mut planner, root, &state).task_names(&domain),
         ["late", "tail"]
     );
 
@@ -111,7 +111,7 @@ fn recursion_and_forward_references_bake_to_edges() {
     let state = PlanState::build(&spiral.components).finish();
     let mut planner = HtnPlanner::new(&spiral);
     assert_eq!(
-        plan_of(&mut planner, spiral_root, &state).task_names(),
+        plan_of(&mut planner, spiral_root, &state).task_names(&spiral),
         ["spiral_step", "spiral_step"],
         "two iterations reach the terminal branch"
     );
@@ -154,18 +154,18 @@ fn same_display_names_are_distinct_identities() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["dup", "dup"]);
+    assert_eq!(plan.task_names(&domain), ["dup", "dup"]);
     let mut executed = state.clone();
-    for &step in &plan.steps {
+    for &step in plan.steps() {
         let Task::Primitive(p) = &domain.tasks[step as usize] else {
             panic!("plans are primitive sequences");
         };
         p.apply_effects(&mut executed);
     }
-    let gold = domain.components.get::<Gold>().unwrap();
-    let noise = domain.components.get::<Noise>().unwrap();
-    assert_eq!(executed.get::<Gold>(gold).0, 1, "a::dup ran");
-    assert!(executed.get::<Noise>(noise).0, "b::dup ran");
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    let noise = domain.components.slot_of::<Noise>().unwrap();
+    assert_eq!(executed.get_slot::<Gold>(gold).0, 1, "a::dup ran");
+    assert!(executed.get_slot::<Noise>(noise).0, "b::dup ran");
 }
 
 /// Registering the same goal function twice is a bake error — the second
@@ -300,7 +300,7 @@ fn baked_domains_get_summaries_and_lookahead() {
 
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
-    assert_eq!(plan_of(&mut planner, act, &state).task_names(), ["safe"]);
+    assert_eq!(plan_of(&mut planner, act, &state).task_names(&domain), ["safe"]);
 }
 
 /// A baked domain plans end-to-end: compound decomposition, preconditions,
@@ -327,7 +327,7 @@ fn baked_domain_plans_forward_and_backward() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, wealthy, &state).task_names(),
+        plan_of(&mut planner, wealthy, &state).task_names(&domain),
         ["work", "work", "work"]
     );
 
@@ -337,15 +337,15 @@ fn baked_domain_plans_forward_and_backward() {
     // method until its own `gold >= 3` gate closes — the plan really reaches
     // the goal's value (the old primitive-only greedy stopped after one `work`,
     // leaving gold at 1).
-    assert_eq!(back_plan.task_names(), ["work", "work", "work"]);
+    assert_eq!(back_plan.task_names(&domain), ["work", "work", "work"]);
     let mut executed = state.clone();
-    for &s in &back_plan.steps {
+    for &s in back_plan.steps() {
         if let Task::Primitive(p) = &domain.tasks[s as usize] {
             p.apply_effects(&mut executed);
         }
     }
-    let gold = domain.components.get::<Gold>().unwrap();
-    assert_eq!(executed.get::<Gold>(gold).0, 3);
+    let gold = domain.components.slot_of::<Gold>().unwrap();
+    assert_eq!(executed.get_slot::<Gold>(gold).0, 3);
 }
 
 /// The full pipeline through the shared bed helper: plan, execute on the
@@ -366,9 +366,9 @@ fn baked_domain_executes_on_the_scratchpad() {
     let mut planner = HtnPlanner::new(&domain);
 
     let plan = plan_of(&mut planner, root, &state);
-    assert_eq!(plan.task_names(), ["recharge", "recharge", "recharge"]);
+    assert_eq!(plan.task_names(&domain), ["recharge", "recharge", "recharge"]);
 
-    for name in plan.task_names() {
+    for name in plan.task_names(&domain) {
         let Task::Primitive(p) = domain.get_task(name).unwrap() else {
             panic!("plans are primitive sequences");
         };
@@ -376,7 +376,7 @@ fn baked_domain_executes_on_the_scratchpad() {
     }
     assert_eq!(
         state
-            .get::<Energy>(domain.components.get::<Energy>().unwrap())
+            .get_slot::<Energy>(domain.components.slot_of::<Energy>().unwrap())
             .0,
         3
     );

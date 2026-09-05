@@ -20,6 +20,7 @@ mod common;
 use common::{Gold, Noise};
 
 use bevy_bhtn::planner::{HtnPlanner, Plan};
+use bevy_bhtn::selection::LookaheadMode;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::{HtnDomain, TaskBuilder, TaskFn, TaskSummary};
 use bevy_ecs::prelude::*;
@@ -281,7 +282,7 @@ fn min_yield_refutes_method_that_cannot_finish_within_budget() {
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
     assert_eq!(
-        plan_of(&mut planner, chain30::root, &state).task_names(),
+        plan_of(&mut planner, chain30::root, &state).task_names(&domain),
         ["ok"]
     );
 
@@ -289,11 +290,11 @@ fn min_yield_refutes_method_that_cannot_finish_within_budget() {
     // prefix (the documented fallback semantics).
     let mut planner = HtnPlanner::new(&domain);
     planner.set_sanity_limit(10);
-    planner.set_lookahead(false);
+    planner.set_lookahead_mode(LookaheadMode::Off);
     let plan = plan_of(&mut planner, chain30::root, &state);
-    let names = plan.task_names();
+    let names = plan.task_names(&domain);
     assert_eq!(names[0], "p0");
-    assert!(!names.contains(&"ok".into()));
+    assert!(!names.contains(&"ok"));
 }
 
 #[test]
@@ -308,7 +309,7 @@ fn min_yield_does_not_refute_within_budget() {
 
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, chain5::root, &state).task_names(),
+        plan_of(&mut planner, chain5::root, &state).task_names(&domain),
         ["p0", "p1", "p2", "p3", "p4"]
     );
 
@@ -318,7 +319,7 @@ fn min_yield_does_not_refute_within_budget() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     assert_eq!(
-        plan_of(&mut planner, structure_tasks::loop_, &state).task_names(),
+        plan_of(&mut planner, structure_tasks::loop_, &state).task_names(&domain),
         ["tick"]
     );
 }

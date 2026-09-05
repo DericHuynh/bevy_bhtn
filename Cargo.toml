@@ -6,11 +6,17 @@ description = "Hierarchical Task Network planner for Bevy AI — tasks are plain
 
 [dependencies]
 bevy_ecs = "0.18"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 smallvec = "1"
 thiserror = "2"
 ustr = "1.1.0"
 
 [features]
+# Serialization of compiled plans (the save-game seam: an agent's AI state is
+# its `Plan` — plain data). `ustr/serde` interns the display names the plan
+# deliberately does not store.
+serde = ["dep:serde", "dep:serde_json", "ustr/serde"]
 # Hot-reload support via Dioxus Subsecond (the same engine behind Bevy's
 # `hotpatching` feature): when enabled, `HtnConfig` can carry a domain
 # rebuild closure and the driver re-records + re-bakes the domain whenever a

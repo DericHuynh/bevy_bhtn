@@ -278,6 +278,8 @@ dependencies = [
  "bevy_ecs 0.18.1",
  "bevy_htnp",
  "criterion",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.20",
  "ustr",
@@ -2526,6 +2528,7 @@ dependencies = [
  "byteorder",
  "lazy_static",
  "parking_lot",
+ "serde",
 ]
 
 [[package]]

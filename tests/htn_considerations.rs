@@ -116,8 +116,8 @@ fn blended_utility_selects_branches_by_state() {
         .finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(decide, &state).expect("plan");
-    assert_eq!(plan.status, PlanStatus::Complete);
-    assert_eq!(plan.task_names(), ["patrol"]);
+    assert_eq!(plan.status(), PlanStatus::Complete);
+    assert_eq!(plan.task_names(&domain), ["patrol"]);
 
     // High hunger (1.0), low morale (inverted 1.0): blend = (2*1 + 1) / 3
     // ≈ 1.0 > 0.5 → eat. Same domain, same code — only the components moved.
@@ -127,6 +127,6 @@ fn blended_utility_selects_branches_by_state() {
         .finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(decide, &state).expect("plan");
-    assert_eq!(plan.task_names(), &["eat"]);
+    assert_eq!(plan.task_names(&domain), &["eat"]);
 }
 

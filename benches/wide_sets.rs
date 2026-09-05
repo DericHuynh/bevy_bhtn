@@ -106,7 +106,7 @@ fn plan_cycle<F: TaskFn>(
     let mut state = state.clone();
     let plan = planner.plan(_root, black_box(&state)).expect("plan cycle");
     execute_plan(domain, &mut state, &plan);
-    black_box(plan.task_names().len());
+    black_box(plan.task_names(domain).len());
 }
 
 fn bench_wide_sets(c: &mut Criterion) {

@@ -12,6 +12,8 @@
 mod bench_common;
 
 use bevy_bhtn::planner::HtnPlanner;
+use bevy_bhtn::selection::LookaheadMode;
+use bevy_bhtn::HtnDomain;
 use bevy_bhtn::state::PlanState;
 use bevy_bhtn::tasks::TaskFn;
 
@@ -25,18 +27,23 @@ fn plan_of<F: TaskFn>(domain: &bevy_bhtn::HtnDomain, _root: F, state: &PlanState
     planner
         .plan(_root, state)
         .expect("plan")
-        .task_names()
+        .task_names(domain)
         .iter()
         .map(|n| n.to_string())
         .collect()
 }
 
 /// Helper: plan with an existing (possibly tuned) planner.
-fn plan_of_with<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState) -> Vec<String> {
+fn plan_of_with<F: TaskFn>(
+    domain: &HtnDomain,
+    planner: &mut HtnPlanner,
+    _root: F,
+    state: &PlanState,
+) -> Vec<String> {
     planner
         .plan(_root, state)
         .expect("plan")
-        .task_names()
+        .task_names(domain)
         .iter()
         .map(|n| n.to_string())
         .collect()
@@ -48,10 +55,10 @@ where
     T: bevy_bhtn::state::PlanComponent + Clone,
 {
     state
-        .get::<T>(
+        .get_slot::<T>(
             domain
                 .components
-                .get::<T>()
+                .slot_of::<T>()
                 .expect("component is registered"),
         )
         .clone()
@@ -237,8 +244,8 @@ fn miner_bench_plans_identical_without_lookahead() {
         let state = miner_scratch(&domain, i);
         let with = plan_of(&domain, miner_tasks::earn_gold, &state);
         let mut planner = HtnPlanner::new(&domain);
-        planner.set_lookahead(false);
-        let without = plan_of_with(&mut planner, miner_tasks::earn_gold, &state);
+        planner.set_lookahead_mode(LookaheadMode::Off);
+        let without = plan_of_with(&domain, &mut planner, miner_tasks::earn_gold, &state);
         assert_eq!(
             with, without,
             "miner entity {i}: look-ahead changed the plan"
@@ -326,8 +333,8 @@ fn outpost_bench_plans_identical_without_lookahead() {
     ] {
         let with = plan_of(&domain, outpost_tasks::secure_outpost, &state);
         let mut planner = HtnPlanner::new(&domain);
-        planner.set_lookahead(false);
-        let without = plan_of_with(&mut planner, outpost_tasks::secure_outpost, &state);
+        planner.set_lookahead_mode(LookaheadMode::Off);
+        let without = plan_of_with(&domain, &mut planner, outpost_tasks::secure_outpost, &state);
         assert_eq!(
             with, without,
             "outpost state {state:?}: look-ahead changed the plan"
@@ -374,7 +381,7 @@ fn run_replan_cycle<F: TaskFn + Copy>(
     let mut plans = Vec::with_capacity(cycles);
     for _ in 0..cycles {
         let plan = planner.plan(_root, &state).expect("replan cycle");
-        plans.push(plan.task_names().iter().map(|n| n.to_string()).collect());
+        plans.push(plan.task_names(domain).iter().map(|n| n.to_string()).collect());
         execute_plan_step(domain, &mut state, &plan);
     }
     (plans, state)

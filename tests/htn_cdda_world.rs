@@ -1009,17 +1009,20 @@ impl CddaWorld {
         self.world
             .get::<HtnAgent>(self.survivor)
             .expect("survivor alive")
-            .plan
+            .plan()
             .is_none()
     }
 
     /// The current plan's full step-program names (exact execution ordering).
     fn plan_names(&self) -> Vec<String> {
-        self.world
-            .get::<HtnAgent>(self.survivor)
-            .and_then(|a| a.plan.as_ref())
-            .map(|p| p.task_names().iter().map(|u| u.to_string()).collect())
-            .unwrap_or_default()
+        let Some(agent) = self.world.get::<HtnAgent>(self.survivor) else {
+            return Vec::new();
+        };
+        let Some(plan) = agent.plan() else {
+            return Vec::new();
+        };
+        let domain = &self.world.resource::<HtnConfig>().domain;
+        plan.task_names(domain).iter().map(|s| s.to_string()).collect()
     }
 
     /// Run exactly `n` ticks (for checkpointed ordering assertions).

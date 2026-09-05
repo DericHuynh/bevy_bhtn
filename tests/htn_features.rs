@@ -512,23 +512,23 @@ fn effect_single_component_mutates() {
     }
     assert_eq!(
         state
-            .get::<Count>(domain.components.get::<Count>().unwrap())
+            .get_slot::<Count>(domain.components.slot_of::<Count>().unwrap())
             .0,
         42
     );
     assert_eq!(
         state
-            .get::<Weight>(domain.components.get::<Weight>().unwrap())
+            .get_slot::<Weight>(domain.components.slot_of::<Weight>().unwrap())
             .0,
         3.25
     );
     assert_eq!(
-        state.get::<Zone>(domain.components.get::<Zone>().unwrap()),
+        state.get_slot::<Zone>(domain.components.slot_of::<Zone>().unwrap()),
         &Zone::Outside
     );
     assert!(
         state
-            .get::<Flag>(domain.components.get::<Flag>().unwrap())
+            .get_slot::<Flag>(domain.components.slot_of::<Flag>().unwrap())
             .0
     );
 
@@ -539,7 +539,7 @@ fn effect_single_component_mutates() {
         e.apply(&mut state);
     }
     assert!(state
-        .get::<Maybe>(domain.components.get::<Maybe>().unwrap())
+        .get_slot::<Maybe>(domain.components.slot_of::<Maybe>().unwrap())
         .0
         .is_none());
 }
@@ -561,20 +561,20 @@ fn effect_multi_component_mutates() {
     // set_from analog: Left copied from Count *before* Count was incremented.
     assert_eq!(
         state
-            .get::<Left>(domain.components.get::<Left>().unwrap())
+            .get_slot::<Left>(domain.components.slot_of::<Left>().unwrap())
             .0,
         10
     );
     // inc_int / inc_float analogs.
     assert_eq!(
         state
-            .get::<Count>(domain.components.get::<Count>().unwrap())
+            .get_slot::<Count>(domain.components.slot_of::<Count>().unwrap())
             .0,
         15
     );
     assert_eq!(
         state
-            .get::<Weight>(domain.components.get::<Weight>().unwrap())
+            .get_slot::<Weight>(domain.components.slot_of::<Weight>().unwrap())
             .0,
         1.5
     );
@@ -586,14 +586,14 @@ fn effect_arity_up_to_eight_mutates() {
     let mut state = PlanState::build(&domain.components).finish();
 
     let slots = [
-        domain.components.get::<P1>().unwrap(),
-        domain.components.get::<P2>().unwrap(),
-        domain.components.get::<P3>().unwrap(),
-        domain.components.get::<P4>().unwrap(),
-        domain.components.get::<P5>().unwrap(),
-        domain.components.get::<P6>().unwrap(),
-        domain.components.get::<P7>().unwrap(),
-        domain.components.get::<P8>().unwrap(),
+        domain.components.slot_of::<P1>().unwrap(),
+        domain.components.slot_of::<P2>().unwrap(),
+        domain.components.slot_of::<P3>().unwrap(),
+        domain.components.slot_of::<P4>().unwrap(),
+        domain.components.slot_of::<P5>().unwrap(),
+        domain.components.slot_of::<P6>().unwrap(),
+        domain.components.slot_of::<P7>().unwrap(),
+        domain.components.slot_of::<P8>().unwrap(),
     ];
     for n in 1..=8 {
         let name = format!("eff{n}");
@@ -603,14 +603,14 @@ fn effect_arity_up_to_eight_mutates() {
         p.apply_effects(&mut state);
         for k in 1..=n {
             let value = match k {
-                1 => state.get::<P1>(slots[0]).0,
-                2 => state.get::<P2>(slots[1]).0,
-                3 => state.get::<P3>(slots[2]).0,
-                4 => state.get::<P4>(slots[3]).0,
-                5 => state.get::<P5>(slots[4]).0,
-                6 => state.get::<P6>(slots[5]).0,
-                7 => state.get::<P7>(slots[6]).0,
-                _ => state.get::<P8>(slots[7]).0,
+                1 => state.get_slot::<P1>(slots[0]).0,
+                2 => state.get_slot::<P2>(slots[1]).0,
+                3 => state.get_slot::<P3>(slots[2]).0,
+                4 => state.get_slot::<P4>(slots[3]).0,
+                5 => state.get_slot::<P5>(slots[4]).0,
+                6 => state.get_slot::<P6>(slots[5]).0,
+                7 => state.get_slot::<P7>(slots[6]).0,
+                _ => state.get_slot::<P8>(slots[7]).0,
             };
             assert_eq!(value, k, "{name} wrote P{k}");
         }
@@ -650,9 +650,9 @@ fn mixed_effect_reads_are_not_journaled_or_committed() {
     let Task::Primitive(p) = domain.get_task("mixed_step").expect("recorded") else {
         panic!("mixed_step must be a primitive");
     };
-    let flag = domain.components.get::<Flag>().unwrap();
-    let count = domain.components.get::<Count>().unwrap();
-    let maybe = domain.components.get::<Maybe>().unwrap();
+    let flag = domain.components.slot_of::<Flag>().unwrap();
+    let count = domain.components.slot_of::<Count>().unwrap();
+    let maybe = domain.components.slot_of::<Maybe>().unwrap();
     let writes: Vec<usize> = p.write_slots().collect();
     assert!(writes.contains(&flag) && writes.contains(&maybe));
     assert!(!writes.contains(&count), "read-only params are not writes");
@@ -739,18 +739,18 @@ fn closure_subtasks_record_unique_identities() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(root, &state).expect("plan");
-    assert_eq!(plan.task_names().len(), 2);
+    assert_eq!(plan.task_names(&domain).len(), 2);
     let mut executed = state.clone();
-    for &step in &plan.steps {
+    for &step in plan.steps() {
         let Task::Primitive(p) = &domain.tasks[step as usize] else {
             panic!("plans are primitive sequences");
         };
         p.apply_effects(&mut executed);
     }
-    let count = domain.components.get::<Count>().unwrap();
-    let flag = domain.components.get::<Flag>().unwrap();
-    assert_eq!(executed.get::<Count>(count).0, 5);
-    assert!(executed.get::<Flag>(flag).0);
+    let count = domain.components.slot_of::<Count>().unwrap();
+    let flag = domain.components.slot_of::<Flag>().unwrap();
+    assert_eq!(executed.get_slot::<Count>(count).0, 5);
+    assert!(executed.get_slot::<Flag>(flag).0);
 }
 
 /// Referencing the *same* closure value from several `then` edges records the
@@ -772,16 +772,16 @@ fn same_closure_value_dedupes_to_one_recorded_task() {
     let state = PlanState::build(&domain.components).finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(root, &state).expect("plan");
-    assert_eq!(plan.task_names().len(), 3, "each edge still executes");
+    assert_eq!(plan.task_names(&domain).len(), 3, "each edge still executes");
     let mut executed = state.clone();
-    for &step in &plan.steps {
+    for &step in plan.steps() {
         let Task::Primitive(p) = &domain.tasks[step as usize] else {
             panic!("plans are primitive sequences");
         };
         p.apply_effects(&mut executed);
     }
-    let count = domain.components.get::<Count>().unwrap();
-    assert_eq!(executed.get::<Count>(count).0, 3);
+    let count = domain.components.slot_of::<Count>().unwrap();
+    assert_eq!(executed.get_slot::<Count>(count).0, 3);
 }
 
 /// Closure tasks are displayed by their REFERENCE SITE (`file:line:col`, via
@@ -867,23 +867,23 @@ fn fn_pointer_coercion_collapses_identity() {
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(root, &state).expect("plan");
     assert_eq!(
-        plan.task_names().len(),
+        plan.task_names(&domain).len(),
         2,
         "two edges — but both point at the first recorded body"
     );
     let mut executed = state.clone();
-    for &step in &plan.steps {
+    for &step in plan.steps() {
         let Task::Primitive(p) = &domain.tasks[step as usize] else {
             panic!("plans are primitive sequences");
         };
         p.apply_effects(&mut executed);
     }
-    let count = domain.components.get::<Count>().unwrap();
-    assert_eq!(executed.get::<Count>(count).0, 2, "strike's body ran twice");
+    let count = domain.components.slot_of::<Count>().unwrap();
+    assert_eq!(executed.get_slot::<Count>(count).0, 2, "strike's body ran twice");
     // bash's body never even recorded — its Flag effect never registered the
     // component in the domain's registry. Silent, total loss of the task.
     assert!(
-        domain.components.get::<Flag>().is_none(),
+        domain.components.slot_of::<Flag>().is_none(),
         "bash's body never ran — the trap"
     );
 }
@@ -931,20 +931,8 @@ fn action_is_stored_on_primitive() {
 
 #[test]
 fn plan_mtr_ordering() {
-    let low = Plan {
-        steps: vec![0],
-        names: vec!["A".into()],
-        mtr: vec![0],
-        status: PlanStatus::Complete,
-        resume: None,
-    };
-    let high = Plan {
-        steps: vec![1],
-        names: vec!["B".into()],
-        mtr: vec![1],
-        status: PlanStatus::Complete,
-        resume: None,
-    };
+    let low = Plan::compiled(vec![0], vec![0], PlanStatus::Complete, None);
+    let high = Plan::compiled(vec![1], vec![1], PlanStatus::Complete, None);
     assert!(low.is_preferred_over(&high));
     assert!(!high.is_preferred_over(&low));
     assert_eq!(format!("{:?}", low.mtr()), "[0]");
@@ -1044,19 +1032,19 @@ fn expected_effects_do_not_apply_on_execution() {
         .finish();
     let mut planner = HtnPlanner::new(&domain);
     let plan = planner.plan(travel_root, &state).expect("plan");
-    assert_eq!(plan.task_names(), ["approach", "arrive"]);
+    assert_eq!(plan.task_names(&domain), ["approach", "arrive"]);
 
     // Execution applies `effects` only: arrive's real Count write lands, but
     // approach's hoped Zone write never does.
     execute_plan(&domain, &mut state, &plan);
     assert_eq!(
         state
-            .get::<Count>(domain.components.get::<Count>().unwrap())
+            .get_slot::<Count>(domain.components.slot_of::<Count>().unwrap())
             .0,
         7
     );
     assert_eq!(
-        state.get::<Zone>(domain.components.get::<Zone>().unwrap()),
+        state.get_slot::<Zone>(domain.components.slot_of::<Zone>().unwrap()),
         &Zone::Inside
     );
 }
@@ -1087,13 +1075,13 @@ fn summaries_reflect_precondition_reads_and_effect_writes() {
         .build()
         .expect("summary domain is well-formed");
 
-    let flag = domain.components.get::<Flag>().expect("Flag registered");
-    let count = domain.components.get::<Count>().expect("Count registered");
+    let flag = domain.components.slot_of::<Flag>().expect("Flag registered");
+    let count = domain.components.slot_of::<Count>().expect("Count registered");
     let weight = domain
         .components
-        .get::<Weight>()
+        .slot_of::<Weight>()
         .expect("Weight registered");
-    let maybe = domain.components.get::<Maybe>().expect("Maybe registered");
+    let maybe = domain.components.slot_of::<Maybe>().expect("Maybe registered");
 
     let leaf = domain.task_summary(summary_leaf).expect("summary present");
     // Reads: both precondition components are required before any write.
@@ -1161,6 +1149,59 @@ fn unreachable_goal_yields_no_plan_error() {
     assert!(matches!(err, HtnError::NoPlan));
 }
 
+/// The expansion budget is configurable (`BackPlanner::with_budget`): a
+/// three-step dependency chain fits the default budget but not a tightened
+/// one — exhaustion is `NoPlan`, the same error as a genuine dead end.
+#[test]
+fn back_planner_budget_is_configurable() {
+    #[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
+    struct Wood(pub bool);
+    #[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
+    struct Tools(pub bool);
+    #[derive(Component, Clone, Default, Debug, PartialEq, Eq)]
+    struct Built(pub bool);
+
+    fn shelter(task: &mut TaskBuilder) {
+        task.branch().then(fetch_wood).then(fetch_tools).then(build);
+    }
+    fn fetch_wood(task: &mut TaskBuilder) {
+        task.effect(|w: &mut Wood| w.0 = true);
+    }
+    fn fetch_tools(task: &mut TaskBuilder) {
+        task.effect(|t: &mut Tools| t.0 = true);
+    }
+    fn build(task: &mut TaskBuilder) {
+        task.precondition(|w: &Wood, t: &Tools| w.0 && t.0)
+            .effect(|b: &mut Built| b.0 = true);
+    }
+    fn built_goal(goal: &mut GoalBuilder) {
+        goal.effect(|b: &mut Built| b.0 = true);
+    }
+
+    let domain = HtnDomain::from_root(shelter)
+        .goal(built_goal)
+        .build()
+        .expect("shelter domain is well-formed");
+    let state = PlanState::build(&domain.components).finish();
+
+    // Default budget: the full three-step chain is committed.
+    let mut planner = BackPlanner::new(&domain);
+    let plan = planner.plan(built_goal, &state).expect("default budget fits");
+    assert_eq!(plan.len(), 3);
+
+    // Tightened below the chain length: exhaustion is `NoPlan`.
+    let mut planner = BackPlanner::new(&domain).with_budget(2);
+    let err = planner.plan(built_goal, &state).unwrap_err();
+    assert!(matches!(err, HtnError::NoPlan));
+
+    // A budget exactly fitting the chain succeeds again.
+    let mut planner = BackPlanner::new(&domain).with_budget(3);
+    assert_eq!(
+        planner.plan(built_goal, &state).expect("exact budget").len(),
+        3
+    );
+}
+
 // ---------------------------------------------------------------------------
 // BackPlanner greedy tie-breaking: a leaf covering multiple goal fields wins.
 // ---------------------------------------------------------------------------
@@ -1203,19 +1244,19 @@ fn backward_plan_commits_full_coverage_compound() {
     // values — which the old primitive-only greedy also did here, but not in
     // value-recursive domains (see the htn_builder end-to-end pin).
     let plan = planner.plan(both_goal, &state).expect("back plan");
-    let names = plan.task_names();
+    let names = plan.task_names(&domain);
     assert!(!names.is_empty());
     assert_eq!(names, ["single_shot", "double_shot"]);
     let mut executed = state.clone();
-    for &s in &plan.steps {
+    for &s in plan.steps() {
         if let Task::Primitive(p) = &domain.tasks[s as usize] {
             p.apply_effects(&mut executed);
         }
     }
-    let flag = domain.components.get::<Flag>().unwrap();
-    let count = domain.components.get::<Count>().unwrap();
-    assert!(executed.get::<Flag>(flag).0);
-    assert_eq!(executed.get::<Count>(count).0, 7);
+    let flag = domain.components.slot_of::<Flag>().unwrap();
+    let count = domain.components.slot_of::<Count>().unwrap();
+    assert!(executed.get_slot::<Flag>(flag).0);
+    assert_eq!(executed.get_slot::<Count>(count).0, 7);
 }
 
 mod combine_tasks {
@@ -1250,7 +1291,7 @@ fn back_plan_combines_leaves_for_distinct_fields() {
     let mut planner = BackPlanner::new(&domain);
     // No single leaf covers both slots -> both are chained.
     let plan = planner.plan(combine_goal, &state).expect("back plan");
-    let names = plan.task_names();
+    let names = plan.task_names(&domain);
     assert_eq!(names.len(), 2);
     assert_ne!(names[0], names[1]);
 }

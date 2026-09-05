@@ -2,7 +2,7 @@
 //! component, [`HtnConfig`], and the exclusive [`htn_ai_system`] driver's
 //! plan → validate → execute-one-step → replan loop over real components.
 
-use bevy_bhtn::ecs::{htn_ai_system, HtnAgent, HtnConfig, PlanEvery};
+use bevy_bhtn::ecs::{htn_ai_system, AgentRoot, HtnAgent, HtnConfig, PlanEvery};
 use bevy_bhtn::tasks::{GoalBuilder, TaskBuilder};
 use bevy_bhtn::HtnDomain;
 use bevy_ecs::prelude::*;
@@ -66,8 +66,8 @@ fn agent_plans_executes_and_completes() {
     // Tick 1: plans (3x gather) and executes the first step.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert_eq!(agent.plan.as_ref().map(|p| p.len()), Some(3));
-    assert_eq!(agent.cursor, 1);
+    assert_eq!(agent.plan().map(|p| p.len()), Some(3));
+    assert_eq!(agent.cursor(), 1);
     assert_eq!(
         world.get::<Battery>(entity).unwrap().0,
         1,
@@ -82,14 +82,14 @@ fn agent_plans_executes_and_completes() {
     htn_ai_system(&mut world);
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert!(agent.plan.is_none(), "finished plan is dropped");
-    assert_eq!(agent.cursor, 0);
+    assert!(agent.plan().is_none(), "finished plan is dropped");
+    assert_eq!(agent.cursor(), 0);
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 3);
 
     // Tick 4: replans; the terminal branch now matches and plans nothing.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert!(agent.plan.is_none());
+    assert!(agent.plan().is_none());
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 3);
 }
 
@@ -117,7 +117,7 @@ fn world_drift_triggers_replan_and_recovery() {
     // >= 3), so the agent goes planless with no effect applied.
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert!(agent.plan.is_none(), "invalid step aborts the plan");
+    assert!(agent.plan().is_none(), "invalid step aborts the plan");
     assert_eq!(
         world.get::<Battery>(entity).unwrap().0,
         3,
@@ -166,7 +166,7 @@ fn drift_replans_and_executes_same_tick() {
     htn_ai_system(&mut world);
     htn_ai_system(&mut world);
     assert_eq!(world.get::<Cell>(entity).unwrap().0, 2);
-    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 2);
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor(), 2);
 
     // External disturbance: another system charges the cell past the gather
     // gate — the plan's third gather (precondition < 3) can never fire.
@@ -184,7 +184,7 @@ fn drift_replans_and_executes_same_tick() {
         "the replanned step executed in the drift tick itself"
     );
     assert!(
-        agent.plan.is_none(),
+        agent.plan().is_none(),
         "one-step plan completed; planless again"
     );
 
@@ -215,8 +215,8 @@ fn driver_handles_multiple_agents_and_config_tuning() {
     // Both agents finished; a replan on the next tick finds the terminal
     // branch and stores an empty (planless) result.
     htn_ai_system(&mut world);
-    assert!(world.get::<HtnAgent>(a).unwrap().plan.is_none());
-    assert!(world.get::<HtnAgent>(b).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(a).unwrap().plan().is_none());
+    assert!(world.get::<HtnAgent>(b).unwrap().plan().is_none());
 }
 
 /// Agents without the domain's components still work: missing components
@@ -231,7 +231,7 @@ fn missing_components_materialize_as_defaults() {
 
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert_eq!(agent.plan.as_ref().map(|p| p.len()), Some(3));
+    assert_eq!(agent.plan().map(|p| p.len()), Some(3));
     // The effect wrote Battery back onto the entity (write-back inserts it).
     assert_eq!(world.get::<Battery>(entity).unwrap().0, 1);
 }
@@ -495,8 +495,8 @@ fn unsolvable_domain_leaves_the_agent_planless_not_wedged() {
         htn_ai_system(&mut world);
     }
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert!(agent.plan.is_none(), "no plan is ever stored");
-    assert_eq!(agent.cursor, 0);
+    assert!(agent.plan().is_none(), "no plan is ever stored");
+    assert_eq!(agent.cursor(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +569,7 @@ fn replan_elides_quiet_prefix_and_advances_same_tick() {
     // flips) and executes.
     htn_ai_system(&mut world);
     assert!(world.get::<Gate>(entity).unwrap().0, "the gate was set");
-    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 1);
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor(), 1);
 
     // The world closes `act_a`'s precondition mid-plan.
     world.get_mut::<GoA>(entity).unwrap().0 = false;
@@ -581,7 +581,7 @@ fn replan_elides_quiet_prefix_and_advances_same_tick() {
     htn_ai_system(&mut world);
     let agent = world.get::<HtnAgent>(entity).unwrap();
     assert!(
-        agent.plan.is_none(),
+        agent.plan().is_none(),
         "the blocked replan consumed both passes"
     );
     assert!(!world.get::<Step1>(entity).unwrap().0, "act_a never ran");
@@ -597,12 +597,12 @@ fn replan_elides_quiet_prefix_and_advances_same_tick() {
         world.get::<Step1>(entity).unwrap().0,
         "the replanned plan resumed at its first consequential step"
     );
-    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 2);
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor(), 2);
 
     // Tick 4: `act_b` finishes the journey.
     htn_ai_system(&mut world);
     assert!(world.get::<Done>(entity).unwrap().0);
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_none());
 }
 
 /// Elision must never skip a step whose effect changes state — even one
@@ -663,12 +663,12 @@ fn elision_never_skips_state_changing_steps() {
         "the state-changing step re-executed in the drift tick itself"
     );
     let agent = world.get::<HtnAgent>(entity).unwrap();
-    assert_eq!(agent.cursor, 1, "the fresh plan is mid-flight");
+    assert_eq!(agent.cursor(), 1, "the fresh plan is mid-flight");
 
     // Tick 4: `act` validates and finishes.
     htn_ai_system(&mut world);
     assert!(world.get::<Done>(entity).unwrap().0);
-    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan().is_none());
 }
 
 /// A plan whose every step is quiet does nothing: it degrades to planless
@@ -698,11 +698,58 @@ fn fully_quiet_plans_degrade_to_planless() {
     for tick in 1..=3 {
         htn_ai_system(&mut world);
         let agent = world.get::<HtnAgent>(entity).unwrap();
-        assert!(agent.plan.is_none(), "tick {tick}: planless, not theater");
-        assert_eq!(agent.cursor, 0);
+        assert!(agent.plan().is_none(), "tick {tick}: planless, not theater");
+        assert_eq!(agent.cursor(), 0);
         assert!(
             world.get::<Gate>(entity).unwrap().0,
             "gate never re-toggled"
         );
     }
+}
+
+/// `AgentRoot` selects the archetype root per agent: one domain, two NPC
+/// kinds — a default agent plans from the domain root, an agent carrying
+/// [`AgentRoot`](bevy_bhtn::ecs::AgentRoot) plans the registered extra root
+/// instead. An out-of-bounds index is an ordinary planning error (the agent
+/// idles), not a wedge.
+#[test]
+fn agent_root_selects_the_archetype_root() {
+    fn charge(task: &mut TaskBuilder) {
+        task.branch().then(gather);
+    }
+    fn gather(task: &mut TaskBuilder) {
+        task.effect(|battery: &mut Battery| battery.0 += 1);
+    }
+    fn drain_root(task: &mut TaskBuilder) {
+        task.branch().then(drain);
+    }
+    fn drain(task: &mut TaskBuilder) {
+        task.effect(|battery: &mut Battery| battery.0 -= 1);
+    }
+    let domain = HtnDomain::from_root(charge)
+        .add_root(drain_root)
+        .build()
+        .expect("archetype domain is well-formed");
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain));
+    let default_agent = world.spawn((Battery(0), HtnAgent::default())).id();
+    let second = world.resource::<HtnConfig>().domain.task_index(drain_root).unwrap() as u32;
+    let drain_agent = world
+        .spawn((Battery(5), HtnAgent::default(), AgentRoot(second)))
+        .id();
+
+    htn_ai_system(&mut world);
+    // The default agent runs the domain root's behavior (gather: 0 -> 1);
+    // the archetype agent runs the extra root's (drain: 5 -> 4).
+    assert_eq!(world.get::<Battery>(default_agent).unwrap().0, 1);
+    assert_eq!(world.get::<Battery>(drain_agent).unwrap().0, 4);
+
+    // An out-of-bounds archetype index is an ordinary planning error: the
+    // agent idles planless instead of wedging.
+    let broken = world
+        .spawn((Battery(0), HtnAgent::default(), AgentRoot(9_999)))
+        .id();
+    htn_ai_system(&mut world);
+    assert!(world.get::<HtnAgent>(broken).unwrap().plan().is_none());
+    assert_eq!(world.get::<Battery>(broken).unwrap().0, 0);
 }
