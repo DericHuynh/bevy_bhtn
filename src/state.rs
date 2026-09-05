@@ -156,7 +156,7 @@ pub(crate) struct Slot {
     pub(crate) default_fn: DefaultFn,
 }
 
-/// The frozen slot layout of a baked domain: one [`Slot`] per registered
+/// The frozen slot layout of a baked domain: one `Slot` per registered
 /// component type, plus the pool's total size and maximum alignment.
 #[derive(Default)]
 pub struct RegistryLayout {
@@ -286,8 +286,7 @@ impl ComponentRegistry {
         self.layout.by_type.get(&TypeId::of::<T>()).copied()
     }
 
-    /// The number of registered components (the
-    /// [`FieldSet`](crate::summaries::FieldSet) universe size).
+    /// The number of registered components (the [`FieldSet`] universe size).
     pub fn len(&self) -> usize {
         self.layout.slots.len()
     }
@@ -681,6 +680,35 @@ impl PlanState {
                 );
             }
         }
+    }
+
+    /// Whether the given slots hold identical bytes in both scratchpads (same
+    /// registry layout). Used by the driver's quiet-prefix elision to prove a
+    /// step's effects are already reflected in the world.
+    ///
+    /// Byte comparison is sound *as a change detector* for this purpose:
+    /// plain-data components carry their whole value in the slot (a semantic
+    /// change always changes bytes; equal bytes mean the planner-certified
+    /// value is already in effect), while heap-owning components (Vec/HashMap
+    /// members) realloc on every write — a semantically identical write still
+    /// moves the pointer, so those slots conservatively read as "changed" and
+    /// their steps simply never elide. Alignment padding between slots is
+    /// never read — it is uninitialized allocation.
+    ///
+    /// # Panics (debug)
+    /// If the two scratchpads do not share the same registry layout.
+    pub(crate) fn slots_unchanged(&self, base: &Self, slots: &[usize]) -> bool {
+        debug_assert!(Arc::ptr_eq(&self.layout, &base.layout));
+        slots.iter().all(|&i| {
+            let slot = &self.layout.slots[i];
+            unsafe {
+                let mine =
+                    std::slice::from_raw_parts(self.pool.as_ptr().add(slot.offset), slot.size);
+                let theirs =
+                    std::slice::from_raw_parts(base.pool.as_ptr().add(slot.offset), slot.size);
+                mine == theirs
+            }
+        })
     }
 
     /// The number of slots (registry size at extraction time).

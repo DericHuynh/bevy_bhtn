@@ -58,15 +58,40 @@
 //! an enemy appears mid-journey, the survivor flees the same tick, and
 //! resumes the craft when the danger passes.
 //!
+//! # Paused plans and plan lifecycle events
+//!
+//! Two driver-level extensions to the plan lifecycle:
+//!
+//! - **Pause/resume (PausePlan)** — a
+//!   [`pause_plan`](crate::tasks::MethodBuilder::pause_plan) marker truncates
+//!   a plan at an authoring boundary. The driver executes the compiled prefix,
+//!   keeps the exhausted paused plan ([`PlanStatus::Paused`]), and on the next
+//!   run **resumes decomposition from the pause**
+//!   ([`HtnPlanner::resume`](crate::planner::HtnPlanner::resume)) — against
+//!   the world as it is then — instead of replanning from the root. One step
+//!   per tick is preserved: a resume tick plans the next leg and executes its
+//!   first step, exactly like a planless tick. Drift during a paused plan
+//!   still replans from the root as always: the fresh plan re-derives the
+//!   executed prefix (its already-reflected steps elide as quiet) and
+//!   re-truncates at the markers.
+//! - **Lifecycle events** — when [`HtnConfig::plan_events`] is set, the driver
+//!   writes [`PlanEvent`]s to `Messages<PlanEvent>`: plans installed and
+//!   replaced (with the old plan — a drift repair or a pause-resume
+//!   continuation; Fluid HTN's `OnNewPlan` / `OnReplacePlan(old, new)`), steps
+//!   that failed re-validation (`OnCurrentTaskFailed`), and plans completed.
+//!   The same bridge pattern as the decomposition trace, with zero
+//!   planner-core involvement.
+//!
 //! # Hot-reloading domains (Subsecond)
 //!
 //! With the `hotpatching` feature (which enables `bevy_ecs/hotpatching`, the
 //! same [Dioxus Subsecond](https://dioxuslabs.com/learn/0.7/essentials/ui/hotreload/)
 //! engine behind Bevy's hot-patching), `HtnConfig` can carry a **domain
-//! rebuild closure** via [`HtnConfig::with_rebuild`]. The baked domain is
+//! rebuild closure** via `HtnConfig::with_rebuild` (feature-gated). The
+//! baked domain is
 //! *data* — compiled precondition/effect closures — so patching a task
 //! function's body does not retroactively change it. Instead, the driver
-//! watches [`bevy_ecs::HotPatchChanges`]; when a hot patch lands it
+//! watches `bevy_ecs::HotPatchChanges`; when a hot patch lands it
 //! **re-records and re-bakes the domain** through the rebuild closure (fresh
 //! closures resolve through the patched jump table), swaps it into the
 //! config, and drops every agent's plan so the next tick replans against the
@@ -128,6 +153,7 @@
 //! ```
 
 use bevy_ecs::entity::Entity;
+use bevy_ecs::message::Message;
 use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
 
@@ -136,9 +162,9 @@ use crate::domain::Task;
 /// Used by the hot-reload rebuild closure; inert without the feature.
 #[cfg_attr(not(feature = "hotpatching"), allow(unused_imports))]
 use crate::error::HtnResult;
-use crate::planner::{HtnPlanner, Plan};
+use crate::planner::{HtnPlanner, Plan, PlanStatus, ResumeStep};
 use crate::selection::{DecompositionTrace, HtnSearchStrategy, LookaheadMode, SearchOverride};
-use crate::state::PlanState;
+use crate::state::{ComponentRegistry, PlanState};
 
 /// The per-entity AI component: current plan and cursor.
 ///
@@ -170,6 +196,57 @@ pub struct HtnAgent {
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct PlanEvery(pub u32);
 
+/// Plan lifecycle events, emitted by the driver into
+/// `Messages<PlanEvent>` when [`HtnConfig::plan_events`] is set — the same
+/// bridge pattern as the decomposition trace, with **zero planner-core
+/// involvement**: the planner knows nothing about these; the driver reports
+/// what it did with the plans it planned and executed.
+///
+/// Mirrors Fluid HTN's plan callbacks (`OnNewPlan`, `OnReplacePlan(old, new)`,
+/// `OnCurrentTaskFailed`): hooks for animation, telemetry, and debug
+/// overlays. Every event carries the agent [`Entity`].
+// `PlanCompleted`/`StepFailed` are deliberately tiny next to `PlanReplaced`'s
+// full plan payloads (the Fluid HTN callback contract — games want the plans,
+// not summaries); the bridge is opt-in and event volume is one to a few per
+// agent per tick, so the size skew is the design.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Message)]
+pub enum PlanEvent {
+    /// A plan was installed on an agent. `old` is the plan it replaced:
+    /// `None` when the agent was planless (Fluid HTN's `OnNewPlan`), `Some`
+    /// when an existing plan was swapped out — a same-tick drift-repair
+    /// replan, or a pause-resume continuation (the paused plan is `old`).
+    PlanReplaced {
+        /// The agent the plan was installed on.
+        entity: Entity,
+        /// The plan that was replaced, if any.
+        old: Option<Plan>,
+        /// The freshly installed plan.
+        new: Plan,
+    },
+    /// The next step's preconditions failed re-validation against the live
+    /// world (drift): the plan was dropped (Fluid HTN's
+    /// `OnCurrentTaskFailed`). The same-tick repair replan that follows on
+    /// the driver's second pass is reported as its own `PlanReplaced`.
+    StepFailed {
+        /// The agent whose step failed.
+        entity: Entity,
+        /// The failing step's task index into
+        /// [`HtnDomain::tasks`](crate::domain::HtnDomain).
+        task: u32,
+        /// The failing task's display name.
+        task_name: &'static str,
+    },
+    /// The plan's steps all executed and the decomposition ran to completion
+    /// (`Complete`). Pause-truncated plans never report this — they resume
+    /// (reported as `PlanReplaced`) — and budget-truncated (`Partial`) plans
+    /// just end without an event.
+    PlanCompleted {
+        /// The agent whose plan completed.
+        entity: Entity,
+    },
+}
+
 /// The planner's world-side configuration: domain and planner tuning.
 #[derive(Resource)]
 pub struct HtnConfig {
@@ -188,6 +265,10 @@ pub struct HtnConfig {
     /// Whether the driver forwards [`DecompositionTrace`] events to
     /// `Messages<DecompositionTrace>` after each plan (default `false`).
     pub debug_trace: bool,
+    /// Whether the driver emits plan lifecycle [`PlanEvent`]s to
+    /// `Messages<PlanEvent>` (default `false`): plans installed/replaced,
+    /// steps failed against live reality, and plans completed.
+    pub plan_events: bool,
     /// Domain rebuild closure for Subsecond hot-reloading (see the module
     /// docs). Set via [`HtnConfig::with_rebuild`]; the driver re-records and
     /// re-bakes the domain through it whenever a hot patch lands.
@@ -204,6 +285,7 @@ impl HtnConfig {
             lookahead: LookaheadMode::default(),
             sanity_limit: 100,
             debug_trace: false,
+            plan_events: false,
             #[cfg(feature = "hotpatching")]
             rebuild: None,
         }
@@ -258,6 +340,12 @@ impl HtnConfig {
         self.debug_trace = enabled;
         self
     }
+
+    /// Emit plan lifecycle [`PlanEvent`]s to `Messages<PlanEvent>`.
+    pub fn with_plan_events(mut self, enabled: bool) -> Self {
+        self.plan_events = enabled;
+        self
+    }
 }
 
 /// Per-tick reusable driver buffers, parked as a resource between runs so
@@ -269,10 +357,86 @@ impl HtnConfig {
 struct DriverScratch {
     entities: Vec<Entity>,
     state: Option<PlanState>,
+    /// Working copy for quiet-prefix elision (reused across plannings via
+    /// `copy_from` — zero steady-state allocation, same discipline as
+    /// `state`). Dropped on a hot-reload domain swap (fresh registry).
+    elide: Option<PlanState>,
     /// The `HotPatchChanges` tick observed on the previous run (hot-reload
     /// support): a different value means a patch landed between ticks.
     #[cfg(feature = "hotpatching")]
     hotpatch_tick: Option<u32>,
+}
+
+/// Elide the plan's leading run of **quiet** steps and return the index of
+/// the first consequential step (== the plan's length when every step is
+/// quiet). A step is quiet iff it dispatches **no action** and its real
+/// write slots — applied against current reality — already hold the values
+/// the effect would produce, i.e. its entire execution footprint is already
+/// reflected in the world.
+///
+/// # Soundness
+///
+/// A quiet step's execution footprint in the driver is exactly: precondition
+/// reads (pure), effect application + commit (verified byte-identical on
+/// every committed slot), and an action dispatch (none exists). Executing it
+/// or skipping it therefore leaves the world identical, so resuming the
+/// fresh plan at the first consequential step is equivalent to executing it
+/// from the top — and the planner certified the suffix from exactly the
+/// state the skip starts from. Every executed step is still re-validated
+/// against live reality before it runs, so later drift is handled exactly
+/// like the baseline.
+///
+/// The per-step no-op check is what makes this safe where structural plan
+/// comparison (Fluid HTN's MTR rejection) is not: if a drift **undid** an
+/// executed step's effect (a hammer picked up and knocked out of the
+/// pocket), re-applying the effect changes its slot, the step is not quiet,
+/// and it re-executes — elision can never skip a step the world still
+/// needs. Each check runs against a clean copy of reality (the working
+/// copy is reset per step), so planning-only effect mutations from earlier
+/// checks cannot poison a later one, and each elided step is quiet on its
+/// own, independent of the others.
+///
+/// Deliberately conservative corners: steps with actions are never elided
+/// (commands are opaque world effects); steps writing heap-owning
+/// components (Vec/HashMap members) never elide — their reallocating writes
+/// always move bytes, so they read as "changed"; planning-only
+/// (`.expected`) mutations are ignored by the check, matching execution,
+/// which never commits them; and a plan whose steps are *all* quiet
+/// degrades to planless — executing it would be pure theater.
+fn elide_quiet_prefix(
+    tasks: &[Task],
+    registry: &ComponentRegistry,
+    state: &PlanState,
+    scratch: &mut Option<PlanState>,
+    plan: &Plan,
+) -> usize {
+    let work = scratch.get_or_insert_with(|| PlanState::build(registry).finish());
+    let mut j = 0;
+    while let Some(&idx) = plan.steps.get(j) {
+        match tasks.get(idx as usize) {
+            // A step with no action and no committed writes has an empty
+            // footprint by construction (the driver skips apply+commit when
+            // the write list is empty).
+            Some(Task::Primitive(primitive)) if primitive.action.is_none() => {
+                let writes = primitive.write_slot_slice();
+                if writes.is_empty() {
+                    j += 1;
+                    continue;
+                }
+                // Clean base per step: each elision decision is measured
+                // against reality alone, never against earlier checks.
+                work.copy_from(state);
+                primitive.apply_effects(work);
+                let unchanged = work.slots_unchanged(state, writes);
+                if !unchanged {
+                    break;
+                }
+                j += 1;
+            }
+            _ => break,
+        }
+    }
+    j
 }
 
 /// The AI driver: one exclusive-system tick for every [`HtnAgent`].
@@ -302,6 +466,17 @@ pub fn htn_ai_system(world: &mut World) {
     }
     world
         .resource_mut::<bevy_ecs::message::Messages<DecompositionTrace>>()
+        .update();
+
+    // Plan lifecycle events: same bridge discipline as the trace above.
+    if world
+        .get_resource::<bevy_ecs::message::Messages<PlanEvent>>()
+        .is_none()
+    {
+        world.insert_resource(bevy_ecs::message::Messages::<PlanEvent>::default());
+    }
+    world
+        .resource_mut::<bevy_ecs::message::Messages<PlanEvent>>()
         .update();
 
     // Reusable buffers: take them out of the world (their allocations move
@@ -338,6 +513,7 @@ pub fn htn_ai_system(world: &mut World) {
                             // The new domain owns a fresh registry: the
                             // parked scratchpad's layout is stale.
                             scratch.state = None;
+                            scratch.elide = None;
                             // Every agent replans against the new domain.
                             let mut agents =
                                 world.query_filtered::<Entity, bevy_ecs::prelude::With<HtnAgent>>();
@@ -361,6 +537,11 @@ pub fn htn_ai_system(world: &mut World) {
         scratch.entities.extend(agents.iter(world));
     }
 
+    // Plan lifecycle events buffered across the agent loop, flushed once at
+    // the end of the tick (ownership moves through the buffer — no clones on
+    // the `old`/`new` plans themselves).
+    let mut events: Vec<PlanEvent> = Vec::new();
+
     for &entity in &scratch.entities {
         // The config resource is scoped out of the world for the whole tick,
         // so domain references (preconditions, effects, actions) stay alive
@@ -378,17 +559,37 @@ pub fn htn_ai_system(world: &mut World) {
             // oscillating between passes, or a system mutating mid-tick),
             // the agent goes planless and retries next tick — bounded work
             // per tick, no spinning.
+            // Lifecycle-bridge bookkeeping: the plan an earlier pass of THIS
+            // turn dropped on drift — the `old` side of the `PlanReplaced`
+            // event the fresh install reports.
+            let mut drifted_off: Option<Plan> = None;
             'turn: for pass in 0..2u32 {
-                // 1. Plan if planless. A per-agent [`SearchOverride`]
-                // component replaces the global strategy/budget for this
-                // entity. The same-tick repair replan (pass 1) bypasses the
-                // [`PlanEvery`] throttle — the throttle paces *idle*
-                // replanning, and an execution interrupt deserves an
-                // immediate reaction; the attempt still resets the deferral,
-                // so subsequent planless ticks stay paced.
+                // 1. Plan if planless — or **resume** an exhausted paused
+                // plan: a plan truncated by a pause marker keeps its
+                // remaining decomposition work queued, and once its compiled
+                // steps have executed the driver resumes decomposition from
+                // the pause instead of replanning from the root (the prefix
+                // is committed history — it can never be backtracked into).
+                // A per-agent [`SearchOverride`] component replaces the
+                // global strategy/budget for this entity. The same-tick
+                // repair replan (pass 1) bypasses the [`PlanEvery`] throttle
+                // — the throttle paces *idle* replanning, and an execution
+                // interrupt deserves an immediate reaction; the attempt
+                // still resets the deferral, so subsequent planless ticks
+                // stay paced.
+                let exhausted_pause = world.get::<HtnAgent>(entity).is_some_and(|a| {
+                    a.plan.as_ref().is_some_and(|p| {
+                        p.status == PlanStatus::Paused
+                            && a.cursor >= p.len()
+                            && p.resume
+                                .as_ref()
+                                .is_some_and(|r| r.tasks.iter().any(|s| matches!(s, ResumeStep::Task(_))))
+                    })
+                });
                 if world
                     .get::<HtnAgent>(entity)
                     .is_some_and(|a| a.plan.is_none())
+                    || exhausted_pause
                 {
                     // LOD throttle: [`PlanEvery`] paces (re)planning to once
                     // every `n` runs while the agent sits planless. Execution
@@ -411,6 +612,7 @@ pub fn htn_ai_system(world: &mut World) {
                         }
                     }
                     let root = config.domain.root;
+                    let tasks = &config.domain.tasks;
                     let registry = &config.domain.components;
                     // One scratchpad, refreshed in place: planning, validation,
                     // and the post-action re-extract all reuse the same buffer.
@@ -435,16 +637,33 @@ pub fn htn_ai_system(world: &mut World) {
                         .set_lookahead_mode(config.lookahead)
                         .set_sanity_limit(sanity)
                         .set_strategy(strategy.clone());
-                    let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
-                    // A planning error (unregistered root or a genuinely
-                    // unsolvable state) is treated like an empty plan: the agent
-                    // stays planless and idles — it never wedges on a bad plan,
-                    // and under a [`PlanEvery`] throttle it retries at the
-                    // reduced cadence instead of every tick.
-                    let plan = (if config.debug_trace {
-                        planner.plan_traced(root, state, &mut trace_buf)
+                    // The `old` plan for the lifecycle event: a plan dropped
+                    // on drift earlier this turn (root replan), or the
+                    // exhausted paused plan being resumed (resume). Drift
+                    // always replans from the root — the pause context is
+                    // abandoned and re-derived from reality; resuming keeps
+                    // the committed chain.
+                    let dropped = drifted_off.take();
+                    let resuming = if dropped.is_none() && exhausted_pause {
+                        world
+                            .get_mut::<HtnAgent>(entity)
+                            .and_then(|mut a| a.plan.take())
                     } else {
-                        planner.plan(root, state)
+                        None
+                    };
+                    let resume_point = resuming.as_ref().and_then(|p| p.resume.as_ref());
+                    let mut trace_buf: Vec<DecompositionTrace> = Vec::new();
+                    // A planning error (unregistered root, a genuinely
+                    // unsolvable state, or a resume whose remaining
+                    // decomposition failed) is treated like an empty plan:
+                    // the agent stays planless and idles — it never wedges
+                    // on a bad plan, and the next tick replans from the root.
+                    let plan = (match resume_point {
+                        Some(point) => planner.resume(point, state),
+                        None if config.debug_trace => {
+                            planner.plan_traced(root, state, &mut trace_buf)
+                        }
+                        None => planner.plan(root, state),
                     })
                     .unwrap_or_default();
                     if !trace_buf.is_empty() {
@@ -454,11 +673,34 @@ pub fn htn_ai_system(world: &mut World) {
                     }
                     // An empty plan means "nothing to do" — store it as planless
                     // so a later world change can trigger a real replan instead
-                    // of wedging the agent on a zero-length program.
-                    let plan = if plan.is_empty() { None } else { Some(plan) };
+                    // of wedging the agent on a zero-length program. Same for a
+                    // plan whose every step is quiet (see `elide_quiet_prefix`).
+                    // A paused plan with queued resume work is never degraded:
+                    // its (possibly empty) prefix is a real leg — executing it
+                    // ends in a resume, not a replan.
+                    let quiet =
+                        elide_quiet_prefix(tasks, registry, state, &mut scratch.elide, &plan);
+                    let resume_work = plan
+                        .resume
+                        .as_ref()
+                        .is_some_and(|r| r.tasks.iter().any(|s| matches!(s, ResumeStep::Task(_))));
+                    let (plan, cursor) = if quiet >= plan.len() && !resume_work {
+                        (None, 0)
+                    } else {
+                        (Some(plan), quiet)
+                    };
+                    if config.plan_events {
+                        if let Some(new) = &plan {
+                            events.push(PlanEvent::PlanReplaced {
+                                entity,
+                                old: dropped.or(resuming),
+                                new: new.clone(),
+                            });
+                        }
+                    }
                     if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                         agent.plan = plan;
-                        agent.cursor = 0;
+                        agent.cursor = cursor;
                         agent.plan_deferral = every.saturating_sub(1);
                     }
                 }
@@ -486,8 +728,15 @@ pub fn htn_ai_system(world: &mut World) {
                     .get_or_insert_with(|| PlanState::build(registry).finish());
                 state.refresh(world, entity);
                 if !primitive.preconditions_met(state) {
+                    if config.plan_events {
+                        events.push(PlanEvent::StepFailed {
+                            entity,
+                            task: step_idx as u32,
+                            task_name: primitive.name,
+                        });
+                    }
                     if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
-                        agent.plan = None;
+                        drifted_off = agent.plan.take();
                         agent.cursor = 0;
                     }
                     if pass == 0 {
@@ -502,11 +751,13 @@ pub fn htn_ai_system(world: &mut World) {
                 // effects observe post-action state), and commit the effects to
                 // the real components.
                 if let Some(action) = &primitive.action {
-                    let mut commands = world.commands();
-                    let mut entity_commands = commands.entity(entity);
-                    action(&mut entity_commands);
-                    drop(entity_commands);
-                    drop(commands);
+                    // The command buffers hold borrows of the world: they are
+                    // released at the end of this block so `flush` can run.
+                    {
+                        let mut commands = world.commands();
+                        let mut entity_commands = commands.entity(entity);
+                        action(&mut entity_commands);
+                    }
                     world.flush();
                     // The action may have mutated planning components: re-extract
                     // so effects apply on top of the post-action state.
@@ -520,19 +771,37 @@ pub fn htn_ai_system(world: &mut World) {
                     state.write_back_with(world, entity, writes);
                 }
 
-                // 5. Advance the cursor (a finished plan is dropped for replan).
-                // One step per tick: the turn ends here even with passes left.
+                // 5. Advance the cursor. A finished `Complete` plan is dropped
+                // for replan (with a lifecycle event); a finished **paused**
+                // plan is kept — the next run resumes its decomposition from
+                // the pause point; a budget-truncated `Partial` plan just
+                // ends. One step per tick: the turn ends here even with
+                // passes left.
                 if let Some(mut agent) = world.get_mut::<HtnAgent>(entity) {
                     agent.cursor += 1;
                     let done = agent.plan.as_ref().is_some_and(|p| agent.cursor >= p.len());
                     if done {
-                        agent.plan = None;
-                        agent.cursor = 0;
+                        let status = agent.plan.as_ref().map(|p| p.status);
+                        if status == Some(PlanStatus::Complete) && config.plan_events {
+                            events.push(PlanEvent::PlanCompleted { entity });
+                        }
+                        if status != Some(PlanStatus::Paused) {
+                            agent.plan = None;
+                            agent.cursor = 0;
+                        }
                     }
                 }
                 break 'turn;
             } // 'turn
         });
+    }
+
+    // Flush the lifecycle bridge: events buffered during the agent loop are
+    // readable for the rest of this tick.
+    if !events.is_empty() {
+        world
+            .resource_mut::<bevy_ecs::message::Messages<PlanEvent>>()
+            .write_batch(events.drain(..));
     }
 
     // Park the buffers back on the world for the next tick.

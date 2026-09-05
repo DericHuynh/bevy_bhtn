@@ -9,6 +9,24 @@
 //! planner backtracks to the most recent decomposition, tries the next method,
 //! and restores the plan/MTR/state.
 //!
+//! # Paused plans (PausePlan)
+//!
+//! A method body can declare a
+//! [`pause marker`](crate::tasks::MethodBuilder::pause_plan) between its
+//! members. When the search reaches the marker while compiling, the plan is
+//! **truncated**: everything decomposed so far is the compiled prefix
+//! ([`PlanStatus::Paused`]), and the work still queued behind the marker is
+//! recorded in [`Plan::resume`] — the remaining task occurrences (chained
+//! markers included) plus the MTR as it stood at the pause.
+//! [`HtnPlanner::resume`] continues the decomposition from that point against
+//! the state the world is in *then*: the executed prefix is committed history
+//! (never re-decomposed, and the resumed search has no frames above the seed
+//! to backtrack into — an unsatisfiable remainder is `NoPlan`). The look-ahead
+//! sweep proves only the pre-pause prefix, so far-future steps are never
+//! optimistically validated against state the executed prefix will have
+//! replaced, and planner work per plan is bounded by the leg between markers
+//! instead of the whole horizon.
+//!
 //! # Performance
 //!
 //! The hot loop works on **`usize` task indices**, never names. The working
@@ -62,6 +80,49 @@ pub enum PlanStatus {
     /// Raise the budget (`HtnPlanner::set_sanity_limit`) or check the domain
     /// for unbounded recursion (the `terminating` summary flags it).
     Partial,
+    /// The search stopped at a [`pause marker`](crate::tasks::MethodBuilder::pause_plan)
+    /// — a deliberate authoring boundary, not a failure. The compiled steps
+    /// are the leg the author committed to planning; the work still queued
+    /// behind the marker is the [`Plan::resume`] point, and decomposition
+    /// **resumes from it** ([`HtnPlanner::resume`]) once the prefix has run.
+    /// Unlike `Partial`, nothing was cut short: the plan ends exactly where
+    /// the author drew the line.
+    Paused,
+}
+
+/// One entry of a paused plan's resume queue: a task still to decompose, or
+/// a pause marker that re-truncates the resumed plan (chained legs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeStep {
+    /// A task occurrence queued behind the pause, to be decomposed when
+    /// decomposition resumes. Look-ahead occurrence pins are deliberately not
+    /// carried: they were derived against the pre-pause state, which the
+    /// executed prefix has replaced — the resumed search re-sweeps.
+    Task(u32),
+    /// A pause marker queued behind the first one (chained legs): when the
+    /// resumed search reaches it, the resumed plan truncates again and a new
+    /// resume point is recorded.
+    Pause,
+}
+
+/// The resume point of a plan truncated by a
+/// [`pause marker`](crate::tasks::MethodBuilder::pause_plan): the work still
+/// queued behind the marker, plus the MTR (method traversal record) as it
+/// stood at the pause. Passed back to [`HtnPlanner::resume`] once the prefix
+/// has executed — decomposition continues from the pause against the state
+/// the world is in *then*, without re-decomposing (or being able to
+/// backtrack past) the already-executed prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResumePoint {
+    /// The remaining decomposition work in execution order: task occurrences
+    /// still queued behind the pause, interleaved with any chained pause
+    /// markers. Task indices address [`HtnDomain::tasks`](crate::domain::HtnDomain).
+    pub tasks: Vec<ResumeStep>,
+    /// The MTR as it stood at the pause: the method choices from the root
+    /// down to (and including) the method holding the marker. Seeded into the
+    /// resumed plan's MTR, so the resumed plan records the full decomposition
+    /// path; backtracking within the resumed search never truncates below it.
+    pub mtr: Vec<usize>,
 }
 
 /// How many consecutive non-refuting sweeps a method tolerates under
@@ -98,6 +159,15 @@ impl From<usize> for PlanRoot {
     }
 }
 
+/// Where one built-in search starts: from a registered root task (the
+/// [`HtnPlanner::plan`] entry) or from a paused plan's resume point (the
+/// [`HtnPlanner::resume`] entry — the work a pause marker queued, seeded
+/// with the committed MTR prefix).
+enum Start<'a> {
+    Root(usize),
+    Resume(&'a ResumePoint),
+}
+
 /// The compiled plan a planner returns: a flat step program over the domain's
 /// task indices.
 ///
@@ -120,6 +190,11 @@ pub struct Plan {
     pub mtr: Vec<usize>,
     /// Whether the search finished (`Complete`) or was cut short (`Partial`).
     pub status: PlanStatus,
+    /// The remaining decomposition work when the plan was truncated by a
+    /// pause marker ([`PlanStatus::Paused`]): pass it to
+    /// [`HtnPlanner::resume`] once the compiled steps have executed.
+    /// `None` on `Complete` and `Partial` plans.
+    pub resume: Option<ResumePoint>,
 }
 
 impl Plan {
@@ -138,6 +213,14 @@ impl Plan {
     /// Whether the search was cut short (see [`Self::is_complete`]).
     pub fn is_partial(&self) -> bool {
         !self.is_complete()
+    }
+
+    /// Whether the plan was truncated by a pause marker (see
+    /// [`PlanStatus::Paused`]): the compiled steps are the leg the author
+    /// committed to planning, and [`Self::resume`] holds the work still
+    /// queued behind the marker.
+    pub fn is_paused(&self) -> bool {
+        self.status == PlanStatus::Paused
     }
 
     /// The domain task index of the step at `cursor` (the compiled program
@@ -177,8 +260,8 @@ impl Plan {
 }
 
 /// One entry of the search's task queue: a task occurrence (with its
-/// optional look-ahead pin) or a pending linearization retry of a
-/// partially-ordered method.
+/// optional look-ahead pin), a pending linearization retry of a
+/// partially-ordered method, or a [`pause marker`](crate::tasks::MethodBuilder::pause_plan).
 #[derive(Clone, Copy, Debug)]
 enum Step {
     Task(usize, Option<u32>),
@@ -191,6 +274,12 @@ enum Step {
         method: u32,
         lin: u32,
     },
+    /// A pause marker between a method's members: popping it truncates the
+    /// compiled plan — everything decomposed so far is the prefix, everything
+    /// still queued becomes the plan's resume point. Only ever queued by
+    /// commitments of methods that carry pause markers (total-order only;
+    /// rejected on partial branches at bake).
+    Pause,
 }
 
 /// Growable, max-aligned byte arena: the rollback journal's value storage.
@@ -343,7 +432,7 @@ impl Drop for Rollback<'_> {
 /// `plan` and `mtr` are append-only within one `plan()` call — recursive
 /// descent (primitives and method indices are only ever `push`ed). So instead
 /// of deep-cloning both `Vec`s into every frame (which costs ~2n allocations
-/// + O(n) copies per recursion level — catastrophic when a domain recursively
+/// and O(n) copies per recursion level — catastrophic when a domain recursively
 /// decomposes its root toward the sanity limit), we snapshot just the two
 /// lengths. On backtrack we `truncate` back to those lengths, which is
 /// provably identical to restoring a clone because the prefix of an
@@ -477,7 +566,8 @@ impl<'a> HtnPlanner<'a> {
     /// (abandon on first downstream failure),
     /// [`CostBounded`](HtnSearchStrategy::CostBounded) (branch-and-bound over
     /// accumulated primitive cost), or [`Custom`](HtnSearchStrategy::Custom)
-    /// (a caller-supplied [`Searcher`] that bypasses the built-in machinery —
+    /// (a caller-supplied [`Searcher`](crate::selection::Searcher) that bypasses
+    /// the built-in machinery —
     /// its statistics live in the strategy object, and lookahead/sanity do
     /// not apply to it). Replacing a strategy replaces it entirely: the old
     /// independent bools could describe combinations (fail-fast **and**
@@ -493,7 +583,10 @@ impl<'a> HtnPlanner<'a> {
     /// out-of-bounds index). Check [`Plan::status`] to tell a finished
     /// decomposition ([`PlanStatus::Complete`]) from one the sanity budget or
     /// fail-fast cut short ([`PlanStatus::Partial`]) — a partial plan may not
-    /// reach the goal.
+    /// reach the goal — and from one truncated by a
+    /// [`pause marker`](crate::tasks::MethodBuilder::pause_plan)
+    /// ([`PlanStatus::Paused`], with the remaining work in [`Plan::resume`]
+    /// for [`Self::resume`]).
     ///
     /// `root` is a task function (passed by value — fn items are zero-sized,
     /// so turbofish is impossible; its `TypeId` resolves through the baked
@@ -523,7 +616,7 @@ impl<'a> HtnPlanner<'a> {
     ///   sanity-limited search returns `Ok` with a `Partial` plan.
     pub fn plan(&mut self, root: impl Into<PlanRoot>, state: &PlanState) -> HtnResult<Plan> {
         let idx = self.resolve_root(root)?;
-        self.plan_inner(idx, state, None)
+        self.plan_inner(Start::Root(idx), state, None)
     }
 
     /// Decompose `root` into a [`Plan`], appending one [`DecompositionTrace`]
@@ -540,7 +633,40 @@ impl<'a> HtnPlanner<'a> {
         trace: &mut Vec<DecompositionTrace>,
     ) -> HtnResult<Plan> {
         let idx = self.resolve_root(root)?;
-        self.plan_inner(idx, state, Some(trace))
+        self.plan_inner(Start::Root(idx), state, Some(trace))
+    }
+
+    /// Resume a decomposition that a
+    /// [`pause marker`](crate::tasks::MethodBuilder::pause_plan) truncated:
+    /// decompose the work `point` still queues (the plan's
+    /// [`Plan::resume`]) against `state` — the state the world is in *now*,
+    /// after the paused plan's compiled steps have executed.
+    ///
+    /// The already-executed prefix is never re-decomposed and can never be
+    /// backtracked into: its methods are committed (they are `point.mtr`,
+    /// seeded into the resumed plan's MTR), so the resumed search explores
+    /// only the work behind the pause. If that work has no valid
+    /// decomposition in the current state, this is
+    /// [`HtnError::NoPlan`] — the caller's recovery is the same as any other
+    /// failed plan: replan from the root against reality.
+    ///
+    /// # Errors
+    ///
+    /// - [`HtnError::UnregisteredTask`] — the resume point carries an
+    ///   out-of-bounds task index (a stale point against a rebuilt domain).
+    /// - [`HtnError::NoPlan`] — the remaining work has no valid
+    ///   decomposition in `state`.
+    pub fn resume(&mut self, point: &ResumePoint, state: &PlanState) -> HtnResult<Plan> {
+        for step in &point.tasks {
+            if let ResumeStep::Task(idx) = *step {
+                if idx as usize >= self.domain.tasks.len() {
+                    return Err(HtnError::UnregisteredTask {
+                        type_name: format!("<task index {idx}>"),
+                    });
+                }
+            }
+        }
+        self.plan_inner(Start::Resume(point), state, None)
     }
 
     /// Resolve a plan root to a task index. Errors carry the fn's `type_name`
@@ -561,10 +687,16 @@ impl<'a> HtnPlanner<'a> {
         }
     }
 
-    /// The search itself.
+    /// The search itself. `start` is either a registered root task or a
+    /// paused plan's resume point; a resume seeds the queue with the paused
+    /// work (occurrence pins dropped — they were derived against the
+    /// pre-pause state) and the MTR with the committed method chain, and the
+    /// search proceeds identically from there. With no committed frames above
+    /// the seed, backtracking past the pause point (whose prefix already
+    /// executed) is structurally impossible: exhaustion is `NoPlan`.
     fn plan_inner(
         &mut self,
-        root: usize,
+        start: Start<'_>,
         state: &PlanState,
         mut trace: Option<&mut Vec<DecompositionTrace>>,
     ) -> HtnResult<Plan> {
@@ -610,6 +742,9 @@ impl<'a> HtnPlanner<'a> {
         // from a legitimate empty decomposition is the drain-exit below, and
         // the two must never be conflated — see `plan`'s error docs).
         let mut exhausted = false;
+        // The resume point recorded when a pause marker pops (the pause exit
+        // below materializes it). `None` everywhere else.
+        let mut paused_resume: Option<ResumePoint> = None;
         let mut stack: VecDeque<Step> = VecDeque::with_capacity(16);
         let mut decomp_stack: Vec<DecompositionFrame> = Vec::with_capacity(8);
         let mut mtr: Vec<usize> = Vec::with_capacity(8);
@@ -651,7 +786,22 @@ impl<'a> HtnPlanner<'a> {
 
         let tasks = &self.domain.tasks;
 
-        stack.push_front(Step::Task(root, None));
+        // Seed the queue: a root search starts from the root task; a resume
+        // starts from the paused work in execution order (chained pause
+        // markers re-enter the queue with it), with the committed MTR prefix
+        // already recorded.
+        match start {
+            Start::Root(root) => stack.push_front(Step::Task(root, None)),
+            Start::Resume(point) => {
+                for step in point.tasks.iter().rev() {
+                    stack.push_front(match step {
+                        ResumeStep::Task(idx) => Step::Task(*idx as usize, None),
+                        ResumeStep::Pause => Step::Pause,
+                    });
+                }
+                mtr.extend_from_slice(&point.mtr);
+            }
+        }
 
         'search: loop {
             let Some(step) = stack.pop_front() else {
@@ -660,7 +810,13 @@ impl<'a> HtnPlanner<'a> {
                 // strictly beats the best so far and keep searching; the
                 // first complete plan is the answer otherwise.
                 if cost_bounded && g < best_cost {
-                    best = Some(materialize(tasks, &plan, mtr.clone(), PlanStatus::Complete));
+                    best = Some(materialize(
+                        tasks,
+                        &plan,
+                        mtr.clone(),
+                        PlanStatus::Complete,
+                        None,
+                    ));
                     best_cost = g;
                     if backtrack(
                         &mut decomp_stack,
@@ -688,7 +844,7 @@ impl<'a> HtnPlanner<'a> {
                 // exhausted, so this stays a `Partial` `Ok` (not `NoPlan`).
                 return Ok(match best {
                     Some(b) => b,
-                    None => materialize(tasks, &plan, mtr.clone(), PlanStatus::Partial),
+                    None => materialize(tasks, &plan, mtr.clone(), PlanStatus::Partial, None),
                 });
             }
 
@@ -699,6 +855,51 @@ impl<'a> HtnPlanner<'a> {
             // exactly the original commitment, with a different member order.
             let (current, occurrence_pin) = match step {
                 Step::Task(current, pin) => (current, pin),
+                Step::Pause => {
+                    // A pause marker popped: the compiled plan ends here.
+                    // Everything still queued is the resume point's work —
+                    // front-to-back, chained pause markers included (the
+                    // resumed search re-truncates at them). A `Linearize`
+                    // entry cannot sit behind a pause (each is pushed by
+                    // `backtrack` and popped back-to-back, before anything
+                    // else can leave the queue), so the queue holds only
+                    // Task/Pause entries here.
+                    let mut left: Vec<ResumeStep> = Vec::with_capacity(stack.len());
+                    let mut live = true;
+                    for entry in &stack {
+                        match entry {
+                            Step::Task(idx, _) => left.push(ResumeStep::Task(*idx as u32)),
+                            Step::Pause => left.push(ResumeStep::Pause),
+                            // Unreachable by construction (see above):
+                            // degrade to a budget-style partial — the driver
+                            // replans from the root — rather than trusting
+                            // an impossible queue shape.
+                            Step::Linearize { .. } => {
+                                live = false;
+                                status = PlanStatus::Partial;
+                                break;
+                            }
+                        }
+                    }
+                    let has_work = live && left.iter().any(|s| matches!(s, ResumeStep::Task(_)));
+                    if has_work {
+                        if cost_bounded && best.is_some() {
+                            // Branch-and-bound already holds a complete
+                            // plan; it stays the answer (a pause only
+                            // truncates the branch it fires on).
+                            break 'search;
+                        }
+                        status = PlanStatus::Paused;
+                        paused_resume = Some(ResumePoint {
+                            tasks: left,
+                            mtr: mtr.clone(),
+                        });
+                    }
+                    // No work queued behind the pause (or a complete plan is
+                    // already held): the pause was vacuous — the prefix (or
+                    // `best`) is the whole answer.
+                    break 'search;
+                }
                 Step::Linearize { task, method, lin } => {
                     let compound = match &tasks[task as usize] {
                         Task::Compound(c) => c,
@@ -869,6 +1070,19 @@ impl<'a> HtnPlanner<'a> {
                         for (pos, &sub) in method.subtasks.iter().enumerate() {
                             resolved_buf.push((pos, sub as usize));
                         }
+                        // A pause marker bounds the leg: the sweep proves
+                        // only the PRE-pause prefix. The far side of the
+                        // marker is not planned in this plan — optimistically
+                        // validating it is exactly what the marker forbids
+                        // (its preconditions depend on state that the
+                        // executed prefix will have replaced). Pins only
+                        // exist for swept positions, so post-pause members
+                        // queue unpinned.
+                        let sweep_end = method
+                            .pause_positions
+                            .first()
+                            .map_or(resolved_buf.len(), |&p| p as usize)
+                            .min(resolved_buf.len());
                         // Look-ahead: can any refinement of this choice
                         // possibly succeed? Scoped to the method's own
                         // subtasks — they execute immediately after this
@@ -897,33 +1111,41 @@ impl<'a> HtnPlanner<'a> {
                             RefutationOnly,
                             Skip,
                         }
-                        let sweep_tier = match self.lookahead {
-                            LookaheadMode::Always => SweepTier::Full,
-                            LookaheadMode::Off => SweepTier::Skip,
-                            LookaheadMode::Adaptive => {
-                                // Tier 1 — shape: a single-subtask,
-                                // totally-ordered method with a terminating
-                                // step duplicates the next queue pop's
-                                // precondition check exactly.
-                                let shape_skip = method.subtasks.len() == 1
-                                    && !method.order.is_partial()
-                                    && self.domain.summaries[method.subtasks[0] as usize].min_yield
-                                        != usize::MAX;
-                                if shape_skip {
-                                    SweepTier::Skip
-                                } else if self.sweep_streaks
-                                    [flat_method.expect("adaptive stats built")]
-                                    >= ADAPTIVE_SWEEP_TRIALS
-                                {
-                                    // Tier 3 — track record: swept
-                                    // `ADAPTIVE_SWEEP_TRIALS` times in a row
-                                    // without one refutation → refutation-only
-                                    // for the rest of THIS plan (a refutation
-                                    // resets the streak).
-                                    SweepTier::RefutationOnly
-                                } else {
-                                    // Tier 2 — on probation: full sweep.
-                                    SweepTier::Full
+                        let sweep_tier = if sweep_end == 0 {
+                            // The pause sits before every member: this
+                            // method contributes nothing to the compiled
+                            // plan — nothing to sweep.
+                            SweepTier::Skip
+                        } else {
+                            match self.lookahead {
+                                LookaheadMode::Always => SweepTier::Full,
+                                LookaheadMode::Off => SweepTier::Skip,
+                                LookaheadMode::Adaptive => {
+                                    // Tier 1 — shape: a single-subtask,
+                                    // totally-ordered method with a
+                                    // terminating step duplicates the next queue pop's
+                                    // precondition check exactly.
+                                    let shape_skip = method.subtasks.len() == 1
+                                        && !method.order.is_partial()
+                                        && self.domain.summaries[method.subtasks[0] as usize]
+                                            .min_yield
+                                            != usize::MAX;
+                                    if shape_skip {
+                                        SweepTier::Skip
+                                    } else if self.sweep_streaks
+                                        [flat_method.expect("adaptive stats built")]
+                                        >= ADAPTIVE_SWEEP_TRIALS
+                                    {
+                                        // Tier 3 — track record: swept
+                                        // `ADAPTIVE_SWEEP_TRIALS` times in a row
+                                        // without one refutation → refutation-only
+                                        // for the rest of THIS plan (a refutation
+                                        // resets the streak).
+                                        SweepTier::RefutationOnly
+                                    } else {
+                                        // Tier 2 — on probation: full sweep.
+                                        SweepTier::Full
+                                    }
                                 }
                             }
                         };
@@ -931,7 +1153,7 @@ impl<'a> HtnPlanner<'a> {
                             SweepTier::Skip => Lookahead::Refine,
                             SweepTier::RefutationOnly => {
                                 seq_buf.clear();
-                                seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
+                                seq_buf.extend(resolved_buf[..sweep_end].iter().map(|&(_, idx)| idx));
                                 lookahead::sweep(
                                     self.domain,
                                     &state,
@@ -947,7 +1169,7 @@ impl<'a> HtnPlanner<'a> {
                             }
                             SweepTier::Full => {
                                 seq_buf.clear();
-                                seq_buf.extend(resolved_buf.iter().map(|&(_, idx)| idx));
+                                seq_buf.extend(resolved_buf[..sweep_end].iter().map(|&(_, idx)| idx));
                                 lookahead::sweep(
                                     self.domain,
                                     &state,
@@ -1040,6 +1262,17 @@ impl<'a> HtnPlanner<'a> {
                                 // execution order; no intermediate buffer.)
                                 match &method.order {
                                     SubtaskOrder::Total => {
+                                        // Pause markers queue as pseudo-entries:
+                                        // a pause declared before member `pos`
+                                        // pops right after every member before
+                                        // it; a pause at `subtasks.len()` —
+                                        // after the last member — pops after the
+                                        // whole sequence (pushed first, since the
+                                        // stack pops last-pushed-first).
+                                        let pauses = &method.pause_positions;
+                                        if pauses.contains(&(method.subtasks.len() as u32)) {
+                                            stack.push_front(Step::Pause);
+                                        }
                                         for pos in (0..method.subtasks.len()).rev() {
                                             let sub_idx = method.subtasks[pos] as usize;
                                             // Skipped sweeps leave `sweep_pins`
@@ -1059,6 +1292,13 @@ impl<'a> HtnPlanner<'a> {
                                                     .map(|&(_, m)| m as u32)
                                             };
                                             stack.push_front(Step::Task(sub_idx, sub_pin));
+                                            // Pushed after the member, so it pops
+                                            // *before* it: the pause before
+                                            // member `pos` pops right after
+                                            // member `pos - 1`.
+                                            if pauses.contains(&(pos as u32)) {
+                                                stack.push_front(Step::Pause);
+                                            }
                                         }
                                     }
                                     SubtaskOrder::Partial { first, .. } => {
@@ -1176,7 +1416,7 @@ impl<'a> HtnPlanner<'a> {
             // Anything else breaking out early already set `Partial` and
             // carries the best prefix as a non-error result.
             None if exhausted => Err(HtnError::NoPlan),
-            None => Ok(materialize(tasks, &plan, mtr, status)),
+            None => Ok(materialize(tasks, &plan, mtr, status, paused_resume.take())),
         }
     }
 }
@@ -1294,11 +1534,18 @@ fn backtrack(
 
 /// Convert a plan of (narrow) task indices into the compiled step program:
 /// contiguous `u32` task indices plus the parallel interned-name list.
-fn materialize(tasks: &[Task], plan: &[usize], mtr: Vec<usize>, status: PlanStatus) -> Plan {
+fn materialize(
+    tasks: &[Task],
+    plan: &[usize],
+    mtr: Vec<usize>,
+    status: PlanStatus,
+    resume: Option<ResumePoint>,
+) -> Plan {
     Plan {
         steps: plan.iter().map(|&i| i as u32).collect(),
         names: plan.iter().map(|&i| tasks[i].name().into()).collect(),
         mtr,
         status,
+        resume,
     }
 }

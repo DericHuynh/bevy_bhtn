@@ -46,7 +46,8 @@
 //! [`HtnDomain::from_root`](crate::domain::HtnDomain::from_root) calls the root
 //! function with a **recording** [`TaskBuilder`]; every `.then(shoot)` captures
 //! the callee's `TypeId` and queues the function for expansion. The result is
-//! baked into flat `Vec`s of [`CompoundTask`]/[`PrimitiveTask`] nodes with
+//! baked into flat `Vec`s of [`CompoundTask`](crate::domain::CompoundTask)/
+//! [`PrimitiveTask`](crate::domain::PrimitiveTask) nodes with
 //! contiguous `usize` indices — the runtime planner never calls task functions
 //! again; it searches the arrays directly.
 
@@ -442,7 +443,7 @@ pub trait TaskFn: 'static {
     /// The task's clean debug name (the last path segment of
     /// `std::any::type_name::<Self>()`). For closures this is the mangled
     /// `{{closure}}` — reference sites replace it with their own
-    /// `file:line:col` via [`reference_display_name`].
+    /// `file:line:col` via `reference_display_name`.
     fn task_name() -> &'static str
     where
         Self: Sized,
@@ -531,6 +532,11 @@ pub(crate) struct MethodProto {
     /// Explicit [`MethodBuilder::before`] constraints as
     /// `(predecessor position, successor position)` pairs.
     pub(crate) edges: Vec<(u32, u32)>,
+    /// [`MethodBuilder::pause_plan`] marker positions — the pause sits
+    /// *before* the member at that declaration position (`subtasks.len()`
+    /// means after the last member). Appended monotonically by construction
+    /// (each call records the current member count).
+    pub(crate) pause_positions: Vec<u32>,
 }
 
 /// The identity of a referenced task in a recorded method body: a task
@@ -759,8 +765,8 @@ impl<'a> MethodBuilder<'a> {
     }
 
     /// Static utility score for
-    /// [`HighestUtility`](crate::selection::SelectionPolicy::HighestUtility) /
-    /// [`WeightedRandom`](crate::selection::SelectionPolicy::WeightedRandom)
+    /// [`HighestUtility`](crate::domain::SelectionPolicy::HighestUtility) /
+    /// [`WeightedRandom`](crate::domain::SelectionPolicy::WeightedRandom)
     /// selection. Branches without one score 0 under HighestUtility and
     /// weight 1.0 under WeightedRandom.
     pub fn utility(&mut self, u: f32) -> &mut Self {
@@ -822,6 +828,45 @@ impl<'a> MethodBuilder<'a> {
     /// a cycle is a build-time error.
     pub fn before(&mut self, before: SubtaskHandle, after: SubtaskHandle) -> &mut Self {
         self.proto.edges.push((before.pos, after.pos));
+        self
+    }
+
+    /// Mark a **plan boundary** at the current position of this branch's
+    /// subtask sequence (PausePlan). When the forward planner reaches this
+    /// point while compiling the plan, the plan is **truncated**: everything
+    /// decomposed before the marker is the executed prefix, and everything
+    /// still queued after it is recorded as the plan's resume point — the
+    /// agent executes the prefix, then decomposition **resumes from the
+    /// pause** (see [`HtnPlanner::resume`](crate::planner::HtnPlanner::resume)
+    /// and [`Plan::resume`](crate::planner::Plan::resume)).
+    ///
+    /// This keeps long-horizon plans from over-committing: far-future steps
+    /// are never optimistically validated against state that will have moved
+    /// on by the time they run, and planner work per plan is bounded by the
+    /// leg between markers instead of the whole horizon.
+    ///
+    /// ```
+    /// # use bevy_bhtn::tasks::TaskBuilder;
+    /// fn journey(task: &mut TaskBuilder) {
+    ///     task.branch()
+    ///         .then(pick_route)   // committed now — the leg is planned
+    ///         .pause_plan()       // the compiled plan ends here
+    ///         .then(follow_route); // deferred into the resume point
+    /// }
+    /// # fn pick_route(task: &mut TaskBuilder) { task.branch(); }
+    /// # fn follow_route(task: &mut TaskBuilder) { task.branch(); }
+    /// ```
+    ///
+    /// Several markers chain legs: each pause truncates the plan compiled so
+    /// far, and the marker itself travels in the resume point so the resumed
+    /// search stops at the next one too. A marker on a partially-ordered
+    /// branch (`.subtask`/`.any_order`/`.before`) is a build error — the cut
+    /// must sit at a fixed member position.
+    pub fn pause_plan(&mut self) -> &mut Self {
+        let pos = self.proto.subtasks.len() as u32;
+        if self.proto.pause_positions.last() != Some(&pos) {
+            self.proto.pause_positions.push(pos);
+        }
         self
     }
 

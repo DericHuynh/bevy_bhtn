@@ -39,7 +39,7 @@
 //!
 //! A blend's score is the **weighted average** of its considerations
 //! (`Σ weightᵢ · valueᵢ / Σ weightᵢ`), so the result stays in 0–1 and the
-//! [`C` exploration constant](crate::selection::SelectionPolicy) of any
+//! [`C` exploration constant](crate::domain::SelectionPolicy) of any
 //! downstream policy keeps a stable scale. Each consideration's `evaluate`
 //! clamps its scorer to 0–1 *before* the curve and applies `invert` after it,
 //! so `curve(quadratic).invert()` means "1 − x²", not "(1 − x)²".

@@ -1,6 +1,6 @@
 //! Monte Carlo Tree Search (UCT) as a pluggable search strategy.
 //!
-//! [`MctsSearcher`] implements [`Searcher`], so it plugs into
+//! [`MctsSearcher`] implements [`Searcher`](crate::selection::Searcher), so it plugs into
 //! [`HtnSearchStrategy::Custom`](crate::selection::HtnSearchStrategy::Custom)
 //! — globally via `HtnConfig::with_strategy`, or per agent via a
 //! [`SearchOverride`](crate::selection::SearchOverride). No planner surgery:
@@ -61,7 +61,7 @@
 //! - **Baked selection policies are ignored**: every applicable method is an
 //!   equal choice for tree expansion; the rollout uses declaration order.
 //! - **Bounded**: rollouts carry a decomposition-step budget
-//!   ([`MctsSearcher::rollout_depth`]); exhausting it is *inconclusive*
+//!   (`MctsSearcher::rollout_depth`); exhausting it is *inconclusive*
 //!   (reward 0, no dead-end marking), so even non-terminating domains cost a
 //!   bounded amount of work per iteration.
 
@@ -353,6 +353,9 @@ impl crate::selection::Searcher for MctsSearcher {
                     steps: plan,
                     mtr: Vec::new(),
                     status: PlanStatus::Complete,
+                    // Custom searchers own their search: pause markers do
+                    // not apply to them.
+                    resume: None,
                 });
             }
             // A failed or aborted root: the initial state already violates
@@ -559,6 +562,8 @@ impl crate::selection::Searcher for MctsSearcher {
             steps: plan,
             mtr: Vec::new(),
             status: PlanStatus::Complete,
+            // Custom searchers own their search: pause markers do not apply.
+            resume: None,
         })
     }
 }

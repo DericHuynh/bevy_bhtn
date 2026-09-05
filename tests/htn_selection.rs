@@ -513,6 +513,7 @@ impl Searcher for FixedSearcher {
             names: vec!["works".into()],
             mtr: vec![1],
             status: bevy_bhtn::planner::PlanStatus::Complete,
+            resume: None,
         })
     }
 }

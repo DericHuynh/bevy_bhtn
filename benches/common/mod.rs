@@ -54,8 +54,8 @@ pub enum Location {
 pub fn miner_components(i: usize) -> impl Bundle {
     (
         Gold((i % 5) as i32),
-        HasOre(i % 3 == 0),
-        HasMetal(i % 7 == 0),
+        HasOre(i.is_multiple_of(3)),
+        HasMetal(i.is_multiple_of(7)),
         Energy(80 - (i % 40) as i32),
         Hunger(20 + (i % 60) as i32),
         Location::Outside,
@@ -66,8 +66,8 @@ pub fn miner_components(i: usize) -> impl Bundle {
 pub fn miner_scratch(domain: &HtnDomain, i: usize) -> PlanState {
     let (gold, has_ore, has_metal, energy, hunger) = (
         (i % 5) as i32,
-        i % 3 == 0,
-        i % 7 == 0,
+        i.is_multiple_of(3),
+        i.is_multiple_of(7),
         80 - (i % 40) as i32,
         20 + (i % 60) as i32,
     );

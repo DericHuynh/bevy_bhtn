@@ -498,3 +498,211 @@ fn unsolvable_domain_leaves_the_agent_planless_not_wedged() {
     assert!(agent.plan.is_none(), "no plan is ever stored");
     assert_eq!(agent.cursor, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Quiet-prefix elision (replan dedup, after Fluid HTN's early replan
+// rejection) — a fresh plan's leading run of steps that dispatch no action
+// and whose effects are already reflected in the world is skipped, so a
+// same-tick repair replan resumes at its first consequential step.
+// ---------------------------------------------------------------------------
+
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Gate(pub bool);
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct GoA(pub bool);
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct GoB(pub bool);
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Step1(pub bool);
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Done(pub bool);
+
+/// A three-step journey: prepare the gate, then two gated acts. `ensure` is
+/// idempotent and action-free — quiet once the gate is up.
+fn gate_domain() -> HtnDomain {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().precondition(|d: &Done| d.0); // terminal: finished
+        task.branch()
+            .then(ensure)
+            .then(act_a)
+            .then(act_b)
+            .then(root);
+    }
+    fn ensure(task: &mut TaskBuilder) {
+        task.effect(|g: &mut Gate| g.0 = true);
+    }
+    fn act_a(task: &mut TaskBuilder) {
+        task.precondition(|g: &Gate| g.0)
+            .precondition(|a: &GoA| a.0)
+            .effect(|s: &mut Step1| s.0 = true);
+    }
+    fn act_b(task: &mut TaskBuilder) {
+        task.precondition(|g: &Gate| g.0)
+            .precondition(|b: &GoB| b.0)
+            .precondition(|s: &Step1| s.0)
+            .effect(|d: &mut Done| d.0 = true);
+    }
+    HtnDomain::from_root(root).build().unwrap()
+}
+
+/// Mid-plan drift replans into the same domain; the fresh plan's `ensure`
+/// prefix is quiet (the gate is already set — its effect would change
+/// nothing), so the replan resumes at `act_a` instead of re-running
+/// `ensure`. The tick the blocker clears, the journey advances — no tick is
+/// spent re-executing a step whose work is already done.
+#[test]
+fn replan_elides_quiet_prefix_and_advances_same_tick() {
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(gate_domain()));
+    let entity = world
+        .spawn((
+            Gate(false),
+            GoA(true),
+            GoB(true),
+            Step1(false),
+            Done(false),
+            HtnAgent::default(),
+        ))
+        .id();
+
+    // Tick 1: plan [ensure, act_a, act_b]; `ensure` is NOT quiet (the gate
+    // flips) and executes.
+    htn_ai_system(&mut world);
+    assert!(world.get::<Gate>(entity).unwrap().0, "the gate was set");
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 1);
+
+    // The world closes `act_a`'s precondition mid-plan.
+    world.get_mut::<GoA>(entity).unwrap().0 = false;
+
+    // Tick 2: `act_a` drifts → dropped → replanned same tick → the fresh
+    // plan's `ensure` prefix IS quiet → elided → `act_a` still blocked →
+    // planless. (Without elision this tick would re-execute `ensure` and
+    // hold the plan.)
+    htn_ai_system(&mut world);
+    let agent = world.get::<HtnAgent>(entity).unwrap();
+    assert!(
+        agent.plan.is_none(),
+        "the blocked replan consumed both passes"
+    );
+    assert!(!world.get::<Step1>(entity).unwrap().0, "act_a never ran");
+
+    // The world opens the way.
+    world.get_mut::<GoA>(entity).unwrap().0 = true;
+
+    // Tick 3: plan → the quiet `ensure` prefix is elided → `act_a`
+    // validates and executes **within this tick**. Without elision this
+    // tick would re-run `ensure` and `act_a` would land a tick later.
+    htn_ai_system(&mut world);
+    assert!(
+        world.get::<Step1>(entity).unwrap().0,
+        "the replanned plan resumed at its first consequential step"
+    );
+    assert_eq!(world.get::<HtnAgent>(entity).unwrap().cursor, 2);
+
+    // Tick 4: `act_b` finishes the journey.
+    htn_ai_system(&mut world);
+    assert!(world.get::<Done>(entity).unwrap().0);
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+}
+
+/// Elision must never skip a step whose effect changes state — even one
+/// that already executed earlier in the plan. The counterexample that kills
+/// naive structural plan comparison: an executed step's effect gets undone
+/// by drift; the replan re-derives the step; skipping it would livelock.
+#[test]
+fn elision_never_skips_state_changing_steps() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().precondition(|d: &Done| d.0); // terminal: finished
+        task.branch()
+            .precondition(|c: &Count| c.0 >= 2)
+            .then(act)
+            .then(root);
+        task.branch().then(increment).then(root);
+    }
+    fn increment(task: &mut TaskBuilder) {
+        task.precondition(|c: &Count| c.0 < 3)
+            .effect(|c: &mut Count| c.0 += 1);
+    }
+    fn act(task: &mut TaskBuilder) {
+        task.precondition(|c: &Count| c.0 >= 2)
+            .effect(|d: &mut Done| d.0 = true);
+    }
+    #[derive(Component, Clone, Default, Debug, PartialEq)]
+    struct Count(pub i32);
+    let domain = HtnDomain::from_root(root).build().unwrap();
+
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain));
+    let entity = world
+        .spawn((Count(0), Done(false), HtnAgent::default()))
+        .id();
+
+    // Tick 1: plan [increment, increment, act]; the first increment runs
+    // (count 1, cursor 1).
+    htn_ai_system(&mut world);
+    assert_eq!(world.get::<Count>(entity).unwrap().0, 1);
+
+    // Drift: an external system undoes the executed increment (the hammer
+    // knocked back out of the pocket).
+    world.get_mut::<Count>(entity).unwrap().0 = 0;
+
+    // Tick 2: the plan's second increment still validates (count < 3) and
+    // runs — count back to 1, cursor 2.
+    htn_ai_system(&mut world);
+    assert_eq!(world.get::<Count>(entity).unwrap().0, 1);
+
+    // Tick 3: `act` drifts (count < 2) → dropped → replanned same tick: the
+    // fresh plan is [increment, act] — and the increment is NOT quiet (1 → 2
+    // changes bytes), so it re-executes **within the drift tick**. (A
+    // structural elision that skipped the re-derived increment would
+    // livelock: count stuck at 1, `act` unreachable, forever.)
+    htn_ai_system(&mut world);
+    assert_eq!(
+        world.get::<Count>(entity).unwrap().0,
+        2,
+        "the state-changing step re-executed in the drift tick itself"
+    );
+    let agent = world.get::<HtnAgent>(entity).unwrap();
+    assert_eq!(agent.cursor, 1, "the fresh plan is mid-flight");
+
+    // Tick 4: `act` validates and finishes.
+    htn_ai_system(&mut world);
+    assert!(world.get::<Done>(entity).unwrap().0);
+    assert!(world.get::<HtnAgent>(entity).unwrap().plan.is_none());
+}
+
+/// A plan whose every step is quiet does nothing: it degrades to planless
+/// instead of burning ticks executing no-ops (and never wedges — the next
+/// tick simply replans the same way).
+#[test]
+fn fully_quiet_plans_degrade_to_planless() {
+    fn root(task: &mut TaskBuilder) {
+        task.branch().precondition(|d: &Done| d.0); // unreachable: done is false
+        task.branch().then(ensure).then(root);
+    }
+    fn ensure(task: &mut TaskBuilder) {
+        task.effect(|g: &mut Gate| g.0 = true);
+    }
+    let domain = HtnDomain::from_root(root).build().unwrap();
+
+    let mut world = World::new();
+    world.insert_resource(HtnConfig::new(domain).with_sanity_limit(10));
+    let entity = world
+        .spawn((Gate(true), Done(false), HtnAgent::default()))
+        .id();
+
+    // The only decomposable branch recurses on `ensure`, whose effect is
+    // already reflected — the truncated plan is entirely quiet. Elision
+    // empties it into planlessness; the agent idles instead of ticking
+    // through ten no-ops.
+    for tick in 1..=3 {
+        htn_ai_system(&mut world);
+        let agent = world.get::<HtnAgent>(entity).unwrap();
+        assert!(agent.plan.is_none(), "tick {tick}: planless, not theater");
+        assert_eq!(agent.cursor, 0);
+        assert!(
+            world.get::<Gate>(entity).unwrap().0,
+            "gate never re-toggled"
+        );
+    }
+}

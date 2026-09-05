@@ -612,7 +612,7 @@ fn effect_arity_up_to_eight_mutates() {
                 7 => state.get::<P7>(slots[6]).0,
                 _ => state.get::<P8>(slots[7]).0,
             };
-            assert_eq!(value, k as i32, "{name} wrote P{k}");
+            assert_eq!(value, k, "{name} wrote P{k}");
         }
     }
 }
@@ -936,12 +936,14 @@ fn plan_mtr_ordering() {
         names: vec!["A".into()],
         mtr: vec![0],
         status: PlanStatus::Complete,
+        resume: None,
     };
     let high = Plan {
         steps: vec![1],
         names: vec!["B".into()],
         mtr: vec![1],
         status: PlanStatus::Complete,
+        resume: None,
     };
     assert!(low.is_preferred_over(&high));
     assert!(!high.is_preferred_over(&low));

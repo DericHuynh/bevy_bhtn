@@ -48,7 +48,8 @@
 //! # Task insertion — gap compilation
 //!
 //! Insertion (GTN_I) lets any applicable primitive run between the steps of
-//! any method — plan repair. [`with_insertion`] adds one synthetic compound
+//! any method — plan repair. [`DomainBuilder::with_insertion`](crate::domain::DomainBuilder::with_insertion)
+//! adds one synthetic compound
 //! `gtn/insert` with the **empty stop method first** and one
 //! `[candidate, insert]` method per domain primitive, then splices
 //! `[insert, t1, insert, …, tn, insert]` into every total-order method body.
@@ -197,6 +198,7 @@ pub(crate) fn apply_sharing(
             subtasks: Vec::new(),
             unordered: false,
             edges: Vec::new(),
+            pause_positions: Vec::new(),
         };
         let moa = MethodProto {
             name: Some(leak_name("do".to_string())),
@@ -205,6 +207,7 @@ pub(crate) fn apply_sharing(
             subtasks: vec![(*req, orig_name, true)],
             unordered: false,
             edges: Vec::new(),
+            pause_positions: Vec::new(),
         };
         let comp = TaskProto::Compound {
             methods: vec![mom, moa],
@@ -280,6 +283,7 @@ pub(crate) fn apply_insertion(
         subtasks: Vec::new(),
         unordered: false,
         edges: Vec::new(),
+        pause_positions: Vec::new(),
     }];
     for (cref, cname) in candidates {
         methods.push(MethodProto {
@@ -289,6 +293,7 @@ pub(crate) fn apply_insertion(
             subtasks: vec![(cref, cname, true), (insert_ref, insert_name, true)],
             unordered: false,
             edges: Vec::new(),
+            pause_positions: Vec::new(),
         });
     }
     let insert = TaskProto::Compound {

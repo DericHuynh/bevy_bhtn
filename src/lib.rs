@@ -27,7 +27,8 @@
 //! closures over component references (`|ammo: &Ammo| ...`), monomorphized at
 //! build time into type-erased checkers/mutators over a dense [`PlanState`]
 //! scratchpad — no reflection anywhere. The ECS driver
-//! ([`htn_ai_system`]) extracts the scratchpad from the entity's real
+//! ([`htn_ai_system`](crate::ecs::htn_ai_system)) extracts the scratchpad from
+//! the entity's real
 //! components, plans, then executes one step per tick: re-validating
 //! preconditions against the world, dispatching the task's action commands,
 //! and committing effects back to the real components.
@@ -60,10 +61,17 @@
 //! reports a genuine dead end as an empty `Complete` plan (an empty *success*
 //! — a root whose decomposition is legitimately empty — is `Ok` and
 //! distinguishable). Budget truncation is not an error: it comes back as an
-//! `Ok` [`Plan`] with [`PlanStatus::Partial`]. Domain-authoring mistakes
-//! (mixed task declarations, aliased effect slots, ...) are collected during
-//! recording and reported together by `build()` as one `HtnError::Builder` —
-//! one build call surfaces every bug at once.
+//! `Ok` [`Plan`](planner::Plan) with
+//! [`PlanStatus::Partial`](planner::PlanStatus::Partial). A
+//! [`pause_plan`](tasks::MethodBuilder::pause_plan) marker truncates a plan
+//! deliberately — [`PlanStatus::Paused`](planner::PlanStatus::Paused), with
+//! the still-queued work in
+//! [`Plan::resume`](planner::Plan::resume) for
+//! [`HtnPlanner::resume`](planner::HtnPlanner::resume) to continue once the
+//! prefix has executed. Domain-authoring mistakes (mixed task declarations,
+//! aliased effect slots, ...) are collected during recording and reported
+//! together by `build()` as one `HtnError::Builder` — one build call
+//! surfaces every bug at once.
 //!
 //! # Generic tasks: one function, many identities
 //!

@@ -1044,15 +1044,14 @@ impl CddaWorld {
 /// step whose validation fails is dropped and replanned **the same tick** —
 /// the fresh plan selects against reality and executes immediately):
 ///
-/// 1 (plan + select) + 8 (walk — each mid-walk drift tick drops the plan
-/// and replans from reality the same tick, immediately re-executing the
-/// journey's first step) + 1 (move re-issued, no-op walk) + 1 (pick_up) +
-/// 1 (do_craft) = 12.
+/// 1 (plan + select) + 8 (walk — every mid-walk tick re-plans from reality,
+/// elides the now-quiet select prefix, and re-issues the move) + 1 (pick_up)
+/// + 1 (do_craft) = 11.
 #[test]
 fn survivor_walks_picks_up_and_crafts_a_spear() {
     let mut sim = CddaWorld::new(ItemKind::Spear);
     let ticks = sim.run_until_crafted(ItemKind::Spear);
-    assert_eq!(ticks, 12, "deterministic tick count for the spear run");
+    assert_eq!(ticks, 11, "deterministic tick count for the spear run");
 
     // The spear exists, in a pocket of the survivor's jacket (the first
     // worn clothing — the pocket the pickup/craft systems target).
@@ -1106,17 +1105,17 @@ fn survivor_walks_picks_up_and_crafts_a_spear() {
 /// Crafting a bandage needs two ground items in sequence (scrap, then berry
 /// — recipe-input order): two full walk-and-fetch trips, still pinned
 /// exactly, and still no distraction toward the other recipes. Verified
-/// against a per-tick trace; the arithmetic:
+/// against a per-tick trace; the arithmetic (one plan covers both trips;
+/// each mid-walk tick replans same-tick and elides the quiet select
+/// prefix):
 ///
-/// trip 1 (scrap, 4 tiles): 1 (plan + select) + 4 (walk) + 1 (pick_up —
-/// arrival lands on a move-tick, so pickup validates directly) = 6;
-/// trip 2 (berry, 3 tiles): 1 (plan + select) + 3 (walk) + 1 (move re-issued)
-/// + 1 (pick_up) + 1 (do_craft) = 7. Total 13.
+/// 1 (plan + select) + 4 (walk to the scrap) + 1 (pick_up) + 1 (select the
+/// berry) + 3 (walk to the berry) + 1 (pick_up) + 1 (do_craft) = 12.
 #[test]
 fn survivor_crafts_a_bandage_from_two_ground_items() {
     let mut sim = CddaWorld::new(ItemKind::Bandage);
     let ticks = sim.run_until_crafted(ItemKind::Bandage);
-    assert_eq!(ticks, 13, "deterministic tick count for the bandage run");
+    assert_eq!(ticks, 12, "deterministic tick count for the bandage run");
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Bandage).is_some());
 
@@ -1148,13 +1147,13 @@ fn survivor_crafts_a_bandage_from_two_ground_items() {
 /// carries a bottle: the planner must use the carried one and leave the
 /// ground bottle lying at (3,1) untouched. One fetch only — the shortest
 /// scenario. Verified against a per-tick trace; the arithmetic:
-/// 1 (plan + select) + 4 (walk to the scrap) + 1 (move re-issued) + 1
-/// (pick_up) + 1 (do_craft) = 8.
+/// 1 (plan + select) + 4 (walk to the scrap) + 1 (pick_up) + 1 (do_craft)
+/// = 7.
 #[test]
 fn survivor_crafts_a_torch_using_the_carried_bottle() {
     let mut sim = CddaWorld::new(ItemKind::Torch);
     let ticks = sim.run_until_crafted(ItemKind::Torch);
-    assert_eq!(ticks, 8, "deterministic tick count for the torch run");
+    assert_eq!(ticks, 7, "deterministic tick count for the torch run");
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Torch).is_some());
 
@@ -1248,7 +1247,7 @@ fn shared_pack_slings_once_across_two_fetch_trips() {
         sim.tick_n(1);
     }
     sim.tick_n(1); // settle tick, mirroring `run_until_crafted`
-    assert_eq!(ticks, 14, "13-tick bandage run + the one shared sling step");
+    assert_eq!(ticks, 13, "12-tick bandage run + the one shared sling step");
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Bandage).is_some());
     assert_eq!(sim.position(), Pos { x: 0, y: 3 });
@@ -1325,8 +1324,8 @@ fn insertion_weaves_the_unmodeled_repair_step() {
     }
     sim.tick_n(1); // settle tick, mirroring `run_until_crafted`
     assert_eq!(
-        ticks, 13,
-        "12-tick spear run + the one inserted repair step"
+        ticks, 12,
+        "11-tick spear run + the one inserted repair step"
     );
 
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());
@@ -1395,7 +1394,7 @@ fn queue_fetches_for_both_crafts_proactively_then_crafts_in_order() {
 
     let ticks = sim.run_until_crafted(ItemKind::Torch);
     assert_eq!(
-        ticks, 21,
+        ticks, 19,
         "deterministic tick count for the two-craft queue run"
     );
 
@@ -1483,7 +1482,7 @@ fn queue_crafts_two_of_an_item_in_one_count_aware_plan() {
     }
     sim.tick_n(1); // settle tick, mirroring `run_until_crafted`
     assert_eq!(
-        ticks, 32,
+        ticks, 31,
         "deterministic tick count for the doubled-craft queue run"
     );
 
@@ -1513,14 +1512,11 @@ struct Enemy;
 
 /// The threat projection: runs with the other perception systems, before the
 /// driver, so a replan in the same tick sees the enemy.
-fn threat_assessment(
-    mut survivors: Query<(&Pos, &mut Danger)>,
-    enemies: Query<&Pos, With<Enemy>>,
-) {
+fn threat_assessment(mut survivors: Query<(&Pos, &mut Danger)>, enemies: Query<&Pos, With<Enemy>>) {
     for (pos, mut danger) in &mut survivors {
-        danger.0 = enemies.iter().any(|e| {
-            (e.x - pos.x).abs() + (e.y - pos.y).abs() <= 2
-        });
+        danger.0 = enemies
+            .iter()
+            .any(|e| (e.x - pos.x).abs() + (e.y - pos.y).abs() <= 2);
     }
 }
 
@@ -1580,7 +1576,9 @@ fn ensure_inputs_alert(task: &mut TaskBuilder) {
             book.inputs_satisfied(goal.0, pockets)
         },
     );
-    task.branch().then(acquire_missing_alert).then(ensure_inputs_alert);
+    task.branch()
+        .then(acquire_missing_alert)
+        .then(ensure_inputs_alert);
 }
 
 /// Branch order encodes the priority: craft the goal **unless** an enemy is
@@ -1603,11 +1601,14 @@ fn behave_alert(task: &mut TaskBuilder) {
 /// tick) and a `Danger` component on the survivor.
 impl CddaWorld {
     fn new_alert(goal: ItemKind) -> Self {
-        let mut sim =
-            Self::new_with(goal, vec![goal], GROUND_ITEMS.as_slice(), behave_alert, |b| b);
-        sim.world
-            .entity_mut(sim.survivor)
-            .insert(Danger::default());
+        let mut sim = Self::new_with(
+            goal,
+            vec![goal],
+            GROUND_ITEMS.as_slice(),
+            behave_alert,
+            |b| b,
+        );
+        sim.world.entity_mut(sim.survivor).insert(Danger::default());
         sim.schedule
             .add_systems(threat_assessment.before(htn_ai_system));
         sim
@@ -1636,7 +1637,12 @@ fn enemy_in_view_replans_the_same_tick_and_the_survivor_flees() {
     sim.tick_n(1);
     assert_eq!(
         sim.plan_names(),
-        ["select_missing", "move_to_item_safe", "pick_up_safe", "do_craft"],
+        [
+            "select_missing",
+            "move_to_item_safe",
+            "pick_up_safe",
+            "do_craft"
+        ],
     );
     assert!(!sim.danger());
     sim.tick_n(1);
@@ -1677,7 +1683,12 @@ fn enemy_in_view_replans_the_same_tick_and_the_survivor_flees() {
     assert!(!sim.danger(), "home is out of range");
     assert_eq!(
         sim.plan_names(),
-        ["select_missing", "move_to_item_safe", "pick_up_safe", "do_craft"],
+        [
+            "select_missing",
+            "move_to_item_safe",
+            "pick_up_safe",
+            "do_craft"
+        ],
         "the journey is re-derived as soon as the danger clears"
     );
 
@@ -1693,7 +1704,10 @@ fn enemy_in_view_replans_the_same_tick_and_the_survivor_flees() {
     let mut ticks = 0;
     while pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_none() {
         ticks += 1;
-        assert!(ticks <= 40, "the survivor never resumed and finished (40 ticks)");
+        assert!(
+            ticks <= 40,
+            "the survivor never resumed and finished (40 ticks)"
+        );
         sim.tick_n(1);
     }
     assert!(pocket_holds(&mut sim.world, sim.survivor, ItemKind::Spear).is_some());

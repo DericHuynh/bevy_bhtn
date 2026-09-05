@@ -367,6 +367,18 @@ impl DomainBuilder {
                         .into_iter()
                         .map(|m| {
                             let order = bake_subtask_order(&m, name)?;
+                            // A pause marker cuts the compiled plan at a
+                            // fixed member position — meaningless on a
+                            // partially-ordered branch, where the member
+                            // execution order is chosen by the search.
+                            if !m.pause_positions.is_empty() && order.is_partial() {
+                                return Err(HtnError::builder(format!(
+                                    "compound task `{name}` has a `pause_plan()` marker on a \
+                                     partially-ordered branch — the plan cut must sit at a \
+                                     fixed member position, so pause branches must be pure \
+                                     `then` chains"
+                                )));
+                            }
                             Ok(Method {
                                 name: m.name,
                                 utility: m.utility,
@@ -383,6 +395,7 @@ impl DomainBuilder {
                                 possible_writes: Default::default(),
                                 guaranteed_writes: Default::default(),
                                 min_cost: 0.0,
+                                pause_positions: m.pause_positions.into_iter().collect(),
                             })
                         })
                         .collect();
@@ -626,6 +639,14 @@ pub struct Method {
     /// strategy prunes commitments whose bound cannot beat the best complete
     /// plan.
     pub(crate) min_cost: f32,
+    /// [`MethodBuilder::pause_plan`](crate::tasks::MethodBuilder::pause_plan)
+    /// marker positions — the pause sits *before* the member at that
+    /// declaration position (`subtasks.len()` means after the last member).
+    /// When the planner reaches the marker while compiling, the plan is
+    /// truncated there and the still-queued work becomes the plan's resume
+    /// point. Empty on ordinary methods. Always empty on partially-ordered
+    /// methods (rejected at bake — the cut must be a fixed member position).
+    pub pause_positions: SmallVec<[u32; 2]>,
 }
 
 /// A baked compound task: on decomposition, pick the first method whose
@@ -777,28 +798,31 @@ fn sample_weighted_order(weights: &[f32], rng: &mut u64, out: &mut SmallVec<[u32
     let mut remaining: SmallVec<[usize; 8]> = (0..weights.len()).collect();
     while !remaining.is_empty() {
         let total: f32 = remaining.iter().map(|&i| weights[i]).sum();
-        if !(total > 0.0) {
-            // All-zero (or degenerate) weights: declaration order for the rest.
+        if total > 0.0 {
+            // splitmix64 step.
+            *rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let r = (z >> 11) as f32 / (1u64 << 53) as f32 * total;
+            let mut acc = 0.0;
+            let mut chosen = remaining.len() - 1;
+            for (k, &i) in remaining.iter().enumerate() {
+                acc += weights[i];
+                if r < acc {
+                    chosen = k;
+                    break;
+                }
+            }
+            out.push(remaining.remove(chosen) as u32);
+        } else {
+            // All-zero (or degenerate — NaN) weights: declaration order for
+            // the rest. `total > 0.0` is false for NaN, so degenerate scores
+            // degrade exactly like an all-zero set.
             out.extend(remaining.drain(..).map(|i| i as u32));
             break;
         }
-        // splitmix64 step.
-        *rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        let r = (z >> 11) as f32 / (1u64 << 53) as f32 * total;
-        let mut acc = 0.0;
-        let mut chosen = remaining.len() - 1;
-        for (k, &i) in remaining.iter().enumerate() {
-            acc += weights[i];
-            if r < acc {
-                chosen = k;
-                break;
-            }
-        }
-        out.push(remaining.remove(chosen) as u32);
     }
 }
 

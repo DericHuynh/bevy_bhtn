@@ -43,12 +43,9 @@ fn plan_of_with<F: TaskFn>(planner: &mut HtnPlanner, _root: F, state: &PlanState
 }
 
 /// Helper: read component `T` out of a scratchpad via the domain's registry.
-fn scratch_get<T: bevy_bhtn::state::PlanComponent>(
-    domain: &bevy_bhtn::HtnDomain,
-    state: &PlanState,
-) -> T
+fn scratch_get<T>(domain: &bevy_bhtn::HtnDomain, state: &PlanState) -> T
 where
-    T: Clone,
+    T: bevy_bhtn::state::PlanComponent + Clone,
 {
     state
         .get::<T>(

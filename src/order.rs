@@ -33,7 +33,7 @@
 //! practice: authored unordered sets model *small independent member sets*;
 //! wide or data-driven repetition (loot N items, craft with M ingredients —
 //! CDDA-scale) belongs in **recursion over components** (a counter component
-//! + a `fetch_one → fetch_all` cycle), which has no arity limit and plans
+//! plus a `fetch_one → fetch_all` cycle), which has no arity limit and plans
 //! ~170 ns per item.
 
 use smallvec::SmallVec;

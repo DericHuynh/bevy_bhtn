@@ -2,13 +2,15 @@
 //!
 //! Forward planning (see [`crate::planner`]) starts from a task and decomposes
 //! toward a fixed goal encoded in the task graph. Back-planning instead starts
-//! from a goal task — a list of desired [`Effect`]s — and greedily builds a
+//! from a goal task — a list of desired [`Effect`](crate::tasks::Effect)s —
+//! and greedily builds a
 //! plan that, when executed from the initial state, makes every goal effect
 //! true.
 //!
 //! # Algorithm
 //!
-//! 1. Register every goal slot (the components each goal [`Effect`] writes).
+//! 1. Register every goal slot (the components each goal
+//!    [`Effect`](crate::tasks::Effect) writes).
 //! 2. Repeatedly pick the candidate covering the most currently-needed slots
 //!    and whose preconditions hold against the simulated state, then commit
 //!    it:
@@ -120,6 +122,9 @@ impl<'a> BackPlanner<'a> {
             // Reverse chaining runs to completion or errors — never a
             // truncated prefix.
             status: crate::planner::PlanStatus::Complete,
+            // Pause markers shape forward plans only; backward chaining has
+            // no method commitments to truncate.
+            resume: None,
         })
     }
 
