@@ -31,13 +31,6 @@ bevy = { version = "0.18", default-features = false }
 bevy_app = "0.18"
 bevy_bae = "0.1"
 bevy_ecs = { version = "0.18", features = ["multi_threaded"] }
-# Vendored copy of bevy_htnp (upstream's transitive `bevy-trait-query` git
-# dependency points at a repository deleted from GitHub, so upstream is
-# unbuildable; see third_party/bevy_htnp/Cargo.toml for the repairs).
-bevy_htnp = { path = "third_party/bevy_htnp" }
-# Handle on the bevy 0.14 that bevy_htnp pulls (renamed so both engine
-# generations coexist in the comparison bench).
-bevy14 = { package = "bevy", version = "0.14", default-features = false }
 criterion = "0.7"
 
 [[bench]]

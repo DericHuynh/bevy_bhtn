@@ -1,18 +1,14 @@
-//! Like-for-like comparison of `bevy_bhtn` against the two other HTN planners
-//! in the Bevy ecosystem:
+//! Like-for-like comparison of `bevy_bhtn` against the other HTN planner in
+//! the Bevy ecosystem:
 //!
 //! - [`bevy_bae`](https://crates.io/crates/bevy_bae) 0.1 (Behavior As
 //!   Entities) — entity-tree domains, string-keyed props, operators are
 //!   systems (bevy_ecs 0.18, the same version this crate uses).
-//! - [`bevy_htnp`](https://github.com/QueenOfSquiggles/bevy_htnp) 0.1 —
-//!   string-keyed `WorldState`, `TaskRegistry`, declarative goals, time-sliced
-//!   planning (vendored under `third_party/` with a repaired manifest; see
-//!   there for why).
 //!
-//! # The problem (identical in all three)
+//! # The problem
 //!
-//! htnp's own example domain, expressed with boolean state so every library
-//! encodes it the same way: the agent is in room A, the door is closed, and
+//! A shared fetch-item domain (from bevy_htnp's example), expressed with
+//! boolean state so both libraries encode it the same way: the agent is in room A, the door is closed, and
 //! the item is on the ground in room B. Tasks: `pickup_item` (needs room B),
 //! `goto_b` (needs the door open), `open_door`, plus the example's two red
 //! herrings `goto_a` / `close_door`. The only valid plan is
@@ -23,22 +19,22 @@
 //! - **`fetch_item_single_actor` / `deep_chain_single_actor`** — one complete
 //!   AI episode per iteration: plan from the initial state and carry the plan
 //!   through to the goal, via each library's native planning/execution
-//!   machinery (bevy_bhtn: one plan + full scratchpad execution; BAE/htnp:
-//!   their driver schedules run until the goal prop flips). The end-to-end
+//!   machinery (bevy_bhtn: one plan + full scratchpad execution; BAE:
+//!   its driver schedule runs until the goal prop flips). The end-to-end
 //!   comparison.
 //! - **`fetch_item_frame_{n}` / `deep_chain_frame_{n}`** — one frame of a
 //!   **continuing episode** for a population of `n` agents, through each
 //!   library's native per-frame cadence, single-threaded: agents mid-episode
 //!   execute/validate their next step (bevy_bhtn: compiled plan cursor, the
-//!   `htn_ai_system` shape; BAE: next operator dispatch; htnp: its chained
-//!   planning/execution systems), planless agents replan, and agents that
+//!   `htn_ai_system` shape; BAE: next operator dispatch), planless agents
+//!   replan, and agents that
 //!   just finished reset immediately (the reset amortizes over the episode —
 //!   3 frames shallow, ~102 deep). This is the per-frame AI budget of a
 //!   running game — the CDDA-relevant number (per-actor per-tick).
 //!
 //!   (An earlier revision measured a "planning frame" — every agent replans
-//!   from scratch in one frame. It was structurally unfair: bevy_bhtn and
-//!   htnp materialize the full plan, while BAE — whose plan is the entity
+//!   from scratch in one frame. It was structurally unfair: bevy_bhtn
+//!   materializes the full plan, while BAE — whose plan is the entity
 //!   tree, executed incrementally — only dispatched the first operator, i.e.
 //!   1/N of its episode work per frame. The single-actor episodes are the
 //!   end-to-end check; these frames are the steady-state check.)
@@ -49,11 +45,9 @@
 //! magnitude: a corridor of [`DEPTH`] rooms — `step_i` requires
 //! `progress == i` and sets `progress = i + 1`, then `pickup_item` — so the
 //! only valid plan is `step_0 … step_99, pickup_item` (**101 steps** vs the
-//! shallow domain's 3). Same state encoding in all three libraries (a numeric
-//! progress counter + a boolean goal flag). Frame populations are 100 / 1k:
-//! htnp's tree generator explores one node per plan step with a cloned
-//! `HashMap` world per node, which makes deeper frames at 10k+ agents
-//! impractical to sample. bevy_bhtn raises its sanity limit for this domain
+//! shallow domain's 3). Same state encoding in both libraries (a numeric
+//! progress counter + a boolean goal flag). Frame populations are 100 / 1k.
+//! bevy_bhtn raises its sanity limit for this domain
 //! (`DEEP_SANITY_LIMIT`): 101 primitives cost ~300 decomposition steps, past
 //! the default budget of 100, under which the planner returns a ~33-step
 //! partial plan — pinned by the completion assertion in the episode bench.
@@ -75,8 +69,8 @@
 //! The same corridor with the bevy_bhtn side re-encoded the way BAE's model
 //! naturally expresses it: a single total-order method (`s0 … s99,
 //! deep_pickup` committed as one linear subtask sequence — no branch
-//! re-scanning). This is the matched-encoding comparison; htnp is excluded
-//! (its corridor is its own encoding, not a `Sequence`). Note the semantic
+//! re-scanning). This is the matched-encoding comparison against BAE's
+//! `Sequence`. Note the semantic
 //! trade both linear encodings share: a flattened corridor can only be
 //! (re)planned from its start state — mid-corridor replanning after drift is
 //! the recursive selector's strength, which is why that encoding stays
@@ -202,8 +196,8 @@ mod bhtn_side {
     /// re-validate and execute their next step; planless agents replan; an
     /// agent that just finished resets to the initial scratchpad so the
     /// population stays mid-episode (the reset amortizes over the episode
-    /// length). Single-threaded on purpose — BAE and htnp run single-threaded
-    /// headless `App`s.
+    /// length). Single-threaded on purpose — BAE runs a single-threaded
+    /// headless `App`.
     pub fn run_ai_steady(domain: Res<HtnRes>, mut q: Query<(&mut Scratch, &mut AgentState)>) {
         q.iter_mut().for_each(|(mut scratch, mut agent)| {
             if agent.cursor < agent.plan.len() {
@@ -718,351 +712,6 @@ mod bae_side {
 }
 
 // ---------------------------------------------------------------------------
-// bevy_htnp — string-keyed WorldState, TaskRegistry, declarative goals
-// (vendored; see third_party/bevy_htnp/Cargo.toml)
-// ---------------------------------------------------------------------------
-
-mod htnp_side {
-    use bevy14::prelude::*;
-    use bevy_htnp::planning::goals::Goal;
-    use bevy_htnp::planning::plan_data::TimeSlicedTreeGen;
-    use bevy_htnp::prelude::*;
-
-    // Task-marker components. Manual `Component` impls: bevy 0.14's derive
-    // emits `bevy_ecs::…` paths that would resolve to this crate's bevy_ecs
-    // 0.18 (two engine generations coexist in this bench).
-    macro_rules! htnp_marker {
-        ($name:ident) => {
-            #[derive(Default)]
-            pub struct $name;
-            impl bevy14::ecs::component::Component for $name {
-                const STORAGE_TYPE: bevy14::ecs::component::StorageType =
-                    bevy14::ecs::component::StorageType::Table;
-            }
-        };
-    }
-
-    htnp_marker!(PickupItemMarker);
-    htnp_marker!(GotoBMarker);
-    htnp_marker!(OpenDoorMarker);
-    htnp_marker!(GotoAMarker);
-    htnp_marker!(CloseDoorMarker);
-
-    pub const TASK_NAMES: [&str; 5] =
-        ["pickup_item", "goto_b", "open_door", "goto_a", "close_door"];
-
-    pub fn task_registry() -> TaskRegistry {
-        let mut reg = TaskRegistry::new();
-        reg.task::<PickupItemMarker, _>(
-            "pickup_item",
-            Requirements::new()
-                .req_equals("in_room_b", true)
-                .req_equals("item_picked_up", false)
-                .build(),
-            WorldState::new().add("item_picked_up", true).build(),
-            1.0,
-        );
-        reg.task::<GotoBMarker, _>(
-            "goto_b",
-            Requirements::new()
-                .req_equals("door_open", true)
-                .req_equals("in_room_b", false)
-                .build(),
-            WorldState::new().add("in_room_b", true).build(),
-            1.0,
-        );
-        reg.task::<OpenDoorMarker, _>(
-            "open_door",
-            Requirements::new().req_equals("door_open", false).build(),
-            WorldState::new().add("door_open", true).build(),
-            1.0,
-        );
-        reg.task::<GotoAMarker, _>(
-            "goto_a",
-            Requirements::new()
-                .req_equals("door_open", true)
-                .req_equals("in_room_b", true)
-                .build(),
-            WorldState::new().add("in_room_b", false).build(),
-            1.0,
-        );
-        reg.task::<CloseDoorMarker, _>(
-            "close_door",
-            Requirements::new().req_equals("door_open", false).build(),
-            WorldState::new().add("door_open", false).build(),
-            1.0,
-        );
-        reg
-    }
-
-    pub fn initial_world() -> WorldState {
-        WorldState::new()
-            .add("in_room_b", false)
-            .add("door_open", false)
-            .add("item_picked_up", false)
-            .build()
-    }
-
-    fn agent_tasks() -> Vec<Task> {
-        TASK_NAMES
-            .iter()
-            .map(|name| Task::primitive(*name))
-            .collect()
-    }
-
-    fn agent_goals() -> Vec<Goal> {
-        vec![Goal::new(
-            "get_item",
-            Requirements::new()
-                .req_equals("item_picked_up", true)
-                .build(),
-            1.0,
-        )]
-    }
-
-    /// The user-side operator systems: realize each task's postconditions on
-    /// the agent's `HtnAgentWorld`, then report success (htnp's execution
-    /// contract — the registry's postcons are *planning* data; the task
-    /// system applies the real effect).
-    macro_rules! task_system {
-        ($fn_name:ident, $marker:ty, $($key:literal => $value:literal),* $(,)?) => {
-            fn $fn_name(
-                mut q: Query<(Entity, &HtnAgentState, &mut HtnAgentWorld), With<$marker>>,
-                mut commands: Commands,
-            ) {
-                for (entity, state, mut agent_world) in &mut q {
-                    if *state == HtnAgentState::Running {
-                        $(agent_world.0.add($key, $value);)*
-                        commands.entity(entity).insert(HtnAgentState::Success);
-                    }
-                }
-            }
-        };
-    }
-
-    task_system!(pickup_item_system, PickupItemMarker, "item_picked_up" => true);
-    task_system!(goto_b_system, GotoBMarker, "in_room_b" => true);
-    task_system!(open_door_system, OpenDoorMarker, "door_open" => true);
-    task_system!(goto_a_system, GotoAMarker, "in_room_b" => false);
-    task_system!(close_door_system, CloseDoorMarker, "door_open" => false);
-
-    pub struct HtnpApp {
-        pub app: App,
-        pub agents: Vec<Entity>,
-        tasks: Vec<Task>,
-        goals: Vec<Goal>,
-    }
-
-    /// Headless htnp app: the plugin's systems run on `Update`, chained for a
-    /// deterministic per-frame cadence.
-    pub fn app_with_agents(n: usize) -> HtnpApp {
-        let mut app = App::new();
-        app.add_plugins(HtnPlanningPlugin::new().orchestrate(OrchestrateFor::FasterResponse));
-        app.insert_resource(task_registry());
-        app.add_systems(
-            Update,
-            (
-                pickup_item_system,
-                goto_b_system,
-                open_door_system,
-                goto_a_system,
-                close_door_system,
-            ),
-        );
-
-        let tasks = agent_tasks();
-        let goals = agent_goals();
-        let mut agents = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut agent = HtnAgent::new();
-            for name in TASK_NAMES {
-                agent.add_task(Task::primitive(name));
-            }
-            agent.add_goal(
-                "get_item",
-                Requirements::new()
-                    .req_equals("item_picked_up", true)
-                    .build(),
-                1.0,
-            );
-            let entity = app
-                .world_mut()
-                .spawn((
-                    agent,
-                    TimeSlicedTreeGen::new_initialized(tasks.clone(), goals.clone()),
-                    HtnAgentWorld(initial_world()),
-                ))
-                .id();
-            agents.push(entity);
-        }
-        HtnpApp {
-            app,
-            agents,
-            tasks,
-            goals,
-        }
-    }
-
-    /// Whether the agent's episode has reached the goal.
-    pub fn picked_up(app: &mut App, agent: Entity) -> bool {
-        app.world()
-            .get::<HtnAgentWorld>(agent)
-            .is_some_and(|w| w.0.get("item_picked_up") == Some(Variant::Bool(true)))
-    }
-
-    /// Reset one agent to the initial state: purge execution state, restore
-    /// the world state, and insert a fresh (empty) plan-tree generator so the
-    /// next update replans from scratch.
-    pub fn reset_agent(htnp: &mut HtnpApp, agent: Entity) {
-        let app = &mut htnp.app;
-        app.world_mut().entity_mut(agent).remove::<(
-            HtnAgentPlan,
-            HtnAgentState,
-            HtnAgentCurrentTask,
-            PickupItemMarker,
-        )>();
-        app.world_mut().entity_mut(agent).remove::<(
-            GotoBMarker,
-            OpenDoorMarker,
-            GotoAMarker,
-            CloseDoorMarker,
-        )>();
-        app.world_mut().entity_mut(agent).insert((
-            HtnAgentWorld(initial_world()),
-            TimeSlicedTreeGen::new_initialized(htnp.tasks.clone(), htnp.goals.clone()),
-        ));
-    }
-
-    // -- deep chain: 100 rooms, a 101-step plan ------------------------------
-
-    pub const DEPTH: f32 = 100.0;
-
-    htnp_marker!(StepMarker);
-
-    fn deep_task_registry() -> TaskRegistry {
-        let mut reg = TaskRegistry::new();
-        for i in 0..DEPTH as i64 {
-            reg.task::<StepMarker, _>(
-                format!("step_{i}"),
-                Requirements::new().req_equals("progress", i as f32).build(),
-                WorldState::new().add("progress", (i + 1) as f32).build(),
-                1.0,
-            );
-        }
-        reg.task::<PickupItemMarker, _>(
-            "pickup_item",
-            Requirements::new().req_equals("progress", DEPTH).build(),
-            WorldState::new().add("item_picked_up", true).build(),
-            1.0,
-        );
-        reg
-    }
-
-    fn deep_initial_world() -> WorldState {
-        WorldState::new()
-            .add("progress", 0.0)
-            .add("item_picked_up", false)
-            .build()
-    }
-
-    /// The user-side operator system for the deep chain's step tasks: bump the
-    /// agent's progress and report success.
-    fn deep_step_system(
-        mut q: Query<(Entity, &HtnAgentState, &mut HtnAgentWorld), With<StepMarker>>,
-        mut commands: Commands,
-    ) {
-        for (entity, state, mut agent_world) in &mut q {
-            if *state == HtnAgentState::Running {
-                let current = match agent_world.0.get("progress") {
-                    Some(Variant::Number(n)) => n,
-                    _ => 0.0,
-                };
-                agent_world.0.add("progress", current + 1.0);
-                commands.entity(entity).insert(HtnAgentState::Success);
-            }
-        }
-    }
-
-    pub struct HtnpDeepApp {
-        pub app: App,
-        pub agents: Vec<Entity>,
-        tasks: Vec<Task>,
-        goals: Vec<Goal>,
-    }
-
-    pub fn deep_app_with_agents(n: usize) -> HtnpDeepApp {
-        let mut app = App::new();
-        app.add_plugins(HtnPlanningPlugin::new().orchestrate(OrchestrateFor::FasterResponse));
-        app.insert_resource(deep_task_registry());
-        app.add_systems(Update, (pickup_item_system, deep_step_system));
-
-        let mut tasks = Vec::with_capacity(DEPTH as usize + 1);
-        for i in 0..DEPTH as i64 {
-            tasks.push(Task::primitive(format!("step_{i}")));
-        }
-        tasks.push(Task::primitive("pickup_item"));
-        let goals = vec![Goal::new(
-            "get_item",
-            Requirements::new()
-                .req_equals("item_picked_up", true)
-                .build(),
-            1.0,
-        )];
-
-        let mut agents = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut agent = HtnAgent::new();
-            for task in &tasks {
-                agent.add_task(task.clone());
-            }
-            agent.add_goal(
-                "get_item",
-                Requirements::new()
-                    .req_equals("item_picked_up", true)
-                    .build(),
-                1.0,
-            );
-            let entity = app
-                .world_mut()
-                .spawn((
-                    agent,
-                    TimeSlicedTreeGen::new_initialized(tasks.clone(), goals.clone()),
-                    HtnAgentWorld(deep_initial_world()),
-                ))
-                .id();
-            agents.push(entity);
-        }
-        HtnpDeepApp {
-            app,
-            agents,
-            tasks,
-            goals,
-        }
-    }
-
-    pub fn deep_picked_up(app: &mut App, agent: Entity) -> bool {
-        app.world()
-            .get::<HtnAgentWorld>(agent)
-            .is_some_and(|w| w.0.get("item_picked_up") == Some(Variant::Bool(true)))
-    }
-
-    pub fn deep_reset_agent(htnp: &mut HtnpDeepApp, agent: Entity) {
-        let app = &mut htnp.app;
-        app.world_mut().entity_mut(agent).remove::<(
-            HtnAgentPlan,
-            HtnAgentState,
-            HtnAgentCurrentTask,
-            PickupItemMarker,
-            StepMarker,
-        )>();
-        app.world_mut().entity_mut(agent).insert((
-            HtnAgentWorld(deep_initial_world()),
-            TimeSlicedTreeGen::new_initialized(htnp.tasks.clone(), htnp.goals.clone()),
-        ));
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The benchmark
 // ---------------------------------------------------------------------------
 
@@ -1078,9 +727,6 @@ fn competitor_comparison(c: &mut Criterion) {
         let state = bhtn_side::initial_state(&domain);
         let mut bae = bae_side::app_with_agents(1);
         let bae_agent = bae.agents[0];
-        let mut htnp = htnp_side::app_with_agents(1);
-        let htnp_agent = htnp.agents[0];
-
         let mut group = c.benchmark_group("fetch_item_single_actor");
         group.throughput(criterion::Throughput::Elements(1));
         group.bench_function("bevy_bhtn", |b| {
@@ -1098,36 +744,19 @@ fn competitor_comparison(c: &mut Criterion) {
                 black_box(frames);
             })
         });
-        group.bench_function("bevy_htnp", |b| {
-            b.iter(|| {
-                htnp_side::reset_agent(&mut htnp, htnp_agent);
-                let mut frames = 0;
-                while !htnp_side::picked_up(&mut htnp.app, htnp_agent) {
-                    htnp.app.update();
-                    frames += 1;
-                    assert!(frames <= EPISODE_FRAME_CAP, "htnp episode did not finish");
-                }
-                black_box(frames);
-            })
-        });
         group.finish();
     }
 
     // --- Steady-state frame: one frame of a continuing episode -------------
     // Every library runs its native per-frame cadence on a population that
     // stays mid-episode: agents execute/validate their next step (bhtn:
-    // compiled plan cursor; BAE: next operator dispatch; htnp: its chained
-    // planning/execution systems), planless agents replan, and agents that
-    // just finished reset immediately (amortized over the episode — 3 frames
-    // shallow, ~102 deep). htnp is skipped at 50k: its per-node
-    // cloned-HashMap tree generator makes that one case take minutes.
+    // compiled plan cursor; BAE: next operator dispatch), planless agents
+    // replan, and agents that just finished reset immediately (amortized
+    // over the episode — 3 frames shallow, ~102 deep).
     for n in POPULATIONS {
         let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::frame_world(n);
         let mut bae = bae_side::app_with_agents(n);
         let bae_agents = bae.agents.clone();
-        let mut htnp = htnp_side::app_with_agents(n);
-        let htnp_agents = htnp.agents.clone();
-
         let mut group = c.benchmark_group(format!("fetch_item_frame_{n}"));
         group.throughput(criterion::Throughput::Elements(n as u64));
         group.bench_function("bevy_bhtn", |b| {
@@ -1143,18 +772,6 @@ fn competitor_comparison(c: &mut Criterion) {
                 }
             })
         });
-        if n < 50_000 {
-            group.bench_function("bevy_htnp", |b| {
-                b.iter(|| {
-                    htnp.app.update();
-                    for &agent in &htnp_agents {
-                        if htnp_side::picked_up(&mut htnp.app, agent) {
-                            htnp_side::reset_agent(&mut htnp, agent);
-                        }
-                    }
-                })
-            });
-        }
         group.finish();
     }
 
@@ -1164,9 +781,6 @@ fn competitor_comparison(c: &mut Criterion) {
         let state = bhtn_side::deep_initial_state(&domain);
         let mut bae = bae_side::deep_app_with_agents(1);
         let bae_agent = bae.agents[0];
-        let mut htnp = htnp_side::deep_app_with_agents(1);
-        let htnp_agent = htnp.agents[0];
-
         let mut group = c.benchmark_group("deep_chain_single_actor");
         group.throughput(criterion::Throughput::Elements(1));
         group.bench_function("bevy_bhtn", |b| {
@@ -1187,21 +801,6 @@ fn competitor_comparison(c: &mut Criterion) {
                 black_box(frames);
             })
         });
-        group.bench_function("bevy_htnp", |b| {
-            b.iter(|| {
-                htnp_side::deep_reset_agent(&mut htnp, htnp_agent);
-                let mut frames = 0;
-                while !htnp_side::deep_picked_up(&mut htnp.app, htnp_agent) {
-                    htnp.app.update();
-                    frames += 1;
-                    assert!(
-                        frames <= 4 * EPISODE_FRAME_CAP,
-                        "htnp deep episode did not finish"
-                    );
-                }
-                black_box(frames);
-            })
-        });
         group.finish();
     }
 
@@ -1210,9 +809,6 @@ fn competitor_comparison(c: &mut Criterion) {
         let (mut bhtn_world, mut bhtn_schedule) = bhtn_side::deep_frame_world(n);
         let mut bae = bae_side::deep_app_with_agents(n);
         let bae_agents = bae.agents.clone();
-        let mut htnp = htnp_side::deep_app_with_agents(n);
-        let htnp_agents = htnp.agents.clone();
-
         let mut group = c.benchmark_group(format!("deep_chain_frame_{n}"));
         group.throughput(criterion::Throughput::Elements(n as u64));
         group.bench_function("bevy_bhtn", |b| {
@@ -1228,21 +824,11 @@ fn competitor_comparison(c: &mut Criterion) {
                 }
             })
         });
-        group.bench_function("bevy_htnp", |b| {
-            b.iter(|| {
-                htnp.app.update();
-                for &agent in &htnp_agents {
-                    if htnp_side::deep_picked_up(&mut htnp.app, agent) {
-                        htnp_side::deep_reset_agent(&mut htnp, agent);
-                    }
-                }
-            })
-        });
         group.finish();
     }
 
     // --- Deep chain, matched encoding: bevy_bhtn total-order method vs BAE
-    //     Sequence (htnp excluded — its deep corridor is its own encoding) ---
+    //     Sequence ---
     {
         let domain = bhtn_side::deep_seq_domain();
         let state = bhtn_side::deep_initial_state(&domain);
